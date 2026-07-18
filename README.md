@@ -1,4 +1,4 @@
-# Sentinel AI
+# Sentinel SRE
 
 > An Autonomous SRE Platform for Self-Healing Cloud Applications.
 
