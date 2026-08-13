@@ -13,6 +13,8 @@ import uuid
 import httpx
 
 from app.core.config import settings
+from app.core.metrics import notification_dispatches_total
+from app.middleware.request_id import get_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,18 @@ class NotificationClient:
         channel: str = "email",
     ) -> None:
         try:
+            headers = {}
+            try:
+                req_id = get_request_id()
+                if req_id:
+                    headers["X-Request-ID"] = req_id
+            except Exception:
+                pass
+
             with httpx.Client(timeout=self.timeout) as client:
                 resp = client.post(
                     f"{self.base_url}/api/notifications",
+                    headers=headers,
                     json={
                         "citizen_id": str(citizen_id),
                         "request_id": str(request_id) if request_id else None,
@@ -46,7 +57,9 @@ class NotificationClient:
                     },
                 )
                 resp.raise_for_status()
+                notification_dispatches_total.labels(result="success").inc()
         except httpx.HTTPError as exc:
+            notification_dispatches_total.labels(result="failure").inc()
             logger.warning(
                 "notification_dispatch_failed",
                 extra={"event_type": event_type, "error": str(exc)},

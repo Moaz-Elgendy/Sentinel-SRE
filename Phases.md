@@ -19,7 +19,7 @@ everything that was in them is preserved here, in one place, alongside Phases 4 
 - [x] Phase 3 — React Frontend
 - [x] Phase 4 — Dockerize everything
 - [x] Phase 5 — Docker Compose (full stack)
-- [ ] Phase 6 — Health checks, metrics, structured logs, request IDs
+- [x] Phase 6 — Health checks, metrics, structured logs, request IDs
 - [ ] Phase 7 — Kubernetes manifests
 - [ ] Phase 8 — Deploy to Kubernetes
 - [ ] Phase 9 — Prometheus / Grafana / Loki / Alertmanager
