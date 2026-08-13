@@ -1,0 +1,110 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: citizen-portal-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME:-citizen_portal}
+      POSTGRES_USER: ${DATABASE_USER:-app_user}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-change_me}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-app_user} -d ${DATABASE_NAME:-citizen_portal}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  citizen-service:
+    build:
+      context: ./citizen-service
+    container_name: citizen-portal-citizen-service
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_HOST: postgres
+    ports:
+      - "8000:8000"
+    volumes:
+      - uploads_data:/data/uploads
+    # Runs migrations then seeds the service catalog before starting the API.
+    # citizen-service calls notification-service fire-and-forget (see
+    # app/core/notifications.py) so it does NOT block on it being healthy —
+    # a slow/down Notification Service must never stop the citizen portal
+    # from serving requests.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      notification-service:
+        condition: service_started
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  notification-postgres:
+    image: postgres:16-alpine
+    container_name: citizen-portal-notification-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${NOTIFICATION_DATABASE_NAME:-notification_service}
+      POSTGRES_USER: ${NOTIFICATION_DATABASE_USER:-app_user}
+      POSTGRES_PASSWORD: ${NOTIFICATION_DATABASE_PASSWORD:-change_me}
+    ports:
+      - "5433:5432"
+    volumes:
+      - notification_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${NOTIFICATION_DATABASE_USER:-app_user} -d ${NOTIFICATION_DATABASE_NAME:-notification_service}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  notification-service:
+    build:
+      context: ./notification-service
+    container_name: citizen-portal-notification-service
+    restart: unless-stopped
+    environment:
+      DATABASE_HOST: notification-postgres
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${NOTIFICATION_DATABASE_NAME:-notification_service}
+      DATABASE_USER: ${NOTIFICATION_DATABASE_USER:-app_user}
+      DATABASE_PASSWORD: ${NOTIFICATION_DATABASE_PASSWORD:-change_me}
+      CHAOS_MODE: ${CHAOS_MODE:-false}
+      CHAOS_FAILURE_RATE: ${CHAOS_FAILURE_RATE:-0.3}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    ports:
+      - "8001:8000"
+    depends_on:
+      notification-postgres:
+        condition: service_healthy
+    # notification-service owns its own database (one DB per microservice),
+    # so it runs its own independent migration on boot.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Baked into the JS bundle at build time — this is what the
+        # *browser* calls, so it must be the host-published citizen-service
+        # port (8000), not the internal container network name.
+        VITE_API_BASE_URL: ${FRONTEND_API_BASE_URL:-http://localhost:8000}
+    container_name: citizen-portal-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      citizen-service:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  notification_postgres_data:
+  uploads_data:
