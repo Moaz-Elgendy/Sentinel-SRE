@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_citizen
+from app.core.metrics import citizen_logins_total, citizen_registrations_total
 from app.core.security import create_access_token, hash_password, verify_password
 from app.models.citizen import Citizen
 from app.schemas.auth import LoginRequest, RegisterRequest, TokenResponse
@@ -37,6 +38,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
     # Never log PII or secrets — just the fact that a registration happened.
     logger.info("citizen_registered", extra={"citizen_id": str(citizen.id)})
+    citizen_registrations_total.inc()
 
     return citizen
 
@@ -47,6 +49,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
     if citizen is None or not verify_password(payload.password, citizen.password_hash):
         logger.info("login_failed", extra={"email": payload.email})
+        citizen_logins_total.labels(result="failure").inc()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -54,6 +57,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
     token = create_access_token(subject=str(citizen.id))
     logger.info("login_succeeded", extra={"citizen_id": str(citizen.id)})
+    citizen_logins_total.labels(result="success").inc()
     return TokenResponse(access_token=token)
 
 

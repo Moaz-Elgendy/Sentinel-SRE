@@ -7,6 +7,8 @@ from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.core.config import settings
 from app.core.logging_config import configure_logging
+from app.middleware.access_log import AccessLogMiddleware
+from app.middleware.request_id import RequestIDMiddleware
 from app.routers import health, notifications
 
 configure_logging(service_name="notification-service")
@@ -29,6 +31,8 @@ app = FastAPI(
 # CORS: this service is only ever called server-to-server (citizen-service)
 # today, not from the browser, but the frontend origin is allowed in case
 # a future admin UI queries it directly.
+app.add_middleware(AccessLogMiddleware)
+app.add_middleware(RequestIDMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allowed_origins_list,

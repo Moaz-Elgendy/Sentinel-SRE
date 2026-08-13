@@ -29,6 +29,15 @@ def configure_logging(service_name: str) -> None:
     def record_factory(*args, **kwargs):
         record = old_factory(*args, **kwargs)
         record.service = service_name
+        
+        try:
+            from app.middleware.request_id import get_request_id
+            req_id = get_request_id()
+            if req_id:
+                record.request_id = req_id
+        except Exception:
+            pass
+            
         return record
 
     logging.setLogRecordFactory(record_factory)

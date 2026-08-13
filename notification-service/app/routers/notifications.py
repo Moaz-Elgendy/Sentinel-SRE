@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.metrics import notification_deliveries_total
 from app.core.sender import deliver
 from app.models.notification import Notification
 from app.schemas.notification import NotificationCreate, NotificationOut
@@ -27,6 +28,7 @@ def create_notification(payload: NotificationCreate, db: Session = Depends(get_d
     delivery_status, error_detail = deliver(
         channel=payload.channel.value, recipient=payload.recipient, message=payload.message
     )
+    notification_deliveries_total.labels(channel=payload.channel.value, result=delivery_status.value).inc()
 
     notification = Notification(
         citizen_id=payload.citizen_id,

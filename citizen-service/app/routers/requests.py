@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_citizen
+from app.core.metrics import service_requests_total
 from app.core.notifications import NotificationClient, get_notification_client
 from app.models.citizen import Citizen
 from app.models.request import ServiceRequest
@@ -35,8 +36,9 @@ def create_request(
 
     logger.info(
         "request_submitted",
-        extra={"request_id": str(req.id), "citizen_id": str(current_citizen.id), "service_id": str(service.id)},
+        extra={"service_request_id": str(req.id), "citizen_id": str(current_citizen.id), "service_id": str(service.id)},
     )
+    service_requests_total.labels(status="submitted").inc()
 
     # Fire-and-forget, run after the response is sent so a slow/unavailable
     # Notification Service never adds latency to the citizen-facing call.
@@ -99,9 +101,10 @@ def update_request(
     db.commit()
     db.refresh(req)
 
-    logger.info("request_status_changed", extra={"request_id": str(req.id), "status": req.status.value})
+    logger.info("request_status_changed", extra={"service_request_id": str(req.id), "status": req.status.value})
 
     if status_changed:
+        service_requests_total.labels(status="status_changed").inc()
         background_tasks.add_task(
             notifier.send,
             citizen_id=req.citizen_id,
