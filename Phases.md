@@ -360,6 +360,124 @@ Docker Compose, `.env`-based configuration, healthchecks-driven startup ordering
 
 ---
 
+## Phase 6 — Health checks, metrics, structured logs, request IDs
+
+### What's implemented
+
+This phase hardened both backend services into production-observable processes without changing any
+citizen-facing behavior. Everything added here is infrastructure that Sentinel (and the observability
+stack in Phase 9) will read; no API contract changed.
+
+#### Request ID propagation (both services)
+
+- **`app/middleware/request_id.py`** — `RequestIDMiddleware` (`BaseHTTPMiddleware`). On every
+  inbound request it reads `X-Request-ID` from the header if present, or mints a fresh UUID v4 if
+  not. The value is stored in a `contextvars.ContextVar` so it is safely isolated per async task,
+  and echoed back to the caller in the `X-Request-ID` response header.
+- **`app/core/logging_config.py`** — `configure_logging()` now installs a custom
+  `LogRecordFactory` that injects `request_id` into every log record automatically (pulled from the
+  context var). Every log line — no matter which router or internal module emits it — carries the
+  same `request_id` that the HTTP client sees, so a single value can be used to correlate all log
+  lines for one request across both services in Loki.
+- **`NotificationClient.send()`** propagates the current `request_id` as an `X-Request-ID` header
+  when calling `notification-service`, so a cross-service trace can be followed by one ID even
+  before Jaeger/OTEL arrives.
+
+#### Structured JSON logging (both services)
+
+- `configure_logging()` (called once at module-load in `main.py`) replaces the default logging
+  handler with a `python-json-logger` `JsonFormatter`. Every log line is a JSON object with:
+  `timestamp`, `level`, `name`, `message`, `service` (tagged per-service: `"citizen-service"` or
+  `"notification-service"`), and `request_id` when inside a request context.
+- The access-log middleware (`app/middleware/access_log.py`) emits one `http_request` log entry per
+  non-probe request with `method`, `path`, `status_code`, and `duration_ms`. Probe paths
+  (`/healthz`, `/readyz`, `/metrics`) are skipped to avoid flooding logs with Kubernetes liveness
+  noise.
+
+#### Business-level Prometheus metrics
+
+Both services already exposed the default `prometheus-fastapi-instrumentator` metrics (HTTP latency
+histograms, request counts by route). Phase 6 added hand-rolled Counters/Histograms for
+business-meaningful events:
+
+**citizen-service** (`app/core/metrics.py`):
+
+| Metric | Type | Labels | What it tracks |
+|---|---|---|---|
+| `citizen_registrations_total` | Counter | — | Successful new registrations |
+| `citizen_logins_total` | Counter | `result` (success/failure) | Login attempts |
+| `service_requests_total` | Counter | `status` (submitted/updated) | Service request lifecycle |
+| `notification_dispatches_total` | Counter | `result` (success/failure) | Fire-and-forget calls to notification-service |
+
+**notification-service** (`app/core/metrics.py`):
+
+| Metric | Type | Labels | What it tracks |
+|---|---|---|---|
+| `notification_deliveries_total` | Counter | `channel`, `result` (sent/failed) | Simulated delivery outcomes |
+| `notification_delivery_duration_seconds` | Histogram | `channel` | Simulated delivery latency |
+
+All metrics land at the existing `GET /metrics` endpoint (Prometheus text format) — nothing new to
+scrape, just richer signal for Grafana dashboards and Alertmanager rules in Phase 9.
+
+#### Enhanced health probes
+
+**citizen-service `/readyz`** now returns a structured `checks` map:
+
+```json
+{ "status": "ready",    "checks": { "database": "up", "notification_service": "up" } }
+{ "status": "degraded", "checks": { "database": "up", "notification_service": "degraded" } }
+{ "status": "not_ready","checks": { "database": "down" }, "... 503" }
+```
+
+The probe pings notification-service's `/healthz` with a 1-second timeout. A reachable DB but
+unreachable downstream returns `200 degraded` rather than `503` — Citizen Service can still serve
+traffic even if its downstream is sick; Sentinel will detect the degraded signal and alert without
+causing a false-positive outage page for the service itself.
+
+**notification-service `/readyz`** now returns `version` and `uptime_seconds` alongside the
+database check — gives Sentinel a quick sanity-check that the service actually came up after a
+restart and can distinguish "not yet started" from "crashed after startup".
+
+#### New test coverage (both services)
+
+- **`citizen-service/tests/test_request_id.py`** (2 tests):
+  - `test_request_id_injected_if_missing` — verifies a UUID is generated and echoed in the response
+    header when the client sends no `X-Request-ID`.
+  - `test_request_id_echoed_if_present` — verifies the client-supplied value is echoed back
+    unchanged.
+- **`notification-service/tests/test_request_id.py`** (2 tests): same two assertions for the
+  notification service.
+- Total test counts after Phase 6: **24 passing** (citizen-service), **11 passing**
+  (notification-service).
+
+### What's missing / deferred on purpose
+
+- No distributed tracing (Jaeger / OpenTelemetry) — `X-Request-ID` propagation is the cheap,
+  dependency-free equivalent for now; OTEL spans and a Jaeger sidecar are deferred to a later phase
+  once the Kubernetes layer exists to host them cleanly.
+- No log shipping configuration — Loki/Promtail aren't running yet (Phase 9); the structured JSON
+  format is ready and waiting, but there's nothing to scrape stdout yet.
+- No alerting rules yet — Prometheus will start scraping `/metrics` in Phase 9 and Alertmanager
+  rules will be written then; the business metrics are just being recorded right now.
+
+### Possible improvements
+
+- Add a `Gauge` for the number of currently-open DB connections (SQLAlchemy pool stats) — useful
+  for diagnosing connection-pool exhaustion under load.
+- Replace `X-Request-ID` with a full OpenTelemetry trace context (`traceparent` header) once a
+  Jaeger/Tempo collector is available — the current propagation is a subset of what W3C
+  Trace Context standardizes.
+- Consider emitting `WARNING`-level log entries from `readyz` when the `notification_service`
+  check is `degraded`, so Loki alerts can fire on log-level rather than needing to parse the JSON
+  body.
+
+### Tech stack
+
+No new dependencies beyond Phase 5. `python-json-logger` and `prometheus-client` were already
+present; this phase wired them into both services consistently.
+
+---
+
 ## Running the full stack locally
 
 ```bash
@@ -539,7 +657,32 @@ digital-citizen-portal/
 
 ## What's next
 
-Phases 6 through 12 — deeper health/observability plumbing (request IDs, correlated logs),
-Kubernetes manifests and deployment, the full Prometheus/Grafana/Loki/Alertmanager stack, chaos
-engineering endpoints beyond the notification-delivery hook already in place, CI/CD, and finally
-end-to-end incident simulations for Sentinel to detect and respond to.
+**Phase 6 is done.** Both services are now fully observable: every request carries a traceable
+ID, every log line is structured JSON tagged with `service` and `request_id`, business-meaningful
+metrics are being recorded, and the health probes surface degraded-vs-down distinctions that
+Sentinel can act on.
+
+### Phase 7 — Kubernetes manifests
+
+The next step is writing the Kubernetes manifests to run the same stack that `docker compose up`
+brings up today, but on a cluster. Planned work:
+
+- **`k8s/`** directory at the repo root with one sub-directory per service
+  (`citizen-service/`, `notification-service/`, `frontend/`, `postgres/`,
+  `notification-postgres/`)
+- **Deployments** — one `Deployment` per service, resource requests/limits set conservatively,
+  liveness → `GET /healthz`, readiness → `GET /readyz`
+- **Services** — `ClusterIP` for inter-service traffic (citizen-service → notification-service,
+  both → their Postgres), `NodePort` or `LoadBalancer` for the frontend
+- **ConfigMaps + Secrets** — env vars (DB URLs, JWT secret, CORS origins) moved out of a flat
+  `.env` into typed Kubernetes objects; secrets managed with `kubectl create secret` locally
+  (SOPS/External Secrets in Phase 11 CI/CD)
+- **PersistentVolumeClaims** — one PVC per Postgres instance to survive pod restarts
+- **Ingress** (optional) — a single nginx-ingress or Traefik entry point that routes
+  `/api/*` to citizen-service and `/` to frontend, eliminating the per-service NodePort exposure
+- No Helm yet — plain YAML first so the manifest structure is transparent; Helm (or Kustomize
+  overlays) comes once there are multiple environments to manage
+
+Phases 8 through 12 — deploy to Kubernetes (local kind/minikube first, cloud later), the full
+Prometheus/Grafana/Loki/Alertmanager observability stack, chaos engineering endpoints, CI/CD
+pipeline, and finally end-to-end incident simulations for Sentinel to detect and respond to.
