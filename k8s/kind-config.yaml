@@ -1,0 +1,29 @@
+# kind cluster config for the Digital Citizen Services Portal.
+#
+# extraPortMappings map the host's 80/443 straight to the node's 80/443,
+# which is where ingress-nginx's Service will land (via the node-port
+# hostPort config in the kind-specific install manifest — see
+# scripts/deploy-kind.sh). Without this, the Ingress exists inside the
+# cluster but nothing on the host machine can reach it.
+#
+# node-labels marks this node the way ingress-nginx's official kind
+# manifest expects, so its controller Deployment's nodeSelector/tolerations
+# actually schedule onto this node.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: citizen-portal
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP

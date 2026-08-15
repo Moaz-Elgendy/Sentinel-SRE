@@ -20,8 +20,8 @@ everything that was in them is preserved here, in one place, alongside Phases 4 
 - [x] Phase 4 — Dockerize everything
 - [x] Phase 5 — Docker Compose (full stack)
 - [x] Phase 6 — Health checks, metrics, structured logs, request IDs
-- [ ] Phase 7 — Kubernetes manifests
-- [ ] Phase 8 — Deploy to Kubernetes
+- [x] Phase 7 — Kubernetes manifests
+- [~] Phase 8 — Deploy to Kubernetes (automation written, not yet run on a real cluster — see below)
 - [ ] Phase 9 — Prometheus / Grafana / Loki / Alertmanager
 - [ ] Phase 10 — Chaos / failure injection
 - [ ] Phase 11 — CI/CD
@@ -555,6 +555,21 @@ digital-citizen-portal/
 ├── .env.example
 ├── README.md
 ├── Phases.md                    # this file
+├── k8s/                          # Phase 7 — Kubernetes manifests (see k8s/README.md)
+│   ├── kustomization.yaml
+│   ├── kind-config.yaml
+│   ├── namespace.yaml
+│   ├── postgres/
+│   ├── notification-postgres/
+│   ├── citizen-service/
+│   ├── notification-service/
+│   ├── frontend/
+│   └── ingress/
+├── scripts/                      # Phase 8 — deploy automation (see k8s/README.md)
+│   ├── deploy-kind.sh
+│   ├── deploy-minikube.sh
+│   ├── teardown.sh
+│   └── smoke-test.sh
 ├── citizen-service/
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -655,34 +670,171 @@ digital-citizen-portal/
   `notification_dispatch_failed` log lines, and `docker compose ps` to confirm
   `notification-service` itself is healthy.
 
+## Phase 7 — Kubernetes manifests
+
+### What's implemented
+
+Plain Kubernetes YAML (no Helm yet) that mirrors `docker-compose.yml` exactly, in a `k8s/`
+directory at the repo root — see `k8s/README.md` for the full breakdown, build/deploy commands,
+and every design decision explained. Summary:
+
+- **`k8s/namespace.yaml`** — everything lives in the `citizen-portal` namespace.
+- **`k8s/postgres/`** and **`k8s/notification-postgres/`** — Secret, PersistentVolumeClaim,
+  Deployment (`replicas: 1`, `strategy: Recreate` — these are stateful, single-instance
+  databases, not horizontally scaled), Service. One Postgres per microservice, matching the
+  Phase 2/5 database-per-service boundary.
+- **`k8s/citizen-service/`** and **`k8s/notification-service/`** — ConfigMap (non-secret env),
+  Secret (DB credentials, JWT secret), Deployment at `replicas: 2` with an `initContainer` that
+  runs `alembic upgrade head` (and `python -m app.seed` for citizen-service) once per rollout
+  before the app container starts, liveness on `GET /healthz`, readiness on `GET /readyz`
+  (which — per Phase 6 — can report a non-503 "degraded" status without pulling the pod out of
+  rotation). `citizen-service` also gets a PVC for `/data/uploads`.
+- **`k8s/frontend/`** — Deployment at `replicas: 2`, both probes on nginx's `/healthz`.
+- **`k8s/ingress/ingress.yaml`** — one host, `/api` → citizen-service, `/` → frontend.
+  `notification-service` deliberately has **no** Ingress rule — it's server-to-server only.
+- **`k8s/kustomization.yaml`** — `kubectl apply -k k8s/` applies all 21 manifests in one command.
+
+The trickiest real design decision: the frontend bakes `VITE_API_BASE_URL` into its JS bundle at
+Vite *build* time, not at container runtime. For the Ingress's same-origin routing to work, the
+image has to be built with `VITE_API_BASE_URL=""` so the browser calls relative `/api/...` paths
+— this is a different build than the one `docker-compose.yml` uses (which points at
+`http://localhost:8000` directly). Documented in `k8s/README.md` with the exact build command.
+
+### Fixed since first written
+
+Nothing — this is a new phase with no prior version to fix.
+
+### What's missing / deferred on purpose
+
+- **No live cluster validation.** No `kubectl` binary and no cluster were available in the
+  environment these manifests were built in. What *was* verified: all 21 YAML files parse, every
+  `ConfigMap`/`Secret`/`PVC` reference inside a Deployment resolves to a declared object, every
+  `Service` selector matches its Deployment's pod labels, namespaces are consistent, and every
+  path in `kustomization.yaml` exists on disk. A real `kubectl apply --dry-run=server` (or just
+  applying for real) against an actual cluster is the first thing to do in Phase 8 — treat these
+  manifests as reviewed-but-not-yet-cluster-tested.
+- **No actual deployment yet** — no cluster is running, nothing has been applied. That's Phase 8.
+- **Plaintext demo secrets** — the `Secret` manifests use the same placeholder credentials as
+  `.env.example` (`sentinal`), committed as plain YAML. Fine for a local kind/minikube demo,
+  explicitly not fine for anything real — SOPS/External Secrets lands in Phase 11.
+- **No HorizontalPodAutoscaler, no NetworkPolicy, no PodDisruptionBudget** — not needed yet at
+  this stage; worth adding once there's real traffic/failure data to size and scope them against.
+- **No Helm / Kustomize overlays for multiple environments** — intentional, see `k8s/README.md`;
+  one environment (local cluster) exists right now, so overlays would be speculative complexity.
+
+### Possible improvements
+
+- Add a `NetworkPolicy` restricting `notification-service`'s ingress to only
+  `citizen-service`'s pod selector, formalizing in-cluster what's currently just "no Ingress rule
+  points at it."
+- Add a `PodDisruptionBudget` for `citizen-service` and `notification-service` (`minAvailable: 1`)
+  once Phase 8 exercises rolling restarts, so a voluntary disruption (node drain, `kubectl
+  rollout restart`) can't take both replicas down at once.
+- Move `citizen-service`'s uploads off a `ReadWriteOnce` PVC and onto object storage (or a
+  `ReadWriteMany` StorageClass) before this ever runs on a multi-node cluster — see the comment
+  in `k8s/citizen-service/deployment.yaml`.
+
+### Tech stack
+
+Kubernetes YAML manifests (`apps/v1` Deployments, `v1` Services/Secrets/ConfigMaps/PVCs,
+`networking.k8s.io/v1` Ingress), Kustomize (bases only, no overlays) for the apply-everything
+entrypoint. No new application dependencies — this phase is pure infrastructure-as-code sitting
+on top of the images Phase 4 already builds.
+
+---
+
+## Phase 8 — Deploy to Kubernetes
+
+### What's implemented
+
+Full deployment automation, built on top of Phase 7's manifests:
+
+- **`k8s/kind-config.yaml`** — a kind cluster config with an `ingress-ready=true` node label and
+  `extraPortMappings` for host ports 80/443, so the Ingress installed inside the cluster is
+  actually reachable from outside it.
+- **`scripts/deploy-kind.sh`** — one script, seven steps: create the kind cluster (idempotent —
+  reuses an existing one), install ingress-nginx (kind-specific manifest, pinned version, see
+  the "Ingress controller note" below), build all three images, load them into kind's image
+  store, `kubectl apply -k k8s/`, wait for every Deployment's rollout to complete, then print the
+  `/etc/hosts` line and a smoke-test command.
+- **`scripts/deploy-minikube.sh`** — the same seven-step flow for minikube (`minikube start`,
+  `minikube addons enable ingress`, build, `minikube image load`, apply, wait, print next steps)
+  for anyone who already has minikube set up instead of kind.
+- **`scripts/teardown.sh`** — `./scripts/teardown.sh kind` or `./scripts/teardown.sh minikube`,
+  a full reset (deletes the cluster, including PVCs).
+- **`scripts/smoke-test.sh`** — scripts the exact "Try it out" flow from this doc against a live
+  deployment: register a real citizen, log in, browse the seeded services, submit a request,
+  confirm it shows up in "My Requests". Takes an optional base URL argument so it can also be
+  pointed at `http://localhost:8000` to test citizen-service directly without the Ingress.
+
+### An important, uncomfortable finding
+
+Researching the current ingress-nginx version to pin turned up something that changes this
+phase's risk profile: **the `kubernetes/ingress-nginx` project was retired by the Kubernetes
+Steering and Security Response Committees in March 2026** — announced November 2025, confirmed
+at retirement. No further releases, bugfixes, or security patches will ever be published for it
+again. It still installs and works correctly for local kind/minikube development, which is all
+this phase needs, and `scripts/deploy-kind.sh` pins the last maintained release (`v1.15.1`)
+rather than something already stale. But this is now explicitly documented in
+`k8s/README.md`'s "Ingress controller note" as **not safe to carry past a local demo cluster** —
+before this project's Ingress layer ever faces real traffic, it needs to move to an actively
+maintained alternative (Traefik, the F5 NGINX Ingress Controller, or a Gateway API
+implementation). Flagging this now, while it's cheap to fix, rather than letting it become a
+silent landmine for a later phase.
+
+### What's missing / deferred on purpose
+
+- **None of this has been run against a real cluster yet.** No `docker`, `kind`, `minikube`, or
+  `kubectl` were available in the environment these scripts were written in — everything here is
+  reviewed and internally consistent (every script passes `bash -n`, the ingress-nginx manifest
+  URL was confirmed to resolve to a real, current release, the kind config YAML is valid) but
+  **untested end-to-end**. Running `./scripts/deploy-kind.sh` for the first time for real, on an
+  actual machine, is the genuinely first validation this automation gets. If it breaks on that
+  first run, that's an expected part of shipping new automation, not a sign of a deeper problem
+  — it just needs to be reported back so it can be fixed here.
+- **No cluster-creation troubleshooting section yet** — `k8s/README.md` documents the intended
+  flow, but real first-run friction (a stuck `ingress-nginx` webhook pod, a kind networking quirk
+  on a particular OS, a Docker Desktop resource limit) hasn't been hit yet, so there's nothing to
+  document as a fix. That section gets built from whatever actually goes wrong on first use.
+- **No CI validation of the manifests** — that's Phase 11's job, once there's a pipeline to run
+  `kubectl apply --dry-run=server` or a tool like `kubeconform` against every PR.
+
+### Possible improvements
+
+- Add a `kubeconform` (or similar schema validator) step to `scripts/deploy-kind.sh` before the
+  `kubectl apply -k` step, so a manifest typo fails fast with a clear message instead of a
+  confusing mid-rollout error.
+- Extend `scripts/smoke-test.sh` to also verify the notification actually landed in
+  `notification-service` (currently it prints manual `kubectl port-forward` instructions instead,
+  since `notification-service` has no Ingress rule by design — see Phase 7).
+- Once Phase 8 has been run for real at least once, capture the actual wall-clock time each step
+  takes and add progress expectations to `k8s/README.md` ("ingress-nginx usually takes ~60-90s to
+  become ready" etc.) so a first-time user knows what's normal versus stuck.
+
+### Tech stack
+
+kind and/or minikube (either works — both scripts are provided), ingress-nginx `v1.15.1` (last
+maintained release — see the note above), bash for all automation scripts. No new application
+dependencies.
+
+---
+
 ## What's next
 
-**Phase 6 is done.** Both services are now fully observable: every request carries a traceable
-ID, every log line is structured JSON tagged with `service` and `request_id`, business-meaningful
-metrics are being recorded, and the health probes surface degraded-vs-down distinctions that
-Sentinel can act on.
+**Phase 7's manifests are written; Phase 8's deployment automation is written on top of them —
+but neither has touched a real cluster yet.** That first real run is the very next step, and it
+comes before any more phases are planned on top of this:
 
-### Phase 7 — Kubernetes manifests
+1. Run `./scripts/deploy-kind.sh` (or `deploy-minikube.sh`) for real, on a machine with Docker
+   and the relevant cluster tool installed.
+2. Fix whatever that first run surfaces — this is genuinely expected, not a sign something is
+   wrong with the plan.
+3. Run `./scripts/smoke-test.sh` and confirm it passes against the live deployment.
+4. Update `k8s/README.md`'s troubleshooting section with whatever was actually encountered, so
+   the next person (or the next phase) doesn't hit the same surprise blind.
 
-The next step is writing the Kubernetes manifests to run the same stack that `docker compose up`
-brings up today, but on a cluster. Planned work:
-
-- **`k8s/`** directory at the repo root with one sub-directory per service
-  (`citizen-service/`, `notification-service/`, `frontend/`, `postgres/`,
-  `notification-postgres/`)
-- **Deployments** — one `Deployment` per service, resource requests/limits set conservatively,
-  liveness → `GET /healthz`, readiness → `GET /readyz`
-- **Services** — `ClusterIP` for inter-service traffic (citizen-service → notification-service,
-  both → their Postgres), `NodePort` or `LoadBalancer` for the frontend
-- **ConfigMaps + Secrets** — env vars (DB URLs, JWT secret, CORS origins) moved out of a flat
-  `.env` into typed Kubernetes objects; secrets managed with `kubectl create secret` locally
-  (SOPS/External Secrets in Phase 11 CI/CD)
-- **PersistentVolumeClaims** — one PVC per Postgres instance to survive pod restarts
-- **Ingress** (optional) — a single nginx-ingress or Traefik entry point that routes
-  `/api/*` to citizen-service and `/` to frontend, eliminating the per-service NodePort exposure
-- No Helm yet — plain YAML first so the manifest structure is transparent; Helm (or Kustomize
-  overlays) comes once there are multiple environments to manage
-
-Phases 8 through 12 — deploy to Kubernetes (local kind/minikube first, cloud later), the full
-Prometheus/Grafana/Loki/Alertmanager observability stack, chaos engineering endpoints, CI/CD
-pipeline, and finally end-to-end incident simulations for Sentinel to detect and respond to.
+Once Phase 8 is confirmed working end-to-end on a real cluster, Phases 9 through 12 continue as
+planned: the full Prometheus/Grafana/Loki/Alertmanager observability stack, chaos engineering
+endpoints, a CI/CD pipeline (which is also where the ingress-nginx retirement finding above
+should get resolved — either by migrating the Ingress controller then, or earlier if it becomes
+urgent), and finally end-to-end incident simulations for Sentinel to detect and respond to.
