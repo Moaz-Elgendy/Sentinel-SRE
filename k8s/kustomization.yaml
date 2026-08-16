@@ -31,3 +31,24 @@ resources:
   - frontend/deployment.yaml
   - frontend/service.yaml
   - ingress/ingress.yaml
+  # Phase 9 — observability stack
+  - monitoring/prometheus/rbac.yaml
+  - monitoring/prometheus/configmap.yaml
+  - monitoring/prometheus/rules-configmap.yaml
+  - monitoring/prometheus/deployment.yaml
+  - monitoring/prometheus/service.yaml
+  - monitoring/alertmanager/configmap.yaml
+  - monitoring/alertmanager/deployment.yaml
+  - monitoring/alertmanager/service.yaml
+  - monitoring/loki/configmap.yaml
+  - monitoring/loki/deployment.yaml
+  - monitoring/loki/service.yaml
+  - monitoring/alloy/rbac.yaml
+  - monitoring/alloy/configmap.yaml
+  - monitoring/alloy/daemonset.yaml
+  - monitoring/grafana/secret.yaml
+  - monitoring/grafana/datasources-configmap.yaml
+  - monitoring/grafana/dashboard-provider-configmap.yaml
+  - monitoring/grafana/dashboard-json-configmap.yaml
+  - monitoring/grafana/deployment.yaml
+  - monitoring/grafana/service.yaml

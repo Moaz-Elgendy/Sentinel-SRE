@@ -21,8 +21,8 @@ everything that was in them is preserved here, in one place, alongside Phases 4 
 - [x] Phase 5 — Docker Compose (full stack)
 - [x] Phase 6 — Health checks, metrics, structured logs, request IDs
 - [x] Phase 7 — Kubernetes manifests
-- [~] Phase 8 — Deploy to Kubernetes (automation written, not yet run on a real cluster — see below)
-- [ ] Phase 9 — Prometheus / Grafana / Loki / Alertmanager
+- [x] Phase 8 — Deploy to Kubernetes
+- [x] Phase 9 — Prometheus / Grafana / Loki / Alertmanager
 - [ ] Phase 10 — Chaos / failure injection
 - [ ] Phase 11 — CI/CD
 - [ ] Phase 12 — End-to-end incident simulations
@@ -564,8 +564,15 @@ digital-citizen-portal/
 │   ├── citizen-service/
 │   ├── notification-service/
 │   ├── frontend/
-│   └── ingress/
+│   ├── ingress/
+│   └── monitoring/                # Phase 9 — observability stack
+│       ├── prometheus/
+│       ├── alertmanager/
+│       ├── loki/
+│       ├── alloy/
+│       └── grafana/
 ├── scripts/                      # Phase 8 — deploy automation (see k8s/README.md)
+│   ├── deploy-docker-desktop.sh
 │   ├── deploy-kind.sh
 │   ├── deploy-minikube.sh
 │   ├── teardown.sh
@@ -747,94 +754,222 @@ on top of the images Phase 4 already builds.
 
 ### What's implemented
 
-Full deployment automation, built on top of Phase 7's manifests:
+Deployment automation, built on top of Phase 7's manifests, plus a real deployment confirmed
+working on Docker Desktop's built-in Kubernetes:
 
-- **`k8s/kind-config.yaml`** — a kind cluster config with an `ingress-ready=true` node label and
-  `extraPortMappings` for host ports 80/443, so the Ingress installed inside the cluster is
-  actually reachable from outside it.
-- **`scripts/deploy-kind.sh`** — one script, seven steps: create the kind cluster (idempotent —
-  reuses an existing one), install ingress-nginx (kind-specific manifest, pinned version, see
-  the "Ingress controller note" below), build all three images, load them into kind's image
-  store, `kubectl apply -k k8s/`, wait for every Deployment's rollout to complete, then print the
-  `/etc/hosts` line and a smoke-test command.
-- **`scripts/deploy-minikube.sh`** — the same seven-step flow for minikube (`minikube start`,
-  `minikube addons enable ingress`, build, `minikube image load`, apply, wait, print next steps)
-  for anyone who already has minikube set up instead of kind.
-- **`scripts/teardown.sh`** — `./scripts/teardown.sh kind` or `./scripts/teardown.sh minikube`,
-  a full reset (deletes the cluster, including PVCs).
-- **`scripts/smoke-test.sh`** — scripts the exact "Try it out" flow from this doc against a live
-  deployment: register a real citizen, log in, browse the seeded services, submit a request,
-  confirm it shows up in "My Requests". Takes an optional base URL argument so it can also be
-  pointed at `http://localhost:8000` to test citizen-service directly without the Ingress.
+- **`scripts/deploy-docker-desktop.sh`** — targets Docker Desktop's Kubernetes specifically,
+  which turned out to be the simplest path for this project: the cluster is already running, and
+  it shares Docker Desktop's own image store directly, so `docker build` output is immediately
+  visible to the cluster with no `kind load` / `minikube image load` equivalent needed at all. It
+  also natively supports `LoadBalancer` Services bound to `localhost`, so ingress-nginx needs no
+  NodePort/extraPortMappings workaround. Refuses to run unless `kubectl`'s current context is
+  literally `docker-desktop`, so it can never accidentally apply to the wrong cluster.
+- **`k8s/kind-config.yaml`** + **`scripts/deploy-kind.sh`** — the kind-specific path (a
+  cluster-in-a-container, useful if you don't use Docker Desktop's own Kubernetes or want
+  something fully disposable): create cluster, install ingress-nginx (kind-specific manifest),
+  build images, load them into kind's image store, apply, wait for rollout.
+- **`scripts/deploy-minikube.sh`** — the equivalent for minikube.
+- **`scripts/teardown.sh`** and **`scripts/smoke-test.sh`** (registers a real citizen, logs in,
+  browses seeded services, submits a request, confirms it shows up — a real end-to-end check
+  against a live deployment, not just "pods are Running").
+
+### Confirmed working on a real cluster
+
+Unlike Phase 7, this phase has now actually been run: all 8 pods (`citizen-postgres`,
+`citizen-service` ×2, `frontend` ×2, `notification-postgres`, `notification-service` ×2) reached
+`Running` on Docker Desktop's Kubernetes, using plain `docker build -t <name>:latest .` images
+(no registry namespace) built directly from this repo's Dockerfiles. Two real things came out of
+that first run, both now fixed:
+
+1. **Image naming.** The manifests originally referenced `citizen-portal/citizen-service:latest`
+   etc. (a namespaced tag, from Phase 7's original — untested — assumptions). A straightforward
+   local `docker build -t citizen-service:latest ./citizen-service` doesn't produce that
+   namespace. Fixed by dropping the `citizen-portal/` prefix from every `image:` field across all
+   three Deployments (and updating every doc that referenced the old names) — the manifests now
+   match a plain local build exactly, which is what most people will actually run.
+2. **No Ingress applied yet in that first pass** — `frontend` was reached via
+   `kubectl port-forward svc/frontend 3000:3000`, which loads the page but breaks all API calls:
+   the frontend's JS bundle calls relative `/api/...` paths (built with `VITE_API_BASE_URL=""`,
+   see Phase 7's design decisions), expecting an Ingress in front of it to route those calls to
+   `citizen-service`. Port-forwarding the frontend alone has nothing to route `/api/...` to. This
+   is now the first item in `k8s/README.md`'s new **Troubleshooting** section, along with the
+   related (and also real) question of why pods don't show up in Docker Desktop's container GUI
+   (expected — Docker Desktop's Kubernetes runs pods via `containerd`/`kubelet`, a separate
+   runtime path from the one the GUI's Containers tab reads). The actual fix: apply
+   `k8s/ingress/ingress.yaml` (or just run `deploy-docker-desktop.sh`, which does it
+   automatically) and hit `http://citizen-portal.local` — no port-forwarding needed at all.
 
 ### An important, uncomfortable finding
 
-Researching the current ingress-nginx version to pin turned up something that changes this
-phase's risk profile: **the `kubernetes/ingress-nginx` project was retired by the Kubernetes
-Steering and Security Response Committees in March 2026** — announced November 2025, confirmed
-at retirement. No further releases, bugfixes, or security patches will ever be published for it
-again. It still installs and works correctly for local kind/minikube development, which is all
-this phase needs, and `scripts/deploy-kind.sh` pins the last maintained release (`v1.15.1`)
-rather than something already stale. But this is now explicitly documented in
-`k8s/README.md`'s "Ingress controller note" as **not safe to carry past a local demo cluster** —
-before this project's Ingress layer ever faces real traffic, it needs to move to an actively
-maintained alternative (Traefik, the F5 NGINX Ingress Controller, or a Gateway API
-implementation). Flagging this now, while it's cheap to fix, rather than letting it become a
-silent landmine for a later phase.
+Researching which ingress-nginx version to pin turned up something that changes this phase's
+risk profile: **the `kubernetes/ingress-nginx` project was retired by the Kubernetes Steering and
+Security Response Committees in March 2026** — announced November 2025, confirmed at retirement.
+No further releases, bugfixes, or security patches will ever be published for it again. It still
+installs and works correctly for local development, which is all this phase needs, and every
+deploy script pins the last maintained release (`v1.15.1`) rather than something already stale.
+But this is documented in `k8s/README.md`'s "Ingress controller note" as **not safe to carry past
+a local demo cluster** — before this project's Ingress layer ever faces real traffic, it needs to
+move to an actively maintained alternative (Traefik, the F5 NGINX Ingress Controller, or a
+Gateway API implementation). Flagging this now, while it's cheap to fix, rather than letting it
+become a silent landmine for a later phase.
 
 ### What's missing / deferred on purpose
 
-- **None of this has been run against a real cluster yet.** No `docker`, `kind`, `minikube`, or
-  `kubectl` were available in the environment these scripts were written in — everything here is
-  reviewed and internally consistent (every script passes `bash -n`, the ingress-nginx manifest
-  URL was confirmed to resolve to a real, current release, the kind config YAML is valid) but
-  **untested end-to-end**. Running `./scripts/deploy-kind.sh` for the first time for real, on an
-  actual machine, is the genuinely first validation this automation gets. If it breaks on that
-  first run, that's an expected part of shipping new automation, not a sign of a deeper problem
-  — it just needs to be reported back so it can be fixed here.
-- **No cluster-creation troubleshooting section yet** — `k8s/README.md` documents the intended
-  flow, but real first-run friction (a stuck `ingress-nginx` webhook pod, a kind networking quirk
-  on a particular OS, a Docker Desktop resource limit) hasn't been hit yet, so there's nothing to
-  document as a fix. That section gets built from whatever actually goes wrong on first use.
+- **Not yet re-verified with the Ingress actually in place end to end.** The pod-level deployment
+  and the image-naming fix are confirmed; a full `smoke-test.sh` run against
+  `http://citizen-portal.local` (post-Ingress-fix) hasn't been reported back yet. Worth doing as
+  the very next step before treating Phase 8 as fully closed.
+- **kind and minikube paths are still unverified against a real cluster** — only the Docker
+  Desktop path has been run for real so far. They're written the same way and reviewed the same
+  way `deploy-docker-desktop.sh` was before its first run, so the same "expect first-run friction"
+  caveat applies if/when someone runs them.
 - **No CI validation of the manifests** — that's Phase 11's job, once there's a pipeline to run
   `kubectl apply --dry-run=server` or a tool like `kubeconform` against every PR.
 
 ### Possible improvements
 
-- Add a `kubeconform` (or similar schema validator) step to `scripts/deploy-kind.sh` before the
+- Add a `kubeconform` (or similar schema validator) step to the deploy scripts before the
   `kubectl apply -k` step, so a manifest typo fails fast with a clear message instead of a
   confusing mid-rollout error.
 - Extend `scripts/smoke-test.sh` to also verify the notification actually landed in
   `notification-service` (currently it prints manual `kubectl port-forward` instructions instead,
   since `notification-service` has no Ingress rule by design — see Phase 7).
-- Once Phase 8 has been run for real at least once, capture the actual wall-clock time each step
-  takes and add progress expectations to `k8s/README.md` ("ingress-nginx usually takes ~60-90s to
-  become ready" etc.) so a first-time user knows what's normal versus stuck.
+- Capture actual wall-clock timings for each step (now that real runs exist) and add progress
+  expectations to `k8s/README.md` ("ingress-nginx usually takes ~60-90s to become ready" etc.) so
+  a first-time user knows what's normal versus stuck.
 
 ### Tech stack
 
-kind and/or minikube (either works — both scripts are provided), ingress-nginx `v1.15.1` (last
-maintained release — see the note above), bash for all automation scripts. No new application
-dependencies.
+Docker Desktop's built-in Kubernetes (primary, confirmed working), kind and minikube (alternative
+paths, scripts written but not yet run for real), ingress-nginx `v1.15.1` (last maintained
+release — see the note above), bash for all automation scripts. No new application dependencies.
+
+---
+
+## Phase 9 — Prometheus / Grafana / Loki / Alertmanager
+
+### What's implemented
+
+The full observability stack, in `k8s/monitoring/`, following the same plain-YAML-per-component
+pattern Phase 7 established (no Helm, no Prometheus Operator CRDs):
+
+- **Prometheus** (`monitoring/prometheus/`) — scrapes `citizen-service` and
+  `notification-service` via annotation-based discovery: both Deployments' pod templates now
+  carry `prometheus.io/scrape`, `prometheus.io/port`, `prometheus.io/path` annotations, and
+  Prometheus's `kubernetes_sd_configs` (role: `pod`) matches on exactly those. A scoped `Role`
+  (not a cluster-wide `ClusterRole`) grants just enough RBAC for pod discovery within
+  `citizen-portal`. A first, deliberately small alerting rule set — `ServiceDown` (via the
+  synthetic `up` metric, no application code needed), `HighHTTPErrorRate`, and
+  `HighRequestLatency` (both built on `http_requests_total` / `http_request_duration_seconds`,
+  already emitted since Phase 1/6's `prometheus-fastapi-instrumentator` setup).
+- **Grafana** (`monitoring/grafana/`) — Prometheus and Loki datasources provisioned via
+  ConfigMap (no manual "Add data source" click-through), plus one starter dashboard
+  ("Citizen Portal Overview") showing pods-up, request rate, 5xx error rate, p95 latency, and a
+  live log panel — deliberately the same signals the alerting rules watch, so what you see on
+  the dashboard is what pages you.
+- **Loki** (`monitoring/loki/`) — single-binary mode, filesystem storage on an `emptyDir` (same
+  ephemeral-storage trade-off Prometheus makes — fine for a local demo, add a PVC before relying
+  on real retention).
+- **Alertmanager** (`monitoring/alertmanager/`) — wired to receive alerts from Prometheus. The
+  routing tree's default receiver has no integrations configured yet (see "What's missing"
+  below) — alerts are visible in Alertmanager's UI/API but nothing pages out yet.
+- Log shipping via **Grafana Alloy**, not Promtail (see the finding below) —
+  `monitoring/alloy/` is a DaemonSet using `loki.source.kubernetes` (Kubernetes API-based
+  tailing) to ship every `citizen-portal` pod's logs to Loki, parsing the structured JSON logs
+  Phase 6 already emits (`level`, `request_id`, `service`) into queryable Loki labels.
+- `k8s/README.md` gained an "Accessing the observability stack" section (everything here is
+  `kubectl port-forward`-only, deliberately not Ingress-exposed — these are internal tools, not
+  citizen-facing) and a "How scraping works" explainer.
+- All three deploy scripts (`deploy-docker-desktop.sh`, `deploy-kind.sh`, `deploy-minikube.sh`)
+  now wait on the new Deployments and the Alloy DaemonSet's rollout, and print a pointer to the
+  port-forward instructions once everything's up.
+
+### An important finding, same shape as Phase 8's
+
+While deciding how to ship logs to Loki, the obvious default — Promtail — turned out to already
+be **deprecated**: its functionality has been merged into Grafana Alloy. Building this phase on
+Promtail would have meant starting on a tool already headed for removal. `monitoring/alloy/`
+uses Alloy's River-syntax config from the start instead. As a side benefit (not the reason for
+the choice, but a nice one), Alloy's `loki.source.kubernetes` tails via the Kubernetes API rather
+than reading host log files, so this DaemonSet needs no `hostPath` mounts or elevated privileges
+the way a classic Promtail setup would.
+
+### What's missing / deferred on purpose
+
+- **No real Alertmanager receiver wired up.** The default receiver has zero integrations — no
+  Slack webhook, no PagerDuty, no email. This is deliberate: faking a receiver with a placeholder
+  webhook URL would just silently fail on every alert, which is worse than being honest that this
+  decision (which channel? whose on-call?) hasn't been made yet. Alerts are inspectable via
+  Alertmanager's UI/API in the meantime.
+- **Not yet run against a real cluster.** Like Phase 7's original manifests, everything in
+  `k8s/monitoring/` was built and internally validated (all YAML parses, every
+  ConfigMap/Secret/PVC/ServiceAccount reference resolves, every Service selector matches its
+  Deployment/DaemonSet's pod labels, the dashboard JSON is valid, all scripts pass `bash -n`) but
+  has not yet been applied to a live cluster. Unlike Phase 8's first pass, there's no confirmed
+  real-cluster run to report on yet for this phase specifically — that's the next step.
+- **No readiness-degraded-vs-down alert.** Phase 6 built `/readyz` to distinguish "down" from
+  "degraded" (e.g., notification-service unreachable but citizen-service still functional) in the
+  JSON response body — but that distinction isn't yet exposed as a Prometheus metric, so
+  Alertmanager can't currently alert on "degraded" specifically, only on a scrape actually
+  failing. Needs a new gauge metric in Phase 6's health router before this is alertable.
+- **No Postgres-specific alerting.** Alerting on a Postgres pod going down currently relies on
+  Kubernetes' own pod-readiness safety net, not a Prometheus rule — `postgres_exporter` isn't
+  deployed, so there's no Postgres-level metric to write a rule against yet.
+- **No CI validation of the manifests** — still Phase 11's job, same as noted in Phase 8.
+
+### Possible improvements
+
+- Deploy `postgres_exporter` alongside both Postgres instances and add a `PostgresDown` /
+  `PostgresReplicationLag`-style rule once there's a real metric to alert on.
+- Expose the readiness-degraded state as a Prometheus gauge (e.g.
+  `citizen_service_readiness_status{status="degraded"}`) so Alertmanager can distinguish
+  "notification-service is unreachable but citizen-service still works" from a full outage,
+  instead of only seeing the binary `up`/`down` signal.
+- Wire a real Alertmanager receiver once there's an actual channel to send to.
+- Move to the Prometheus Operator's `ServiceMonitor`/`PodMonitor` CRDs once there's a reason to
+  manage more than two scrape targets — annotation-based discovery is the right amount of
+  complexity for two services, not necessarily for more.
+- Add a PVC for Prometheus's and Loki's storage (matching the pattern already used for both
+  Postgres instances) before treating either's data as anything but disposable.
+
+### Tech stack
+
+Prometheus `v3.13.2`, Grafana `13.1.3`, Loki `3.7.5`, Grafana Alloy `v1.16.3` (not Promtail — see
+the finding above), Alertmanager `v0.33.1`. All versions confirmed current via search rather than
+assumed from training data, consistent with how ingress-nginx's version was handled in Phase 8.
 
 ---
 
 ## What's next
 
-**Phase 7's manifests are written; Phase 8's deployment automation is written on top of them —
-but neither has touched a real cluster yet.** That first real run is the very next step, and it
-comes before any more phases are planned on top of this:
+**Phase 8 is confirmed working end-to-end on Docker Desktop's Kubernetes. Phase 9's observability
+stack is built and internally validated, but — like Phase 7 before its first real run — hasn't
+yet been applied to a live cluster.** That's the immediate next step, in order:
 
-1. Run `./scripts/deploy-kind.sh` (or `deploy-minikube.sh`) for real, on a machine with Docker
-   and the relevant cluster tool installed.
-2. Fix whatever that first run surfaces — this is genuinely expected, not a sign something is
-   wrong with the plan.
-3. Run `./scripts/smoke-test.sh` and confirm it passes against the live deployment.
-4. Update `k8s/README.md`'s troubleshooting section with whatever was actually encountered, so
-   the next person (or the next phase) doesn't hit the same surprise blind.
+1. Run one of the `deploy-*.sh` scripts again (they're idempotent) to pick up
+   `k8s/monitoring/` alongside everything already running.
+2. Confirm all of `prometheus`, `alertmanager`, `loki`, `grafana`, and the `alloy` DaemonSet
+   reach `Running`/`Ready`.
+3. Port-forward into Grafana (`kubectl port-forward -n citizen-portal svc/grafana 3001:3000`),
+   confirm the "Citizen Portal Overview" dashboard loads with real data, and confirm the log
+   panel is actually receiving log lines from Alloy.
+4. Port-forward into Prometheus and check Status → Targets — confirm both `citizen-service` and
+   `notification-service` pods show as `UP` under the `kubernetes-pods` job.
+5. Trigger something that should fire `ServiceDown` (e.g. `kubectl scale deployment
+   citizen-service -n citizen-portal --replicas=0` briefly) and confirm it shows up in
+   Alertmanager's UI within a couple of minutes — the first real proof this stack actually
+   detects a failure, not just that its YAML is well-formed.
+6. Report back whatever that first run surfaces — same expectation as Phase 8's first run.
 
-Once Phase 8 is confirmed working end-to-end on a real cluster, Phases 9 through 12 continue as
-planned: the full Prometheus/Grafana/Loki/Alertmanager observability stack, chaos engineering
-endpoints, a CI/CD pipeline (which is also where the ingress-nginx retirement finding above
-should get resolved — either by migrating the Ingress controller then, or earlier if it becomes
-urgent), and finally end-to-end incident simulations for Sentinel to detect and respond to.
+### Phase 10 — Chaos engineering endpoints
+
+Once Phase 9 is confirmed actually watching the system, Phase 10 gives it something real to
+react to: deliberate, controllable failure injection in `citizen-service` and
+`notification-service` (both already have a `CHAOS_MODE` config flag reserved since Phase 1/2 —
+this is where it gets used), likely as an admin-only endpoint or environment-variable-driven
+fault injection (artificial latency, forced 5xx responses, simulated DB connection loss) that
+Prometheus's new alerting rules and Grafana's new dashboard should visibly catch in real time.
+
+Phases 11 and 12 remain: a CI/CD pipeline (also where the ingress-nginx retirement finding from
+Phase 8 should get resolved), and finally end-to-end incident simulations for Sentinel to detect
+and respond to, using the exact observability stack this phase just built.

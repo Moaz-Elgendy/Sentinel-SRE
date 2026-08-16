@@ -1,0 +1,63 @@
+# A deliberately small first set of alerting rules, built only on signals
+# this project actually emits today. Resist the urge to add more before
+# there's real traffic/failure data to tune thresholds against — see
+# Phases.md Phase 9 "Possible improvements" for what's intentionally NOT
+# here yet (a readiness-degraded-vs-down alert needs a new metric that
+# doesn't exist yet; Postgres alerting needs postgres_exporter, not
+# installed).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: citizen-portal
+data:
+  citizen-portal.yml: |
+    groups:
+      - name: citizen-portal.rules
+        rules:
+          - alert: ServiceDown
+            # `up` is a synthetic metric Prometheus sets to 0 automatically
+            # when a scrape fails — no application code needed for this one.
+            expr: up{kubernetes_namespace="citizen-portal", job="kubernetes-pods"} == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "{{ $labels.app }} pod {{ $labels.kubernetes_pod_name }} is down"
+              description: >-
+                Prometheus has failed to scrape {{ $labels.kubernetes_pod_name }}
+                ({{ $labels.app }}) for 2 minutes. Check `kubectl get pods -n
+                citizen-portal` and `kubectl logs`.
+
+          - alert: HighHTTPErrorRate
+            # http_requests_total comes from prometheus-fastapi-instrumentator,
+            # already wired into both services since Phase 1/6 — see
+            # citizen-service/app/main.py and notification-service/app/main.py.
+            expr: >-
+              sum(rate(http_requests_total{status=~"5..", kubernetes_namespace="citizen-portal"}[5m])) by (app)
+              /
+              sum(rate(http_requests_total{kubernetes_namespace="citizen-portal"}[5m])) by (app)
+              > 0.05
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} is returning >5% 5xx responses"
+              description: >-
+                {{ $labels.app }}'s 5xx error rate has been above 5% for 5
+                minutes. Check recent deploys and `kubectl logs` for stack
+                traces.
+
+          - alert: HighRequestLatency
+            expr: >-
+              histogram_quantile(0.95,
+                sum(rate(http_request_duration_seconds_bucket{kubernetes_namespace="citizen-portal"}[5m])) by (app, le)
+              ) > 1
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }}'s p95 latency is above 1s"
+              description: >-
+                {{ $labels.app }}'s 95th-percentile request latency has been
+                above 1 second for 5 minutes.

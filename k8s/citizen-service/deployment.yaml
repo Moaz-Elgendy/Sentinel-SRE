@@ -14,6 +14,15 @@ spec:
     metadata:
       labels:
         app: citizen-service
+      # Phase 9: annotation-based scrape discovery — see
+      # k8s/monitoring/prometheus/configmap.yaml's kubernetes_sd_configs
+      # (role: pod) relabeling, which matches on exactly these annotations.
+      # No ServiceMonitor CRD / Prometheus Operator yet, consistent with
+      # "plain YAML, no Helm" for this whole k8s/ directory (see Phase 7).
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
       # Migrations + seeding run once here, before any replica starts
       # serving traffic, instead of in each replica's startup command

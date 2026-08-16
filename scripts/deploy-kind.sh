@@ -51,27 +51,29 @@ kubectl wait --namespace ingress-nginx \
   --timeout=180s
 
 echo "==> [4/7] Building application images"
-docker build -t citizen-service:latest "$REPO_ROOT/citizen-service"
-docker build -t notification-service:latest "$REPO_ROOT/notification-service"
+docker build -t citizen-portal/citizen-service:latest "$REPO_ROOT/citizen-service"
+docker build -t citizen-portal/notification-service:latest "$REPO_ROOT/notification-service"
 # VITE_API_BASE_URL is intentionally empty here — see k8s/README.md for why
 # this must differ from the docker-compose frontend build.
-docker build -t frontend:latest \
+docker build -t citizen-portal/frontend:latest \
   --build-arg VITE_API_BASE_URL="" \
   "$REPO_ROOT/frontend"
 
 echo "==> [5/7] Loading images into the kind cluster"
-kind load docker-image citizen-service:latest --name "$CLUSTER_NAME"
-kind load docker-image notification-service:latest --name "$CLUSTER_NAME"
-kind load docker-image frontend:latest --name "$CLUSTER_NAME"
+kind load docker-image citizen-portal/citizen-service:latest --name "$CLUSTER_NAME"
+kind load docker-image citizen-portal/notification-service:latest --name "$CLUSTER_NAME"
+kind load docker-image citizen-portal/frontend:latest --name "$CLUSTER_NAME"
 
 echo "==> [6/7] Applying Kubernetes manifests"
 kubectl apply -k "$REPO_ROOT/k8s/"
 
 echo "==> [7/7] Waiting for Deployments to become available"
-for dep in citizen-postgres notification-postgres citizen-service notification-service frontend; do
+for dep in citizen-postgres notification-postgres citizen-service notification-service frontend prometheus alertmanager loki grafana; do
   echo "    Waiting for deployment/$dep..."
   kubectl rollout status deployment/"$dep" -n citizen-portal --timeout=180s
 done
+echo "    Waiting for daemonset/alloy..."
+kubectl rollout status daemonset/alloy -n citizen-portal --timeout=180s
 
 echo
 echo "============================================================"
@@ -88,3 +90,7 @@ echo "  curl -s http://citizen-portal.local/api/services | head -c 300"
 echo
 echo "If that curl fails, see the Troubleshooting section in k8s/README.md,"
 echo "or start with: kubectl get pods -n citizen-portal"
+echo
+echo "Observability stack (Prometheus/Grafana/Loki/Alertmanager) is up too,"
+echo "reachable via kubectl port-forward — see 'Accessing the observability"
+echo "stack' in k8s/README.md for the exact commands."
