@@ -14,5 +14,5 @@ data:
   # the same host under "/", so this only needs to list that host (plus
   # localhost for `kubectl port-forward` during local debugging).
   CORS_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000,http://citizen-portal.local"
-  CHAOS_MODE: "true"
+  CHAOS_MODE: "false"
   UPLOAD_DIR: /data/uploads
