@@ -23,7 +23,7 @@ everything that was in them is preserved here, in one place, alongside Phases 4 
 - [x] Phase 7 — Kubernetes manifests
 - [x] Phase 8 — Deploy to Kubernetes
 - [x] Phase 9 — Prometheus / Grafana / Loki / Alertmanager
-- [ ] Phase 10 — Chaos / failure injection
+- [x] Phase 10 — Chaos / failure injection
 - [ ] Phase 11 — CI/CD
 - [ ] Phase 12 — End-to-end incident simulations
 
@@ -961,14 +961,70 @@ yet been applied to a live cluster.** That's the immediate next step, in order:
    detects a failure, not just that its YAML is well-formed.
 6. Report back whatever that first run surfaces — same expectation as Phase 8's first run.
 
-### Phase 10 — Chaos engineering endpoints
+### Phase 10 — Chaos engineering / failure injection
 
-Once Phase 9 is confirmed actually watching the system, Phase 10 gives it something real to
-react to: deliberate, controllable failure injection in `citizen-service` and
-`notification-service` (both already have a `CHAOS_MODE` config flag reserved since Phase 1/2 —
-this is where it gets used), likely as an admin-only endpoint or environment-variable-driven
-fault injection (artificial latency, forced 5xx responses, simulated DB connection loss) that
-Prometheus's new alerting rules and Grafana's new dashboard should visibly catch in real time.
+Phase 10 is now implemented in both backend services. Chaos is deliberately **off by default** and
+is controlled at runtime only when `CHAOS_MODE=true` and a separate `CHAOS_ADMIN_TOKEN` is configured.
+The control surface is intentionally kept out of the frontend; Sentinel or an operator can drive it
+through the backend API.
+
+**Citizen Service** exposes:
+
+- `GET /api/chaos/status` — inspect the current fault state
+- `POST /api/chaos/fault` — configure artificial latency, forced HTTP 5xx probability, and simulated
+  database failure
+- `POST /api/chaos/reset` — clear all active faults
+
+**Notification Service** exposes the same endpoints and additionally controls
+`notification_failure_rate`, which drives the existing simulated email/SMS provider failure path.
+The older `CHAOS_FAILURE_RATE` environment variable remains supported as the initial provider-failure
+rate for backwards-compatible Docker/Kubernetes startup configuration.
+
+All chaos control requests require the `X-Chaos-Token` header. Missing/incorrect tokens return 404,
+so the existence of the control surface is not advertised to unauthenticated callers. The control
+endpoints, health probes, OpenAPI endpoints, and Prometheus `/metrics` are excluded from fault
+injection. Artificial latency is therefore observable without making Kubernetes believe the pod is
+unhealthy, while database failure deliberately makes `/readyz` return HTTP 503 and normal application
+requests return HTTP 503.
+
+The services export Prometheus telemetry for the active fault configuration and every injected fault:
+`chaos_latency_ms`, `chaos_error_rate`, `chaos_db_failure`, `chaos_notification_failure_rate` (notification
+service), and `chaos_injections_total{fault_type=...}`. Phase 9's Prometheus rules now include explicit
+chaos-observation alerts plus a notification-delivery failure-rate alert, and the Grafana overview has
+panels for active chaos configuration, injection events, and notification failures.
+
+### Phase 10 test scenarios
+
+The test suites now cover authentication of the chaos control API, fault configuration/reset, forced
+5xx responses, latency injection, simulated DB failure/readiness degradation, and notification delivery
+failure injection. The normal notification chaos test was updated to drive the new runtime controller
+while retaining the existing failure-rate behavior.
+
+Example local control flow when running Docker Compose:
+
+```bash
+# Enable the control plane in .env first:
+CHAOS_MODE=true
+CHAOS_ADMIN_TOKEN=use-a-strong-random-token
+
+# Then configure a 100% HTTP failure rate:
+curl -H "X-Chaos-Token: use-a-strong-random-token" \
+  -H "Content-Type: application/json" \
+  -d '{"error_rate":1.0}' \
+  http://localhost:8000/api/chaos/fault
+
+# Reset afterward:
+curl -X POST \
+  -H "X-Chaos-Token: use-a-strong-random-token" \
+  http://localhost:8000/api/chaos/reset
+```
+
+For Kubernetes, replace the demo `CHAOS_ADMIN_TOKEN` value in both service Secrets before enabling
+`CHAOS_MODE`. Because each deployment has two replicas and chaos state is intentionally in-memory,
+setting a fault through one pod affects that pod only. This is useful for demonstrating partial
+failures; target a specific pod with `kubectl port-forward` when you need deterministic single-pod
+experiments.
+
 
 Phases 11 and 12 remain: a CI/CD pipeline (also where the ingress-nginx retirement finding from
 Phase 8 should get resolved), and finally end-to-end incident simulations for Sentinel to detect

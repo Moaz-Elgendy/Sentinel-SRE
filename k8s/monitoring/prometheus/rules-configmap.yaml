@@ -48,6 +48,54 @@ data:
                 minutes. Check recent deploys and `kubectl logs` for stack
                 traces.
 
+          - alert: ChaosForcedHTTPFailures
+            expr: >-
+              increase(chaos_injections_total{fault_type="http_5xx", kubernetes_namespace="citizen-portal"}[5m]) > 0
+            for: 30s
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} is experiencing forced chaos HTTP failures"
+              description: >-
+                Phase 10 has injected HTTP 5xx responses into {{ $labels.app }}.
+                This rule confirms Prometheus is observing the deliberate fault.
+
+          - alert: ChaosDatabaseFailure
+            expr: chaos_db_failure{kubernetes_namespace="citizen-portal"} == 1
+            for: 30s
+            labels:
+              severity: critical
+            annotations:
+              summary: "{{ $labels.app }} has simulated database failure enabled"
+              description: >-
+                Phase 10 is deliberately simulating database connection failure
+                for {{ $labels.app }}. Readiness should be degraded/unready.
+
+          - alert: ChaosLatencyInjection
+            expr: chaos_latency_ms{kubernetes_namespace="citizen-portal"} > 1000
+            for: 30s
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} has >1s chaos latency configured"
+              description: >-
+                Phase 10 has configured {{ $value }}ms of artificial latency
+                on {{ $labels.app }}.
+
+          - alert: NotificationDeliveryFailureRateHigh
+            expr: >-
+              sum(rate(notification_deliveries_total{result="Failed", kubernetes_namespace="citizen-portal"}[5m])) by (app)
+              /
+              sum(rate(notification_deliveries_total{kubernetes_namespace="citizen-portal"}[5m])) by (app)
+              > 0.20
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} notification delivery failure rate is above 20%"
+              description: >-
+                Notification delivery failures have exceeded 20% for 5 minutes.
+
           - alert: HighRequestLatency
             expr: >-
               histogram_quantile(0.95,

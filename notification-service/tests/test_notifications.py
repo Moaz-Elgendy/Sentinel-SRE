@@ -1,5 +1,6 @@
 import uuid
 
+from app.chaos.state import controller
 from app.core.config import settings
 
 
@@ -58,9 +59,10 @@ def test_get_notification_unknown_id_404(client):
 
 def test_chaos_mode_forces_failures(client, monkeypatch):
     monkeypatch.setattr(settings, "chaos_mode", True)
-    monkeypatch.setattr(settings, "chaos_failure_rate", 1.0)
+    controller.update(notification_failure_rate=1.0)
 
     resp = client.post("/api/notifications", json=_payload())
+    controller.reset()
     assert resp.status_code == 201
     body = resp.json()
     assert body["status"] == "Failed"

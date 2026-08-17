@@ -26,6 +26,8 @@ services:
       - .env
     environment:
       DATABASE_HOST: postgres
+      CHAOS_MODE: ${CHAOS_MODE:-false}
+      CHAOS_ADMIN_TOKEN: ${CHAOS_ADMIN_TOKEN:-replace_me}
     ports:
       - "8000:8000"
     volumes:
@@ -76,6 +78,7 @@ services:
       DATABASE_PASSWORD: ${NOTIFICATION_DATABASE_PASSWORD:-change_me}
       CHAOS_MODE: ${CHAOS_MODE:-false}
       CHAOS_FAILURE_RATE: ${CHAOS_FAILURE_RATE:-0.3}
+      CHAOS_ADMIN_TOKEN: ${CHAOS_ADMIN_TOKEN:-replace_me}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
     ports:
       - "8001:8000"

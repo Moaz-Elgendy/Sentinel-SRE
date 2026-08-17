@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # sends to fail, to exercise Sentinel's incident detection.
     chaos_mode: bool = False
     chaos_failure_rate: float = 0.3
+    chaos_admin_token: str = ""
 
     # CORS: comma-separated list of allowed browser origins (not exercised
     # by anything yet — this service is only ever called server-to-server

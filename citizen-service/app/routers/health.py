@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, Response, status
+
+from app.chaos.state import controller
 import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -21,6 +23,11 @@ def readiness(response: Response, db: Session = Depends(get_db)):
     checks = {}
     is_ready = True
     
+    if controller.get().db_failure:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        checks["database"] = "down"
+        return {"status": "not_ready", "checks": checks}
+
     try:
         db.execute(text("SELECT 1"))
         checks["database"] = "up"

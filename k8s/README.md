@@ -335,7 +335,25 @@ automation, not a sign something is fundamentally wrong.
 ## What's deferred to later phases
 
 - Prometheus/Grafana/Loki/Alertmanager (ServiceMonitors, log shipping) — **Phase 9**
-- Chaos engineering endpoints — **Phase 10**
+- Chaos engineering endpoints — **Phase 10 (implemented)**
+
+### Phase 10 chaos controls
+
+Both backend Deployments now support controlled, authenticated failure injection. Set `CHAOS_MODE: "true"`
+and replace the demo `CHAOS_ADMIN_TOKEN` in the service Secret before using it. The control endpoints are:
+
+```text
+GET  /api/chaos/status
+POST /api/chaos/fault
+POST /api/chaos/reset
+```
+
+Send the token in `X-Chaos-Token`. Citizen Service supports `latency_ms`, `error_rate`, and `db_failure`;
+Notification Service additionally supports `notification_failure_rate`. Control state is in-memory per pod,
+which makes pod-specific experiments possible with `kubectl port-forward`. Health, metrics, and control
+paths are excluded from request fault injection. Phase 9 Prometheus/Grafana configuration now exposes and
+visualizes the active chaos state and injected faults, so the observability pipeline can be tested directly
+against Phase 10 incidents.
 - CI/CD building and pushing these images to a real registry, replacing `imagePullPolicy:
   IfNotPresent` + local image loading with a proper `image: registry/…:tag` + `imagePullSecrets`
   — **Phase 11**
