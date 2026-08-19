@@ -1,0 +1,250 @@
+# Phase 11 — CI/CD.
+#
+# What this does, on every push/PR:
+#   - Runs both backend test suites (SQLite-backed, no live Postgres needed —
+#     see citizen-service/tests/conftest.py and notification-service/tests/conftest.py)
+#   - Lints and builds the frontend
+#   - Validates every k8s manifest: YAML parses, all kustomization.yaml
+#     resource paths exist, AND (unlike the validation done in earlier
+#     phases, which had no cluster or kubectl available) a real
+#     `kubeconform` schema check against the actual Kubernetes API schemas —
+#     GitHub's runners have the network access this project's own sandbox
+#     never did, so this is the first real schema validation these
+#     manifests get.
+#
+# What this does, only on a push to main (not on PRs), and only after every
+# job above has passed:
+#   - Builds and pushes all three images to GHCR (ghcr.io), tagged with both
+#     `latest` and the commit SHA
+#
+# What this deliberately does NOT do: automatically deploy anywhere. This
+# project has no standing cloud cluster to deploy to — see Phases.md Phase
+# 11 for why "build, test, validate, push a versioned image" is treated as
+# the actual deliverable here, with deployment staying a deliberate local
+# step via scripts/deploy-*.sh (or wherever a real cluster target gets
+# decided later).
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  test-citizen-service:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: citizen-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: citizen-service/requirements.txt
+      - run: pip install --break-system-packages -r requirements.txt
+      - run: python -m pytest -v
+        env:
+          # Tests run against an in-memory SQLite DB (see tests/conftest.py)
+          # — these values just need to be non-empty for Settings() to
+          # construct; they're never used to reach a real database.
+          DATABASE_PASSWORD: test
+          JWT_SECRET: test
+          CHAOS_ADMIN_TOKEN: test
+
+  test-notification-service:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: notification-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: notification-service/requirements.txt
+      - run: pip install --break-system-packages -r requirements.txt
+      - run: python -m pytest -v
+        env:
+          DATABASE_PASSWORD: test
+          CHAOS_ADMIN_TOKEN: test
+
+  lint-and-build-frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+        env:
+          # Matches k8s/README.md's "Image naming" note: the k8s-targeted
+          # frontend build uses a relative API base so the browser calls
+          # same-origin "/api/..." paths through the Ingress. This is NOT
+          # the same value docker-compose's frontend build uses locally
+          # (http://localhost:8000) — see that file for why.
+          VITE_API_BASE_URL: ""
+
+  validate-k8s-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Parse all YAML and check kustomization.yaml resource paths
+        run: |
+          python3 -c "
+          import yaml, glob, os, sys
+          files = sorted(glob.glob('k8s/**/*.yaml', recursive=True))
+          for f in files:
+              list(yaml.safe_load_all(open(f)))
+          print(f'{len(files)} k8s YAML files parse OK')
+
+          k = yaml.safe_load(open('k8s/kustomization.yaml'))
+          missing = [r for r in k['resources'] if not os.path.isfile(f'k8s/{r}')]
+          if missing:
+              print('MISSING kustomization resources:', missing)
+              sys.exit(1)
+          print(f'All {len(k[\"resources\"])} kustomization resource paths exist')
+          "
+
+      - name: Cross-check ConfigMap/Secret/PVC/ServiceAccount references and Service selectors
+        run: |
+          python3 -c "
+          import yaml, glob, sys
+          from collections import defaultdict
+
+          all_names = defaultdict(dict)
+          refs = []
+          for f in sorted(glob.glob('k8s/**/*.yaml', recursive=True)):
+              for d in yaml.safe_load_all(open(f)):
+                  if not d: continue
+                  kind = d.get('kind')
+                  name = d.get('metadata', {}).get('name')
+                  all_names[kind][name] = f
+                  spec = d.get('spec', {})
+                  tmpl = spec.get('template', {}).get('spec', {}) if kind in ('Deployment', 'DaemonSet') else {}
+                  for c in tmpl.get('containers', []) + tmpl.get('initContainers', []):
+                      for ref in c.get('envFrom', []):
+                          if 'configMapRef' in ref: refs.append(('ConfigMap', ref['configMapRef']['name'], f))
+                          if 'secretRef' in ref: refs.append(('Secret', ref['secretRef']['name'], f))
+                  for v in tmpl.get('volumes', []):
+                      if 'persistentVolumeClaim' in v: refs.append(('PersistentVolumeClaim', v['persistentVolumeClaim']['claimName'], f))
+                      if 'configMap' in v: refs.append(('ConfigMap', v['configMap']['name'], f))
+                  sa = tmpl.get('serviceAccountName')
+                  if sa: refs.append(('ServiceAccount', sa, f))
+                  if kind == 'RoleBinding':
+                      for s in d.get('subjects', []):
+                          if s.get('kind') == 'ServiceAccount': refs.append(('ServiceAccount', s['name'], f))
+
+          ok = True
+          for kind, name, f in refs:
+              if name and name not in all_names.get(kind, {}):
+                  print(f'MISSING: {f} references {kind}/{name}')
+                  ok = False
+          if not ok: sys.exit(1)
+          print('All ConfigMap/Secret/PVC/ServiceAccount references resolve')
+
+          services = {n: d['spec'].get('selector', {}) for f in glob.glob('k8s/**/*.yaml', recursive=True) for d in yaml.safe_load_all(open(f)) if d and d.get('kind') == 'Service' for n in [d['metadata']['name']]}
+          pods = {n: d['spec']['template']['metadata']['labels'] for f in glob.glob('k8s/**/*.yaml', recursive=True) for d in yaml.safe_load_all(open(f)) if d and d.get('kind') in ('Deployment', 'DaemonSet') for n in [d['metadata']['name']]}
+          for svc, sel in services.items():
+              labels = pods.get(svc)
+              if labels and not all(labels.get(k) == v for k, v in sel.items()):
+                  print(f'MISMATCH: Service/{svc} selector {sel} vs pod labels {labels}')
+                  sys.exit(1)
+          print('All Service selectors match their Deployment/DaemonSet pod labels')
+          "
+
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Render with Kustomize and validate against real Kubernetes schemas
+        run: |
+          # This is the first real schema validation these manifests get —
+          # every prior phase's "validation" was YAML-parses-and-references-
+          # resolve only, since no kubectl/cluster/internet access was
+          # available in the environment they were built in. kubeconform
+          # checks the rendered output against the actual Kubernetes API
+          # schemas (structure, required fields, types).
+          kubectl_version=$(curl -sL https://dl.k8s.io/release/stable.txt)
+          kubectl kustomize k8s/ | kubeconform -strict -summary \
+            -kubernetes-version "${kubectl_version#v}" \
+            -ignore-missing-schemas
+
+  build-and-push-images:
+    needs:
+      - test-citizen-service
+      - test-notification-service
+      - lint-and-build-frontend
+      - validate-k8s-manifests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - service: citizen-service
+            context: citizen-service
+            build_args: ""
+          - service: notification-service
+            context: notification-service
+            build_args: ""
+          - service: frontend
+            context: frontend
+            # See lint-and-build-frontend's comment on why this differs
+            # from docker-compose's local frontend build.
+            build_args: |
+              VITE_API_BASE_URL=
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          build-args: ${{ matrix.build_args }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/citizen-portal-${{ matrix.service }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/citizen-portal-${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # NOTE: image vulnerability scanning was deliberately left out of
+      # this pipeline. The obvious choice, aquasecurity/trivy-action, was
+      # compromised twice in 2026: a full repository takeover in late
+      # February, and a credential-stealing supply-chain attack in March
+      # that affected every published tag from 0.0.1 through 0.34.2 —
+      # exfiltrating CI secrets (including this workflow's GITHUB_TOKEN)
+      # to an attacker-controlled domain. Newer tags exist post-incident,
+      # but wiring a secret-bearing CI job to a third-party Action with
+      # that specific history, on the strength of "the new tags are
+      # probably fine now," isn't a call worth making silently. See
+      # Phases.md Phase 11 for what to evaluate before adding scanning
+      # back (pinning by commit SHA rather than tag, GitHub's own
+      # Dependabot/code-scanning, Docker Scout, or Anchore Grype).
