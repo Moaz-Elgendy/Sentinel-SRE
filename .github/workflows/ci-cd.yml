@@ -173,7 +173,7 @@ jobs:
           print(f'{len(files)} k8s YAML files parse OK')
 
           k = yaml.safe_load(open('k8s/kustomization.yaml'))
-          missing = [r for r in k['resources'] if not os.path.isfile(f'k8s/{r}')]
+          missing = [r for r in k['resources'] if not os.path.exists(f'k8s/{r}')]
           if missing:
               print('MISSING kustomization resources:', missing)
               sys.exit(1)
