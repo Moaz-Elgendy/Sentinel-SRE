@@ -359,7 +359,7 @@ jobs:
   # has — even though this job is read-only plus one harmless SSM echo.
   # -------------------------------------------------------------------------
   test-aws-connectivity:
-    if: github.event_name == 'workflow_dispatch'
+    
     runs-on: ubuntu-latest
     environment: aws-demo
     permissions:
