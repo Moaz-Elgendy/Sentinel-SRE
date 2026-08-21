@@ -110,19 +110,20 @@ class RemediationAction(str, Enum):
 
     @classmethod
     def parse(cls, raw: Any) -> "RemediationAction | None":
-        """Strict parse used on the LLM boundary.
-
-        Returns None (never raises, never guesses) for anything that is not
-        an exact enum value. A model that hallucinates "delete_namespace" or
-        "restart_deployment; rm -rf /" gets None, and the caller falls back
-        to the rule-based recommendation.
-        """
+        """Strict parse used on the LLM boundary."""
         if not isinstance(raw, str):
             return None
+
+        # Reject newline/tab control characters.
+        if "\r" in raw or "\n" in raw or "\t" in raw:
+            return None
+
         candidate = raw.strip().lower()
+
         for member in cls:
             if member.value == candidate:
                 return member
+
         return None
 
 
