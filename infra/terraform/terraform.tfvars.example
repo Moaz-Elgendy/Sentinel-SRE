@@ -1,0 +1,103 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored;
+# this .example file is committed.
+#
+# Every variable below has a working default in variables.tf, so an empty
+# terraform.tfvars is valid — this file exists to show what is worth
+# considering rather than to list required values.
+
+# ---------------------------------------------------------------------------
+# Region — decide this BEFORE the first apply
+# ---------------------------------------------------------------------------
+# Moving a running environment between regions means recreating it, and the
+# instance has prevent_destroy set, so changing this later is deliberately
+# awkward.
+#
+# Caveat: t3a (the AMD burstable family) is not offered in every region.
+# If `apply` fails with an unsupported-instance-type error, switch
+# instance_type to "t3.large" or "m6i.large" for the same 2 vCPU / 8 GiB.
+aws_region = "eu-west-1"
+
+# ---------------------------------------------------------------------------
+# Naming and tagging
+# ---------------------------------------------------------------------------
+# project_name prefixes every resource name AND the ECR repository
+# namespace. If you change it, also change ECR_REPOSITORY_PREFIX in the
+# GitHub repository variables, and the `images:` entries in
+# k8s/overlays/aws/kustomization.yaml — they are not derived from this.
+project_name = "sentinel-sre-demo"
+environment  = "demo"
+
+# ---------------------------------------------------------------------------
+# Compute
+# ---------------------------------------------------------------------------
+# Do not go below 2 vCPU / 4 GiB. The full stack (3 app services, 2
+# PostgreSQL, Prometheus, Loki, Grafana, Alertmanager, Alloy, Sentinel)
+# requests roughly 1.3 vCPU, and the chaos scenarios deliberately spike CPU
+# on top of that.
+instance_type       = "t3a.large"
+root_volume_size_gb = 40
+
+# Pinning an exact K3s version makes the environment reproducible. "stable"
+# also works but means two applies weeks apart can install different
+# Kubernetes versions.
+k3s_version = "v1.31.4+k3s1"
+
+# ---------------------------------------------------------------------------
+# Network exposure
+# ---------------------------------------------------------------------------
+# Who can reach the portal on :80. The default is the whole internet, which
+# is what the phase's acceptance criteria ask for.
+#
+# If you would rather keep the demo private, set this to your own address:
+#   allowed_http_cidrs = ["203.0.113.4/32"]
+# Nothing else breaks — SSM administration, Sentinel, the observability
+# stack and the Kubernetes API are all independent of this rule.
+allowed_http_cidrs = ["0.0.0.0/0"]
+
+# Leave false until TLS is actually configured in Traefik. An open :443 with
+# nothing listening is a port that refuses connections, which is worse than
+# a closed one because it looks like it should work.
+enable_https_ingress = false
+
+# Pin the AZ only if you have a reason to. The EBS volume is AZ-bound, so
+# this matters if you ever want to recreate the instance and reattach a
+# pre-existing volume.
+# availability_zone = "eu-west-1a"
+
+# ---------------------------------------------------------------------------
+# ECR
+# ---------------------------------------------------------------------------
+# MUTABLE is required for CI's moving `latest` tag to work. Kubernetes only
+# ever deploys the immutable git-SHA tag. See the variable's documentation
+# for the full reasoning, and what else to change if you want IMMUTABLE.
+ecr_image_tag_mutability       = "MUTABLE"
+ecr_untagged_image_expiry_days = 14
+
+# ---------------------------------------------------------------------------
+# GitHub Actions OIDC
+# ---------------------------------------------------------------------------
+# Leave github_repository as null for a first apply if you just want the
+# infrastructure up and will push images by hand. Set it to enable CI.
+#
+# This value IS the security boundary on the deploy role — its trust policy
+# is scoped to exactly this repository and these branches. A typo here means
+# either CI cannot authenticate, or (if it matched something broader) a
+# workflow you do not control could.
+# github_repository       = "your-org/Sentinel-SRE"
+# github_allowed_branches = ["main"]
+
+# The IAM OIDC provider for token.actions.githubusercontent.com is an
+# ACCOUNT-WIDE singleton. If one already exists — another project, or a
+# previous apply — set this to false or the apply fails with
+# EntityAlreadyExists. Check with:
+#   aws iam list-open-id-connect-providers
+# create_github_oidc_provider = true
+
+# ---------------------------------------------------------------------------
+# Repository checkout on the node
+# ---------------------------------------------------------------------------
+# Cloned to /opt/sentinel-sre during bootstrap so manifests can be applied
+# from the node itself. Only works unattended for a PUBLIC repository; for a
+# private one the clone fails harmlessly and the directory must be populated
+# once by hand. Leave null to skip.
+# repo_url = "https://github.com/your-org/Sentinel-SRE.git"

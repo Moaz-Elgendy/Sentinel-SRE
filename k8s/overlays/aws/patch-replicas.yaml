@@ -1,0 +1,73 @@
+# Replica counts for a single 2 vCPU node.
+#
+# ---------------------------------------------------------------------------
+# The arithmetic
+# ---------------------------------------------------------------------------
+# The base runs citizen-service, notification-service and frontend at 2
+# replicas each. Summing CPU *requests* at base counts:
+#
+#   citizen-service      2 x 100m = 200m
+#   notification-service 2 x 100m = 200m
+#   frontend             2 x  50m = 100m
+#   both Postgres        2 x 100m = 200m
+#   Prometheus/Loki/Grafana/Alertmanager/Alloy = 500m
+#   Sentinel                      = 100m
+#   K3s system (coredns, metrics-server, traefik) ~ 200m
+#                                          total ~ 1500m of 2000m
+#
+# That fits, but with little room for the chaos scenarios that deliberately
+# spike CPU — which is the point of the environment. Dropping to 1 replica
+# on the three stateless services frees 350m.
+#
+# ---------------------------------------------------------------------------
+# The more important reason: chaos faults are per-pod
+# ---------------------------------------------------------------------------
+# Chaos state is an in-memory module-level singleton in each pod
+# (citizen-service/app/chaos/state.py). A POST to /api/chaos/fault through
+# the Service VIP lands on exactly ONE replica, so at 2 replicas a fault
+# affects roughly half of traffic and a reset may well hit the pod that was
+# never faulted. scripts/incident-scenarios.sh works around this by scaling
+# to 1 before injecting (its pin_single_replica helper).
+#
+# Running these at 1 replica makes fault injection deterministic, which
+# matters a great deal for Sentinel: its recovery validation has to be able
+# to conclude "the fault is gone", and that conclusion is unreliable when a
+# reset might have gone to the wrong pod.
+#
+# ---------------------------------------------------------------------------
+# What this gives up
+# ---------------------------------------------------------------------------
+# At 1 replica there is no redundancy — a pod restart is a brief gap in
+# service. Two things make that acceptable here: the default RollingUpdate
+# strategy computes maxUnavailable=0 for a single replica (25% rounded
+# down), so a *rollout* still starts the new pod before stopping the old
+# one and causes no downtime; and this is a demonstration environment, so
+# an unplanned restart being visible is a feature, not a regression.
+#
+# It also leaves headroom for scale_deployment to be a genuine remediation:
+# Sentinel scaling 1 -> 2 under load is a real action with a real effect,
+# which it would not be if everything already ran at its ceiling.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: citizen-service
+  namespace: citizen-portal
+spec:
+  replicas: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: citizen-portal
+spec:
+  replicas: 1
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: citizen-portal
+spec:
+  replicas: 1

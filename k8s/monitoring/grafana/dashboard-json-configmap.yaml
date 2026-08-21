@@ -1,0 +1,135 @@
+# A first, deliberately small dashboard — one row of the same signals
+# monitoring/prometheus/rules-configmap.yaml alerts on (so what you see
+# here is exactly what pages you), plus pod availability. Not meant to be
+# comprehensive; add panels as real usage reveals what's actually useful
+# to look at, rather than front-loading a large dashboard nobody reads.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-overview
+  namespace: citizen-portal
+data:
+  citizen-portal-overview.json: |
+    {
+      "title": "Citizen Portal Overview",
+      "uid": "citizen-portal-overview",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Pods up",
+          "type": "stat",
+          "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "sum(up{kubernetes_namespace=\"citizen-portal\", job=\"kubernetes-pods\"}) by (app)",
+              "legendFormat": "{{app}}"
+            }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Request rate (req/s)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 9, "x": 6, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "sum(rate(http_requests_total{kubernetes_namespace=\"citizen-portal\"}[5m])) by (app)",
+              "legendFormat": "{{app}}"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "5xx error rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 9, "x": 15, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "percentunit" } },
+          "targets": [
+            {
+              "expr": "sum(rate(http_requests_total{status=~\"5..\", kubernetes_namespace=\"citizen-portal\"}[5m])) by (app) / sum(rate(http_requests_total{kubernetes_namespace=\"citizen-portal\"}[5m])) by (app)",
+              "legendFormat": "{{app}}"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "p95 request latency",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "s" } },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{kubernetes_namespace=\"citizen-portal\"}[5m])) by (app, le))",
+              "legendFormat": "{{app}}"
+            }
+          ]
+        },
+        {
+          "id": 5,
+          "title": "Chaos configuration",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "chaos_latency_ms{kubernetes_namespace=\"citizen-portal\"}",
+              "legendFormat": "{{app}} latency ms"
+            },
+            {
+              "expr": "chaos_error_rate{kubernetes_namespace=\"citizen-portal\"} * 100",
+              "legendFormat": "{{app}} HTTP error %"
+            },
+            {
+              "expr": "chaos_db_failure{kubernetes_namespace=\"citizen-portal\"}",
+              "legendFormat": "{{app}} DB failure"
+            }
+          ]
+        },
+        {
+          "id": 6,
+          "title": "Chaos injections",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "sum(rate(chaos_injections_total{kubernetes_namespace=\"citizen-portal\"}[5m])) by (app, fault_type)",
+              "legendFormat": "{{app}} {{fault_type}}"
+            }
+          ]
+        },
+        {
+          "id": 7,
+          "title": "Notification delivery failures",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "targets": [
+            {
+              "expr": "sum(rate(notification_deliveries_total{result=\"Failed\", kubernetes_namespace=\"citizen-portal\"}[5m])) by (app, channel)",
+              "legendFormat": "{{app}} {{channel}} failed/s"
+            }
+          ]
+        },
+        {
+          "id": 8,
+          "title": "Recent logs (all pods)",
+          "type": "logs",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "datasource": { "type": "loki", "uid": "loki" },
+          "targets": [
+            {
+              "expr": "{namespace=\"citizen-portal\"}"
+            }
+          ]
+        }
+      ]
+    }

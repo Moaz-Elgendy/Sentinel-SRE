@@ -1,0 +1,110 @@
+# Per-Deployment changes needed on AWS/K3s.
+#
+# Common to all three application Deployments:
+#
+#   imagePullSecrets: ecr-credentials
+#     ECR needs authentication. The secret is created and refreshed every 6
+#     hours by a systemd timer on the node using the EC2 instance profile
+#     (see infra/terraform/user_data.sh.tftpl) — ECR tokens expire after 12
+#     hours, so a static secret would break overnight. Nothing here holds a
+#     long-lived credential.
+#
+#   revisionHistoryLimit: 5
+#     This is what makes autonomous rollback possible at all. Kubernetes
+#     keeps this many old ReplicaSets, and `rollout undo` can only go back
+#     to a revision that still exists. The default is 10; 5 is plenty of
+#     rollback depth and keeps `kubectl rollout history` readable for
+#     Sentinel's deployment-correlation step. Setting it to 0 or 1 would
+#     silently disable rollback — worth knowing, since nothing warns you.
+#
+#   startupProbe (Python services only)
+#     The base has liveness + readiness but no startup probe. On a 2 vCPU
+#     node with the whole stack starting at once, uvicorn's first boot can
+#     be slow enough that the liveness probe's initialDelaySeconds=5 fires
+#     before the app is listening — which restarts the container, which
+#     makes it slower, which is a CrashLoopBackOff that looks like an
+#     application bug. A startup probe holds liveness off until the process
+#     answers once, then hands over.
+#
+#     Deliberately NOT added to the frontend: nginx serving a static bundle
+#     is up in well under a second, and its existing probes are fine.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: citizen-service
+  namespace: citizen-portal
+spec:
+  revisionHistoryLimit: 5
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ecr-credentials
+      containers:
+        - name: citizen-service
+          startupProbe:
+            httpGet:
+              # /healthz, not /readyz: this only needs to know the process
+              # is listening. /readyz touches the database and calls
+              # notification-service, so using it here would tie startup to
+              # Postgres being up and turn a slow database into a
+              # CrashLoopBackOff.
+              path: /healthz
+              port: 8000
+            periodSeconds: 5
+            timeoutSeconds: 3
+            # 5s x 30 = up to 150s to start before being declared failed.
+            failureThreshold: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: citizen-portal
+spec:
+  revisionHistoryLimit: 5
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ecr-credentials
+      containers:
+        - name: notification-service
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: citizen-portal
+spec:
+  revisionHistoryLimit: 5
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ecr-credentials
+---
+# The Postgres Deployments pull postgres:16-alpine from Docker Hub, not
+# ECR, so they need no pull secret. They do get revisionHistoryLimit for
+# consistency, though Sentinel is never permitted to roll back a database
+# (see the remediation allow-list in sentinel-ai/app/remediation/).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: citizen-postgres
+  namespace: citizen-portal
+spec:
+  revisionHistoryLimit: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-postgres
+  namespace: citizen-portal
+spec:
+  revisionHistoryLimit: 3

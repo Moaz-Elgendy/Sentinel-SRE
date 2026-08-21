@@ -1,0 +1,22 @@
+# Versions are pinned and deliberately kept identical to citizen-service /
+# notification-service wherever they overlap. Two services in the same cluster
+# resolving different minor versions of pydantic or httpx has bitten us before
+# (subtle validation-error shape changes), so overlap == exact match.
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.5.2
+prometheus_client==0.21.0
+python-json-logger==2.0.7
+httpx==0.27.2
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# Sentinel-specific. The Kubernetes client is the ONLY way this service is
+# allowed to mutate cluster state — there is intentionally no kubectl binary in
+# the image, so an LLM cannot be tricked into shelling out.
+kubernetes==31.0.0
+
+# Optional. Sentinel is fully functional (rule-based) without an API key; the
+# LLM only enriches narrative and nudges confidence within a hard bound.
+openai==1.54.3

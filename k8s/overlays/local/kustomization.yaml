@@ -1,0 +1,35 @@
+# Local-development overlay (kind / minikube / Docker Desktop).
+#
+# This is the base plus the demo Secrets, and nothing else — the base was
+# already written for local development, so there is nothing to patch.
+#
+# ---------------------------------------------------------------------------
+# Why the Secrets live here rather than in base/
+# ---------------------------------------------------------------------------
+# These files contain literal committed passwords (DATABASE_PASSWORD:
+# sentinal, CHAOS_ADMIN_TOKEN: replace_me). That is a reasonable trade for a
+# throwaway cluster on a laptop, and it is what makes `kubectl apply -k k8s/`
+# a single command with nothing to configure first.
+#
+# It is not a reasonable trade on an internet-facing EC2 instance. Keeping
+# them in an overlay rather than the base means the AWS overlay does not
+# inherit them at all — it cannot accidentally deploy a known password,
+# because the manifest simply is not in its resource list. The alternative
+# (leaving them in base/ and overriding them in the AWS overlay) would
+# work right up until someone forgot the override, and would fail silently
+# when they did.
+#
+# The AWS overlay generates its own Secrets from gitignored env files. See
+# k8s/overlays/aws/secrets/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: citizen-portal
+
+resources:
+  - ../../base
+  - secrets/citizen-postgres-secret.yaml
+  - secrets/notification-postgres-secret.yaml
+  - secrets/citizen-service-secret.yaml
+  - secrets/notification-service-secret.yaml
+  - secrets/grafana-secret.yaml

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notification-service-config
+  namespace: citizen-portal
+data:
+  DATABASE_HOST: notification-postgres
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: notification_service
+  CHAOS_MODE: "false"
+  CHAOS_FAILURE_RATE: "0.3"
+  CORS_ALLOWED_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000,http://citizen-portal.local"
