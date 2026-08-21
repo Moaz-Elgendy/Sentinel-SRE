@@ -73,10 +73,21 @@ data "aws_iam_policy_document" "github_assume_role" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values = [
-        for branch in var.github_allowed_branches :
-        "repo:${var.github_repository}:ref:refs/heads/${branch}"
-      ]
+      values = concat(
+        [
+          for branch in var.github_allowed_branches :
+          "repo:${var.github_repository}:ref:refs/heads/${branch}"
+        ],
+        # A job bound to a GitHub Environment (e.g. `environment: aws-demo`)
+        # presents repo:<owner>/<repo>:environment:<name> as its subject,
+        # NOT the branch-ref form above — even when triggered from an
+        # allowed branch. deploy-to-k3s and test-aws-connectivity both use
+        # `environment: aws-demo`, so that subject must be trusted
+        # explicitly or every OIDC assume-role call from those jobs fails.
+        [
+          "repo:${var.github_repository}:environment:${var.github_environment_name}"
+        ]
+      )
     }
   }
 }

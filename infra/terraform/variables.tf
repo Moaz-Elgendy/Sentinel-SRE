@@ -256,6 +256,20 @@ variable "github_allowed_branches" {
   default     = ["main"]
 }
 
+variable "github_environment_name" {
+  description = <<-EOT
+    Name of the GitHub Environment (Settings -> Environments) that gates
+    the deploy and connectivity-test jobs, e.g. "aws-demo". Any job that
+    sets `environment: <this-name>` in the workflow presents
+    repo:<repository>:environment:<this-name> as its OIDC subject instead
+    of the branch-ref form, so the trust policy must trust this value
+    explicitly or role assumption from that job fails. Must match the
+    `environment:` value in .github/workflows/ci-cd.yml exactly.
+  EOT
+  type        = string
+  default     = "aws-demo"
+}
+
 variable "create_github_oidc_provider" {
   description = <<-EOT
     Whether to create the account-level IAM OIDC provider for GitHub
