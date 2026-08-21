@@ -1221,7 +1221,6 @@ against it — is the natural next step before trusting any of these write-ups a
 Beyond the 12-phase local/Kubernetes build plan, two further design docs cover taking this to AWS
 and connecting it to Sentinel AI, the platform this project exists to be a realistic workload for:
 
-<<<<<<< HEAD
 ### Phase 10 — Chaos engineering / failure injection
 
 Phase 10 is now implemented in both backend services. Chaos is deliberately **off by default** and
@@ -1291,12 +1290,32 @@ Phases 11 and 12 remain: a CI/CD pipeline (also where the ingress-nginx retireme
 Phase 8 should get resolved), and finally end-to-end incident simulations for Sentinel to detect
 and respond to, using the exact observability stack this phase just built.
 =======
-- **[`docs/aws-deployment.md`](docs/aws-deployment.md)** — how this project's existing Kubernetes
-  manifests map onto AWS (EKS, RDS, ALB, ECR, IAM/IRSA, Secrets Manager), and what changes vs.
-  stays the same getting there.
-- **[`docs/sentinel-integration.md`](docs/sentinel-integration.md)** — the interface contract for
-  how Sentinel AI is meant to pull metrics, logs, and alerts from this project once both are
-  running on AWS, and the detect → diagnose → plan → fix → report loop that's meant to drive.
-  Sentinel itself lives in a separate repository; this document describes the *contract* this
-  project exposes for it, not Sentinel's own implementation.
->>>>>>> da275c8 (Phase 12 is Done)
+**Phase 6 is done.** Both services are now fully observable: every request carries a traceable
+ID, every log line is structured JSON tagged with `service` and `request_id`, business-meaningful
+metrics are being recorded, and the health probes surface degraded-vs-down distinctions that
+Sentinel can act on.
+
+### Phase 7 — Kubernetes manifests
+
+The next step is writing the Kubernetes manifests to run the same stack that `docker compose up`
+brings up today, but on a cluster. Planned work:
+
+- **`k8s/`** directory at the repo root with one sub-directory per service
+  (`citizen-service/`, `notification-service/`, `frontend/`, `postgres/`,
+  `notification-postgres/`)
+- **Deployments** — one `Deployment` per service, resource requests/limits set conservatively,
+  liveness → `GET /healthz`, readiness → `GET /readyz`
+- **Services** — `ClusterIP` for inter-service traffic (citizen-service → notification-service,
+  both → their Postgres), `NodePort` or `LoadBalancer` for the frontend
+- **ConfigMaps + Secrets** — env vars (DB URLs, JWT secret, CORS origins) moved out of a flat
+  `.env` into typed Kubernetes objects; secrets managed with `kubectl create secret` locally
+  (SOPS/External Secrets in Phase 11 CI/CD)
+- **PersistentVolumeClaims** — one PVC per Postgres instance to survive pod restarts
+- **Ingress** (optional) — a single nginx-ingress or Traefik entry point that routes
+  `/api/*` to citizen-service and `/` to frontend, eliminating the per-service NodePort exposure
+- No Helm yet — plain YAML first so the manifest structure is transparent; Helm (or Kustomize
+  overlays) comes once there are multiple environments to manage
+
+Phases 8 through 12 — deploy to Kubernetes (local kind/minikube first, cloud later), the full
+Prometheus/Grafana/Loki/Alertmanager observability stack, chaos engineering endpoints, CI/CD
+pipeline, and finally end-to-end incident simulations for Sentinel to detect and respond to.
