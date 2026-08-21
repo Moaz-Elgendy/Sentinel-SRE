@@ -2,8 +2,10 @@
 
 A realistic, intentionally manageable cloud-native application that simulates a government
 digital services portal. It's built to be the **sample production workload monitored by
-Sentinel AI** (an autonomous SRE platform, built separately) — so it's designed from day one
-for observability, health checks, and controlled failure injection.
+Sentinel AI**, an autonomous SRE platform — so it's designed from day one for observability,
+health checks, and controlled failure injection. Through Phase 12, Sentinel was described here as
+a separate platform living in its own repository; as of Phase 13 it lives in this repo, in
+`sentinel-ai/`, and is deployed alongside the workload it watches.
 
 > This is a demonstration project. It does not represent any real government system or process,
 > and national IDs / documents used here are fake/generated.
@@ -26,9 +28,17 @@ everything that was in them is preserved here, in one place, alongside Phases 4 
 - [x] Phase 10 — Chaos / failure injection
 - [x] Phase 11 — CI/CD
 - [x] Phase 12 — End-to-end incident simulations
+- [ ] Phase 13 — AWS deployment (EC2 + K3s) and Sentinel integration
 
+Phase 13 is deliberately left **unchecked**. Every other box on this list means "written, tested,
+and run for real". Phase 13's infrastructure code is written and validated — Terraform validates,
+both Kustomize overlays render and pass `kubeconform`, Sentinel's lifecycle is unit-tested — but
+it has never been applied: no `terraform plan` against a real account, no instance, no pod, no
+incident. Checking the box would be the one dishonest line in this file.
 
 ## Architecture (current)
+
+Local development, and the base every environment shares:
 
 ```text
                     React Frontend  (nginx, Phase 3/4)
@@ -43,6 +53,25 @@ everything that was in them is preserved here, in one place, alongside Phases 4 
               PostgreSQL                          PostgreSQL
            (citizen_portal)                  (notification_service)
 ```
+
+The AWS target added in Phase 13 — written, not yet applied:
+
+```text
+  AWS
+   └── VPC / public subnet / Internet Gateway / security group (:80 only, no SSH)
+        └── one t3a.large EC2 instance (Ubuntu 24.04, 40 GiB encrypted gp3)
+             └── K3s v1.31.4+k3s1, single node (control-plane + worker)
+                  └── Traefik (K3s's bundled ingress controller)
+                       ├── frontend  ->  citizen-service  ->  notification-service
+                       │                      |                      |
+                       │                 citizen-postgres    notification-postgres
+                       ├── Prometheus / Loki / Grafana / Alertmanager / Grafana Alloy
+                       └── Sentinel AI  (FastAPI :8080, namespaced RBAC Role)
+```
+
+Everything runs on the one instance, including both databases. No EKS, no RDS, no ALB, no NAT
+Gateway — see Phase 13 for why each was declined. Administration is Systems Manager Session
+Manager; the Kubernetes API is not exposed publicly.
 
 All three application services (frontend, citizen-service, notification-service) plus both
 Postgres instances now come up from a single `docker compose up --build` (Phases 4 and 5). The
@@ -556,29 +585,70 @@ digital-citizen-portal/
 ├── .env.example
 ├── README.md
 ├── Phases.md                    # this file
+├── docs/
+│   ├── aws-deployment.md          # Phase 13 — step-by-step AWS procedure
+│   ├── github-configuration.md    # Phase 13 — GitHub Secrets vs Variables
+│   └── sentinel-integration.md    # Phase 13 — Sentinel's interface contract
 ├── .github/
 │   └── workflows/
-│       └── ci-cd.yml             # Phase 11 — test, lint, validate, build & push to GHCR
-├── k8s/                          # Phase 7 — Kubernetes manifests (see k8s/README.md)
-│   ├── kustomization.yaml
+│       └── ci-cd.yml             # Phase 13 — test, lint, validate, push to ECR, deploy via SSM
+├── infra/
+│   └── terraform/                 # Phase 13 — the AWS environment (validated, not applied)
+│       ├── versions.tf            # provider + default tags
+│       ├── variables.tf
+│       ├── network.tf             # VPC, IGW, one public subnet, route table
+│       ├── security.tf            # security group: :80 only, no :22, no :6443
+│       ├── iam.tf                 # instance profile: SSM + ECR pull only
+│       ├── ecr.tf                 # four repositories
+│       ├── ec2.tf                 # the single t3a.large K3s node
+│       ├── github_oidc.tf         # GitHub Actions OIDC role (no access keys)
+│       ├── outputs.tf
+│       ├── user_data.sh.tftpl     # K3s install, ECR credential timer, deploy helper
+│       └── terraform.tfvars.example
+├── k8s/                          # Phase 7/13 — Kubernetes manifests (see k8s/README.md)
+│   ├── kustomization.yaml         # local entrypoint: `kubectl apply -k k8s/`
 │   ├── kind-config.yaml
-│   ├── namespace.yaml
-│   ├── postgres/
-│   ├── notification-postgres/
-│   ├── citizen-service/
-│   ├── notification-service/
-│   ├── frontend/
-│   ├── ingress/
-│   └── monitoring/                # Phase 9 — observability stack
-│       ├── prometheus/
-│       ├── alertmanager/
-│       ├── loki/
-│       ├── alloy/
-│       └── grafana/
-├── scripts/                      # Phase 8 — deploy automation (see k8s/README.md)
+│   ├── base/                      # shared by both environments, no Secrets
+│   │   ├── kustomization.yaml
+│   │   ├── namespace.yaml
+│   │   ├── postgres/
+│   │   ├── notification-postgres/
+│   │   ├── citizen-service/
+│   │   ├── notification-service/
+│   │   ├── frontend/
+│   │   ├── ingress/               # ingress-nginx (local flavour)
+│   │   └── monitoring/            # Phase 9 — observability stack
+│   │       ├── prometheus/
+│   │       ├── alertmanager/
+│   │       ├── loki/
+│   │       ├── alloy/
+│   │       └── grafana/
+│   └── overlays/
+│       ├── local/                 # kind / minikube / Docker Desktop
+│       │   └── secrets/           # the committed demo Secrets live here only
+│       └── aws/                   # EC2 + K3s: Traefik, ECR images, Sentinel
+│           ├── kustomization.yaml
+│           ├── patch-*.yaml       # Traefik, ECR pull, PVCs, replicas, monitoring
+│           ├── secrets/           # *.env gitignored; only *.env.example tracked
+│           └── sentinel/          # Sentinel Deployment, Service, RBAC, config
+├── sentinel-ai/                   # Phase 13 — the autonomous SRE agent
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── clients/               # prometheus, loki, kubernetes, github, slack, chaos
+│   │   ├── lifecycle/             # detection -> ... -> learning, incl. policy + remediation
+│   │   ├── models/
+│   │   ├── store/                 # SQLite incident history
+│   │   └── routers/               # health, alerts webhook, incidents
+│   └── tests/                     # policy, decision, allow-list, validation, RCA
+├── scripts/                      # Phase 8/13 — deploy automation (see k8s/README.md)
 │   ├── deploy-docker-desktop.sh
 │   ├── deploy-kind.sh
 │   ├── deploy-minikube.sh
+│   ├── deploy-aws.sh              # Phase 13 — runs on the EC2 node
+│   ├── generate-aws-secrets.sh    # Phase 13 — creates the gitignored secret files
+│   ├── incident-scenarios.sh      # Phase 10/12/13 — nine chaos scenarios
 │   ├── teardown.sh
 │   └── smoke-test.sh
 ├── citizen-service/
@@ -1207,115 +1277,312 @@ No new dependencies — bash, `kubectl`, `curl`, and the Prometheus/Alertmanager
 running since Phase 9.
 
 ---
+## Phase 13 — AWS deployment (EC2 + K3s) and Sentinel integration
+
+The phase that closes the two loose ends Phase 12 left open — "there is no real cluster to run
+any of this against" and "Sentinel lives somewhere else and this repo only describes a contract
+for it". Both are now addressed in-repo: `infra/terraform/` stands up a single-node Kubernetes
+cluster on AWS, and `sentinel-ai/` is Sentinel itself, running as a workload inside that cluster
+next to the application it watches.
+
+**Nothing in this phase has been applied to AWS.** The Terraform has never been planned against a
+real account, no pod has ever started on the instance, and Sentinel has never run against a
+cluster. That is why the checklist entry at the top of this file is unchecked. Everything below
+describes code that exists and has been validated the way earlier phases validated things before
+their first real run — see "What's missing" for exactly where the line falls.
+
+### What's implemented
+
+**Infrastructure — `infra/terraform/`, one EC2 instance running K3s.**
+
+A deliberately small AWS footprint: a VPC (`10.20.0.0/16`) with one public subnet
+(`10.20.1.0/24`), an Internet Gateway, a route table, one security group, one `t3a.large` EC2
+instance (2 vCPU / 8 GiB) on Canonical's official Ubuntu 24.04 AMI, a 40 GiB encrypted gp3 root
+volume, an IAM role and instance profile, and four ECR repositories. That is the whole list.
+
+The services this project does **not** use are as much of the design as the ones it does:
+
+- **No EKS.** A managed control plane is a standing hourly charge that accrues before a single
+  workload node exists, and this project's entire compute need fits on one burstable instance.
+  K3s gives a conformant Kubernetes API on that instance for the cost of the instance. The
+  tradeoff is real and stated rather than hidden: there is no managed control plane, no control
+  plane HA, and no managed upgrade path. For a demo whose purpose is to have a cluster Sentinel
+  can act on, that is the right trade; for anything with users, it is not.
+- **No RDS.** Both Postgres instances stay inside Kubernetes, exactly as they are locally. This
+  one is not primarily about cost: **database failure is one of Sentinel's incident scenarios.**
+  Moving Postgres to a managed service would put it outside the cluster Sentinel observes and
+  outside the RBAC boundary that makes Sentinel's behaviour analysable, and would quietly delete
+  the most interesting escalation case in the project — the one where the correct autonomous
+  action is *no action*.
+- **No ALB.** K3s ships Traefik as its bundled ingress controller, and it is reached directly on
+  the instance's public IP on port 80. An ALB would add a second standing charge to route traffic
+  to exactly one target.
+- **No NAT Gateway.** The single subnet is public, so the instance reaches ECR, SSM and
+  `get.k3s.io` through the Internet Gateway using its own public IP. A NAT Gateway exists to give
+  private-subnet workloads egress; with one node that has to be reachable anyway, it buys nothing
+  and costs continuously.
+- **No ingress-nginx on AWS.** The retirement finding from Phase 8 has been carried forward,
+  unresolved, through Phases 9, 10 and 11. It is resolved here, for the environment where it
+  actually mattered: AWS uses Traefik, which K3s installs anyway. Local development still uses
+  ingress-nginx, which is still fine for a laptop cluster and still not something to put in front
+  of real traffic.
+
+**No SSH, at all.** There is no port 22 ingress rule and no EC2 key pair in the Terraform.
+Administration is AWS Systems Manager Session Manager, which reaches the instance through the SSM
+agent's outbound connection rather than an inbound listener. The Kubernetes API on `:6443` is not
+exposed publicly either. Port 80 is the only thing open (443 exists behind a variable that
+defaults to off, because nothing terminates TLS yet). This removes the single most commonly
+attacked surface on a public EC2 instance, and it costs almost nothing in convenience: Session
+Manager also does port-forwarding, which is how Grafana and Sentinel are reached from a laptop.
+
+**Storage is K3s's `local-path` provisioner on the root EBS volume.** PVCs become directories on
+the node's disk. This survives pod recreation and instance reboot, and does not survive instance
+replacement — a `terraform destroy`/`apply` cycle starts from an empty database. Stated plainly
+rather than implied by "it's a demo": the honest description of this storage is "durable across
+the failures Sentinel is meant to handle, not durable across the ones it is not".
+
+**Kubernetes layout — a real Kustomize base with two overlays.**
+
+```text
+k8s/base/            shared manifests, configured for local development
+k8s/overlays/local/  base + the committed demo Secrets (kind / minikube / Docker Desktop)
+k8s/overlays/aws/    base + Traefik, ECR images pinned by SHA, real Secrets, Sentinel
+```
+
+The manifests moved out of `k8s/*` into `k8s/base/*` for a mechanical reason worth recording:
+Kustomize refuses an overlay whose base is a parent directory containing that overlay, reporting
+a cycle. There is no way to keep the manifests at the `k8s/` root and also have `k8s/overlays/aws`
+build on them. **Local development is unchanged** — `k8s/kustomization.yaml` now points at
+`overlays/local`, so `kubectl apply -k k8s/` and all three `scripts/deploy-*.sh` behave exactly as
+they did in Phase 8.
+
+The demo Secrets moved to `k8s/overlays/local/secrets/` rather than staying in the base, and this
+is a security decision rather than tidiness. They contain literal committed passwords
+(`sentinal`, `replace_me`), which is a fine trade on a laptop and is what makes local setup a
+single command. Keeping them out of the base means the AWS overlay does not inherit them at all —
+it cannot ship a known password to a public IP by forgetting an override, because the manifest is
+not in its resource list. The AWS overlay generates its Secrets from gitignored `.env` files
+instead, and `kubectl apply -k` fails with a missing-file error until they exist. Failing closed
+beats defaulting to a published credential on an internet-facing host.
+
+**CI/CD extended to actually deploy — `.github/workflows/ci-cd.yml`.**
+
+Phase 11 built, tested and published images and honestly called out that it deployed nothing,
+because there was nothing to deploy to. There is now:
+
+- **Registry moved from GHCR to ECR**, four repositories under `sentinel-sre-demo/`
+  (`citizen-service`, `notification-service`, `frontend`, `sentinel-ai`). Images are tagged with
+  the git commit SHA. Nothing is deployed by `latest` — the running ReplicaSet has to be traceable
+  back to a commit, because "which deploy caused this" is a question Sentinel asks and answers
+  mechanically.
+- **AWS authentication is GitHub OIDC federation** (`infra/terraform/github_oidc.tf`). There are
+  no long-lived AWS access keys in repository secrets. The trust policy is scoped to this
+  repository and branch, and the role's permissions are limited to the ECR repositories and the
+  one instance it is allowed to send commands to.
+- **Deployment goes through `aws ssm send-command`**, invoking `/usr/local/bin/sentinel-deploy.sh
+  images <sha>` — a fixed script installed on the node at provisioning time. CI never connects to
+  the Kubernetes API, never holds a kubeconfig, and cannot run an arbitrary command on the node:
+  it can only ask SSM to run that one script with an image tag. The API server stays unreachable
+  from the internet, which was the point of not exposing `:6443`.
+- **`kubeconform` now validates both overlays**, not just the local one, so the AWS manifests get
+  the same real-schema check the local ones have had since Phase 11.
+- **A `test-sentinel-ai` job**, running Sentinel's own pytest suite alongside the two application
+  suites.
+
+**Chaos surface extended for the incident types Sentinel needs to distinguish.**
+
+Two new fault fields on both services' chaos API: `cpu_burn` (bool) and `memory_leak_mb`
+(int, 0–2048), exported as the gauges `chaos_cpu_burn` and `chaos_memory_leak_mb` alongside the
+existing `chaos_*` metrics. The control API is otherwise unchanged, including the Phase 10
+behaviour of returning 404 rather than 401 to an unauthenticated caller so the surface is not
+advertised.
+
+`scripts/incident-scenarios.sh` grew from five scenarios to nine: `db-outage`, `http-errors`,
+`latency`, `notification-degradation`, `full-outage`, `high-cpu`, `memory-leak`, `crashloop`,
+`bad-deployment`. The four new ones exist because they are the cases where Sentinel's *choice of
+action* is the interesting part rather than its detection. `high-cpu` and `memory-leak` are
+resource-exhaustion incidents where a restart is genuinely the right first move; `crashloop` is
+one where it is not; `bad-deployment` is the one where the correct action is a rollback and
+nothing else, which is the scenario the whole rollback path exists for. New Prometheus rules
+(`HighCPUUsage`, `MemoryLeakSuspected`, `ChaosCPUBurn`, `ChaosMemoryLeak`,
+`NotificationDispatchFailures`, plus `SentinelDown` and `SentinelEscalating` watching Sentinel
+itself) come in through the AWS overlay's monitoring patch.
+
+**Sentinel AI — `sentinel-ai/`, an autonomous SRE agent, in this repo.**
+
+Through Phase 12 this project described Sentinel as "a separate platform built in its own
+repository" and this repo as its sample workload. That split is gone: Sentinel is a FastAPI
+service in `sentinel-ai/`, deployed by the AWS overlay into the same `citizen-portal` namespace as
+the workload it watches, listening on `:8080`, receiving Alertmanager webhooks at
+`/api/alerts/webhook`.
+
+Its incident lifecycle is fixed and explicit:
+
+```text
+DETECTION -> INVESTIGATION -> CORRELATION -> ROOT CAUSE ANALYSIS
+          -> REMEDIATION DECISION -> POLICY CHECK -> AUTONOMOUS EXECUTION
+          -> RECOVERY VALIDATION -> DOCUMENTATION -> NOTIFICATION -> LEARNING
+```
+
+When recovery validation fails, it re-investigates, takes the next action off the ordered
+candidate list, executes it and re-validates. When the list is exhausted, or when the action cap
+for the incident is reached, it escalates. An agent that keeps inventing new things to try against
+a service that is not recovering is strictly worse than one that stops and says so.
+
+The layering is the security argument, and it is why an LLM being involved is defensible:
+
+```text
+LLM  ->  Decision Engine  ->  Policy Engine  ->  Remediation Engine  ->  Kubernetes API
+```
+
+The LLM analyses evidence and returns a *structured* recommendation. It never receives shell
+access, never receives kubectl, and cannot name a target outside the allow-list — the action name
+is parsed against a fixed enum and the target against a configured list, both in ordinary
+deterministic code, before anything reaches the cluster. Everything downstream of the LLM is code
+with no free-text path into it.
+
+Four autonomous actions exist: `restart_deployment`, `rollback_deployment`, `scale_deployment`,
+`reset_chaos_fault`. Confidence thresholds are 0.95 for rollback and 0.90 for the other three,
+and rollback additionally requires that the deployment and namespace are allow-listed, that a
+previous revision exists, that deployment history exists, that a recent deploy correlates with the
+incident, that the rollback is reversible, and that recovery validation is available for the
+target. If any precondition fails, the Decision Engine's next candidate is tried, or the incident
+escalates.
+
+**Rollback runs with no human approval step.** That is deliberate and is the point of the phase.
+What bounds it is not an approval gate but three things that hold whatever the LLM says: the
+allow-list (`citizen-service`, `notification-service`, `frontend` — and a frozen deny-list for
+both Postgres deployments that no environment variable can override), the namespaced RBAC Role,
+and the preconditions above.
+
+RBAC is a namespaced `Role`, not `cluster-admin` and not a `ClusterRole`
+(`k8s/overlays/aws/sentinel/namespace-rbac.yaml`). It reads pods, services, endpoints, configmaps,
+events, deployments, replicasets and pod logs; it writes only `patch`/`update` on deployments and
+`deployments/scale`, plus creating Events so its own actions show up in `kubectl get events`
+alongside everything else. It cannot exec into a container, cannot delete anything (restarts are
+done by patching the pod template, so no delete verb is needed at all), cannot read Secrets,
+cannot touch PVCs or nodes, and cannot modify RBAC. It has no AWS permissions of any kind.
+`citizen-postgres` and `notification-postgres` are not allow-listed, so a database incident
+escalates to a human by design.
+
+Recovery validation after every action checks deployment availability, pod readiness, HTTP health,
+5xx error rate, p95 latency, CPU, memory, and the `chaos_*` gauges. The HTTP health check parses
+the JSON `status` field rather than trusting the status code, because `/readyz` returns 200 with
+`status: "degraded"` when a downstream dependency is broken — a validator that only looked at the
+code would declare a still-broken service recovered. An incident is only marked RESOLVED after
+validation passes.
+
+GitHub integration creates issues, incident reports and postmortems, and can *propose* a fix. It
+never modifies application code and never merges anything.
+
+### What's missing / deferred on purpose
+
+- **Nothing has been applied to AWS.** No `terraform apply`, and no `terraform plan` either — a
+  plan needs real credentials against a real account, and there has been none. `terraform
+  validate` and `terraform fmt` pass; that confirms the configuration is well-formed and
+  internally consistent, not that AWS would accept it. Expect the first real plan to surface
+  something: an AMI parameter path, a region without `t3a` capacity, an IAM policy that is
+  narrower than the thing it needs to permit.
+- **No pod has ever started on AWS.** The user-data bootstrap, the ECR credential refresh timer,
+  the Traefik ingress patch and `scripts/deploy-aws.sh` are all first-run-untested, in exactly the
+  sense Phases 7, 8, 9 and 12 each used the phrase before their own first real runs.
+- **Sentinel has never run against a real cluster.** The lifecycle, the Policy Engine, the
+  Decision Engine's ordering and the rollback preconditions are implemented and unit-tested with
+  the Kubernetes and Prometheus clients stubbed. The autonomous remediation and rollback path is
+  **not verified end-to-end.** Until a `bad-deployment` scenario has been run on a live cluster and
+  watched all the way through to a validated rollback, every claim about Sentinel's behaviour in
+  this file is a claim about code, not about observed behaviour.
+- **No TLS and no DNS.** The portal is reachable over plain HTTP on an IP address. `:443` is
+  wired behind a Terraform variable that defaults to off because nothing terminates TLS yet.
+  Doing this properly needs a hostname first, then cert-manager or Traefik's own ACME resolver;
+  putting a self-signed certificate on an IP address would be worse than plain HTTP, because it
+  teaches whoever demos it to click through a browser warning.
+- **No database backups.** Postgres runs in-cluster on a local-path PVC with no `pg_dump`
+  schedule, no snapshot policy, and nothing that survives instance replacement. This is the
+  sharpest edge of the "not production" caveat.
+- **Terraform state is local.** No S3 backend, no DynamoDB lock table. One operator, one laptop,
+  no concurrent applies — fine for that, and a genuine problem the moment a second person or a CI
+  job needs to apply.
+- **Sentinel runs as a single replica and is not safely horizontally scalable.** Incident
+  deduplication is in-process and the incident store is node-local SQLite, so two replicas would
+  each open their own incident for the same alert and neither would see the other's history. This
+  is a design consequence, not an oversight — but it means Sentinel itself is a single point of
+  failure in the system that is supposed to be watching for single points of failure.
+- **Single node, no redundancy anywhere.** One instance, one AZ, one control plane. If the
+  instance goes, everything goes, and Sentinel goes with it.
+- **The LLM is optional and unset by default.** With no `OPENAI_API_KEY`, Sentinel runs fully
+  rule-based: it still detects, investigates, correlates, decides, remediates and validates, and
+  it records `llm_used=false` on the incident so a later reading of the record is honest about
+  what produced the narrative. Nothing degrades silently.
+- **No autoscaling, no HPA, no cluster autoscaler.** Replica counts are fixed and sized by hand
+  to fit 2 vCPU; `MAX_REPLICAS=3` is what the node can actually absorb rather than a policy
+  preference.
+- **Image vulnerability scanning is still absent**, for the reasons in Phase 11's finding, which
+  have not been revisited.
+
+### Possible improvements
+
+- Run `terraform plan`, then `apply`, then `scripts/deploy-aws.sh`, then
+  `./scripts/incident-scenarios.sh bad-deployment`, and watch Sentinel roll it back. That single
+  sequence is what converts this phase from "written" to "done", and until it happens nothing else
+  on this list matters much.
+- A hostname and TLS (Route 53 or any DNS provider, plus Traefik's ACME resolver), which also
+  unblocks exposing Grafana with real authentication instead of a port-forward.
+- Move Terraform state to S3 with DynamoDB locking before a second person touches it.
+- Scheduled `pg_dump` to S3 with lifecycle expiry — the cheapest possible backup that is better
+  than none.
+- Make Sentinel horizontally scalable by moving the incident store and the dedup window out of
+  the pod (Postgres, or leader election) — worth doing only once there is more than one node for
+  a second replica to land on.
+- A local Sentinel setup so it can be exercised on kind/minikube without AWS. Sentinel is only in
+  the AWS overlay today, which means the fastest way to test it is also the slowest.
+- Feed `scripts/incident-scenarios.sh` into CI as a scheduled synthetic-incident suite against
+  the live node, asserting on Sentinel's incident records rather than only on alerts firing —
+  Phase 12's "possible improvement" made concrete now that a long-lived cluster is meant to exist.
+
+### Tech stack
+
+Terraform (AWS provider 5.x, local state), AWS: VPC / Internet Gateway / public subnet / route
+table / security group / EC2 / EBS / IAM / ECR / Systems Manager. K3s `v1.31.4+k3s1` with its
+bundled Traefik, on Ubuntu 24.04. Kustomize base + overlays (`kubectl kustomize`, no standalone
+binary needed). GitHub Actions with OIDC federation and `aws ssm send-command`. Sentinel:
+FastAPI, `pydantic-settings`, `httpx`, the Kubernetes HTTP API, SQLite for incident history, and
+optionally the OpenAI API. No new application dependencies in `citizen-service` or
+`notification-service` beyond what the two new chaos fields needed.
+
+---
 
 ## What's next
 
-**All 12 phases are implemented.** Two loose ends flagged along the way are still open and worth
-closing before treating any of this as "done-done": Phase 9's observability stack and this
-Phase 12 script have both been validated internally but never run against a real cluster; Phase
-11's CI/CD workflow has never actually run on GitHub. Pushing this repo and watching all of it run
-for real — the workflow, then a live deployment, then `./scripts/incident-scenarios.sh all`
-against it — is the natural next step before trusting any of these write-ups as more than
-"should work."
+**Twelve of thirteen phases are implemented and Phase 13 is written but unapplied.** The gap is
+specific and worth naming precisely, because it is the same gap Phases 8, 9 and 12 each carried
+before someone finally ran them: everything in Phase 13 has been checked as thoroughly as it can
+be without an AWS account attached — Terraform validates, both Kustomize overlays render and pass
+`kubeconform`, Sentinel's lifecycle is unit-tested — and none of it has been executed. No
+`terraform plan`, no instance, no pod, no incident.
 
-Beyond the 12-phase local/Kubernetes build plan, two further design docs cover taking this to AWS
-and connecting it to Sentinel AI, the platform this project exists to be a realistic workload for:
+The next step is therefore not another phase. It is:
 
-### Phase 10 — Chaos engineering / failure injection
+1. `terraform plan` and `apply` in `infra/terraform/`, and fix whatever the first real plan
+   surfaces.
+2. `scripts/generate-aws-secrets.sh`, then `scripts/deploy-aws.sh <sha>` over SSM, and confirm the
+   portal answers on the instance's public IP.
+3. `./scripts/incident-scenarios.sh all`, and watch Phase 9's alerts fire on a real cluster for
+   the first time.
+4. `./scripts/incident-scenarios.sh bad-deployment`, and watch Sentinel correlate the deploy,
+   roll it back with no human involved, validate the recovery, and write the incident up.
 
-Phase 10 is now implemented in both backend services. Chaos is deliberately **off by default** and
-is controlled at runtime only when `CHAOS_MODE=true` and a separate `CHAOS_ADMIN_TOKEN` is configured.
-The control surface is intentionally kept out of the frontend; Sentinel or an operator can drive it
-through the backend API.
+Only after (4) is any statement in this file about autonomous remediation a statement about
+observed behaviour rather than about code that should work.
 
-**Citizen Service** exposes:
+Two documents cover the details this file only summarises:
 
-- `GET /api/chaos/status` — inspect the current fault state
-- `POST /api/chaos/fault` — configure artificial latency, forced HTTP 5xx probability, and simulated
-  database failure
-- `POST /api/chaos/reset` — clear all active faults
+- **[`docs/aws-deployment.md`](docs/aws-deployment.md)** — the AWS architecture in full: what
+  Terraform creates, why EKS/RDS/ALB/NAT Gateway were each declined, how the SSM-only
+  administration path works, and the step-by-step deploy runbook.
+- **[`docs/sentinel-integration.md`](docs/sentinel-integration.md)** — what Sentinel reads, what
+  it is permitted to act on, how `request_id` ties logs to alerts, and how it tells a deliberately
+  injected chaos fault from a real failure.
 
-**Notification Service** exposes the same endpoints and additionally controls
-`notification_failure_rate`, which drives the existing simulated email/SMS provider failure path.
-The older `CHAOS_FAILURE_RATE` environment variable remains supported as the initial provider-failure
-rate for backwards-compatible Docker/Kubernetes startup configuration.
-
-All chaos control requests require the `X-Chaos-Token` header. Missing/incorrect tokens return 404,
-so the existence of the control surface is not advertised to unauthenticated callers. The control
-endpoints, health probes, OpenAPI endpoints, and Prometheus `/metrics` are excluded from fault
-injection. Artificial latency is therefore observable without making Kubernetes believe the pod is
-unhealthy, while database failure deliberately makes `/readyz` return HTTP 503 and normal application
-requests return HTTP 503.
-
-The services export Prometheus telemetry for the active fault configuration and every injected fault:
-`chaos_latency_ms`, `chaos_error_rate`, `chaos_db_failure`, `chaos_notification_failure_rate` (notification
-service), and `chaos_injections_total{fault_type=...}`. Phase 9's Prometheus rules now include explicit
-chaos-observation alerts plus a notification-delivery failure-rate alert, and the Grafana overview has
-panels for active chaos configuration, injection events, and notification failures.
-
-### Phase 10 test scenarios
-
-The test suites now cover authentication of the chaos control API, fault configuration/reset, forced
-5xx responses, latency injection, simulated DB failure/readiness degradation, and notification delivery
-failure injection. The normal notification chaos test was updated to drive the new runtime controller
-while retaining the existing failure-rate behavior.
-
-Example local control flow when running Docker Compose:
-
-```bash
-# Enable the control plane in .env first:
-CHAOS_MODE=true
-CHAOS_ADMIN_TOKEN=use-a-strong-random-token
-
-# Then configure a 100% HTTP failure rate:
-curl -H "X-Chaos-Token: use-a-strong-random-token" \
-  -H "Content-Type: application/json" \
-  -d '{"error_rate":1.0}' \
-  http://localhost:8000/api/chaos/fault
-
-# Reset afterward:
-curl -X POST \
-  -H "X-Chaos-Token: use-a-strong-random-token" \
-  http://localhost:8000/api/chaos/reset
-```
-
-For Kubernetes, replace the demo `CHAOS_ADMIN_TOKEN` value in both service Secrets before enabling
-`CHAOS_MODE`. Because each deployment has two replicas and chaos state is intentionally in-memory,
-setting a fault through one pod affects that pod only. This is useful for demonstrating partial
-failures; target a specific pod with `kubectl port-forward` when you need deterministic single-pod
-experiments.
-
-
-Phases 11 and 12 remain: a CI/CD pipeline (also where the ingress-nginx retirement finding from
-Phase 8 should get resolved), and finally end-to-end incident simulations for Sentinel to detect
-and respond to, using the exact observability stack this phase just built.
-=======
-**Phase 6 is done.** Both services are now fully observable: every request carries a traceable
-ID, every log line is structured JSON tagged with `service` and `request_id`, business-meaningful
-metrics are being recorded, and the health probes surface degraded-vs-down distinctions that
-Sentinel can act on.
-
-### Phase 7 — Kubernetes manifests
-
-The next step is writing the Kubernetes manifests to run the same stack that `docker compose up`
-brings up today, but on a cluster. Planned work:
-
-- **`k8s/`** directory at the repo root with one sub-directory per service
-  (`citizen-service/`, `notification-service/`, `frontend/`, `postgres/`,
-  `notification-postgres/`)
-- **Deployments** — one `Deployment` per service, resource requests/limits set conservatively,
-  liveness → `GET /healthz`, readiness → `GET /readyz`
-- **Services** — `ClusterIP` for inter-service traffic (citizen-service → notification-service,
-  both → their Postgres), `NodePort` or `LoadBalancer` for the frontend
-- **ConfigMaps + Secrets** — env vars (DB URLs, JWT secret, CORS origins) moved out of a flat
-  `.env` into typed Kubernetes objects; secrets managed with `kubectl create secret` locally
-  (SOPS/External Secrets in Phase 11 CI/CD)
-- **PersistentVolumeClaims** — one PVC per Postgres instance to survive pod restarts
-- **Ingress** (optional) — a single nginx-ingress or Traefik entry point that routes
-  `/api/*` to citizen-service and `/` to frontend, eliminating the per-service NodePort exposure
-- No Helm yet — plain YAML first so the manifest structure is transparent; Helm (or Kustomize
-  overlays) comes once there are multiple environments to manage
-
-Phases 8 through 12 — deploy to Kubernetes (local kind/minikube first, cloud later), the full
-Prometheus/Grafana/Loki/Alertmanager observability stack, chaos engineering endpoints, CI/CD
-pipeline, and finally end-to-end incident simulations for Sentinel to detect and respond to.
+See also [`README.md`](README.md) for the project overview and a worked example incident, and
+[`k8s/README.md`](k8s/README.md) for the manifest layout and both deployment paths.

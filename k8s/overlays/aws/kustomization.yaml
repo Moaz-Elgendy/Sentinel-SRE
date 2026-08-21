@@ -1,0 +1,138 @@
+# AWS / K3s overlay.
+#
+# ---------------------------------------------------------------------------
+# Relationship to local development
+# ---------------------------------------------------------------------------
+# The manifests this builds on live in k8s/base/. Local development still
+# runs `kubectl apply -k k8s/`, which is a thin wrapper around the same base
+# — so both environments share one set of manifests and cannot drift.
+#
+# The base IS the local configuration (ingress-nginx, committed demo Secret
+# values, :latest images from a local image store). This overlay replaces
+# exactly those three things and adds Sentinel. Anything that should be true
+# in both environments belongs in base/, not here.
+#
+# ---------------------------------------------------------------------------
+# What this overlay changes, and why each change is needed for AWS/K3s
+# ---------------------------------------------------------------------------
+#   1. Images       -> ECR, pinned by git SHA (base uses local :latest tags
+#                      that only exist in a kind/minikube image store).
+#   2. Ingress      -> Traefik instead of ingress-nginx, and reachable by
+#                      raw IP instead of the citizen-portal.local hostname.
+#   3. Pull secret  -> ecr-credentials, refreshed on the node by a systemd
+#                      timer (see infra/terraform/user_data.sh.tftpl).
+#   4. Secrets      -> real values injected at deploy time from gitignored
+#                      env files, replacing the committed demo placeholders.
+#   5. Storage      -> explicit local-path StorageClass (K3s's provisioner).
+#   6. Rollout      -> revisionHistoryLimit so Sentinel has rollback targets.
+#   7. Chaos        -> enabled, so the failure scenarios exist to demo.
+#   8. Sentinel     -> added (it has no local-development equivalent yet).
+#   9. Right-sizing -> replica counts tuned for a 2 vCPU node.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: citizen-portal
+
+resources:
+  - ../../base
+  # Sentinel has no local equivalent yet, so it is added here rather than
+  # patched. When a local Sentinel setup exists, promote this to the base.
+  - sentinel/namespace-rbac.yaml
+  - sentinel/configmap.yaml
+  - sentinel/deployment.yaml
+  - sentinel/service.yaml
+
+# ---------------------------------------------------------------------------
+# Images
+#
+# newTag is a placeholder that CI overwrites. Two mechanisms do this, and
+# they are complementary rather than redundant:
+#
+#   * `sentinel-deploy.sh images <sha>` (kubectl set image) — the normal CI
+#     path. Fast, and produces a clean new ReplicaSet, which is what makes
+#     `kubectl rollout undo` meaningful and gives Sentinel something to
+#     correlate an incident against.
+#   * `kustomize edit set image` before `apply` — used when manifests
+#     themselves changed, not just the image tag.
+#
+# "PLACEHOLDER" is deliberately not a valid tag: if it ever reaches the
+# cluster unsubstituted, the pod fails with ImagePullBackOff immediately
+# and visibly, rather than silently running a stale `latest`.
+# ---------------------------------------------------------------------------
+images:
+  - name: citizen-service
+    newName: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/citizen-service
+    newTag: PLACEHOLDER
+  - name: notification-service
+    newName: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/notification-service
+    newTag: PLACEHOLDER
+  - name: frontend
+    newName: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/frontend
+    newTag: PLACEHOLDER
+  - name: sentinel-ai
+    newName: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/sentinel-ai
+    newTag: PLACEHOLDER
+
+# ---------------------------------------------------------------------------
+# Secrets
+#
+# The base contains NO Secrets at all — the committed demo values live in
+# k8s/overlays/local/secrets/ and are never inherited here. So these are
+# plain `create`, not overrides: there is nothing to override, and no way to
+# accidentally ship `DATABASE_PASSWORD: sentinal` to a public IP by
+# forgetting a patch.
+#
+# The .env files are gitignored and absent from a fresh checkout, so
+# `kubectl apply -k` fails with a clear "no such file or directory" until
+# they exist. That is deliberate — failing closed beats defaulting to a
+# known password on an internet-facing host. Generate them once with
+# scripts/generate-aws-secrets.sh.
+#
+# disableNameSuffixHash keeps the Secret names stable. A content hash in the
+# name is normally good practice (it forces a rollout when a secret
+# changes), but here the Postgres readiness probe hardcodes
+# `pg_isready -U app_user`, so the username cannot move independently of the
+# probe — and a rotation is a deliberate, rare, operator-driven act in this
+# environment anyway.
+# ---------------------------------------------------------------------------
+secretGenerator:
+  - name: citizen-postgres-secret
+    envs:
+      - secrets/citizen-postgres.env
+  - name: notification-postgres-secret
+    envs:
+      - secrets/notification-postgres.env
+  - name: citizen-service-secret
+    envs:
+      - secrets/citizen-service.env
+  - name: notification-service-secret
+    envs:
+      - secrets/notification-service.env
+  - name: grafana-secret
+    envs:
+      - secrets/grafana.env
+  # Sentinel's own credentials: OpenAI key, GitHub token, Slack webhook,
+  # chaos admin token. All optional — Sentinel runs fully rule-based with no
+  # OpenAI key and skips issue creation with no GitHub token. See
+  # sentinel/configmap.yaml.
+  - name: sentinel-secret
+    envs:
+      - secrets/sentinel.env
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+patches:
+  # Enable chaos, and point CORS at the public IP.
+  - path: patch-configmaps.yaml
+  # Traefik ingress, IP-addressable.
+  - path: patch-ingress-traefik.yaml
+  # Pull from ECR, keep rollback history, add startup probes.
+  - path: patch-app-deployments.yaml
+  # Explicit StorageClass on every PVC.
+  - path: patch-pvcs.yaml
+  # Fit the workload onto 2 vCPU.
+  - path: patch-replicas.yaml
+  # Alertmanager -> Sentinel webhook, plus the missing alert rules.
+  - path: patch-monitoring.yaml

@@ -1,0 +1,58 @@
+# Traefik instead of ingress-nginx.
+#
+# K3s bundles Traefik and wires it to the node's :80 via its ServiceLB, so
+# the EC2 instance's public IP serves the portal with no cloud load
+# balancer involved. Installing ingress-nginx alongside it would put two
+# controllers in contention for :80.
+#
+# Three changes from the base Ingress:
+#
+#  1. ingressClassName: nginx -> traefik.
+#
+#  2. The nginx.ingress.kubernetes.io/use-regex annotation is removed. It is
+#     ingress-nginx-specific and Traefik ignores it; leaving a dead
+#     annotation behind invites someone to assume it does something. The
+#     base only used it for the two Prefix paths, which need no regex.
+#     (Removal is by explicit null — strategic-merge-patching a map cannot
+#     delete a key any other way.)
+#
+#  3. The `host: citizen-portal.local` rule is replaced with a
+#     host-less rule, so it matches any Host header. The AWS environment
+#     is reached by raw IP (http://<public-ip>) and there is no DNS name
+#     for it, so a host-scoped rule would never match. Once a real
+#     hostname and an ACM/cert-manager certificate exist, put the host
+#     back and add a tls block.
+#
+# Path ordering note: /api must win over /. Traefik sorts rules by path
+# length descending, so the more specific /api prefix is matched first
+# regardless of the order they appear here — the same behaviour
+# ingress-nginx gives, so the base's ordering assumption still holds.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: citizen-portal-ingress
+  namespace: citizen-portal
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: null
+spec:
+  ingressClassName: traefik
+  rules:
+    # Replaces the base's single host-scoped rule. Strategic merge on a
+    # list without a merge key is a full replacement, which is what we want
+    # here.
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: citizen-service
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000

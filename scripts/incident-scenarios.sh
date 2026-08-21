@@ -17,7 +17,20 @@
 #   ./scripts/incident-scenarios.sh all
 #
 # Scenarios: db-outage | http-errors | latency | notification-degradation
-#            | full-outage | all
+#            | full-outage | high-cpu | memory-leak | crashloop
+#            | bad-deployment | all
+#
+# Eight scenarios, in three families:
+#   * chaos-API application faults (db-outage, http-errors, latency,
+#     notification-degradation, high-cpu, memory-leak) — injected in-process
+#     through the Phase 10 control plane, reversible with a single
+#     POST /api/chaos/reset;
+#   * platform faults (full-outage, crashloop) — driven purely through
+#     kubectl, needing no application cooperation at all, which is exactly
+#     what makes them the most trustworthy of the eight;
+#   * release faults (bad-deployment) — a bad rollout that only a rollback
+#     fixes. This one deliberately LEAVES THE SYSTEM BROKEN, see its own
+#     notes below.
 #
 # Requires: kubectl context pointed at the cluster, the chaos control
 # plane enabled (CHAOS_MODE=true + CHAOS_ADMIN_TOKEN set in both
@@ -33,6 +46,9 @@
 set -euo pipefail
 
 NAMESPACE="${2:-citizen-portal}"
+# Read at top level, not inside the function: inside a shell function $3 is
+# the *function's* third argument, not the script's.
+AUTO_ROLLBACK="${3:-${BAD_DEPLOYMENT_AUTO_ROLLBACK:-false}}"
 CHAOS_TOKEN="${CHAOS_ADMIN_TOKEN:-}"
 PROM_PORT=9090
 AM_PORT=9093
@@ -41,11 +57,27 @@ NOTIF_PORT=18001
 
 PIDS=()
 ORIGINAL_REPLICAS=()
+# Deployments whose Pod template this run has deliberately broken and which
+# MUST be rolled back on exit — including on Ctrl-C or a mid-scenario
+# failure. A crash-loop we walked away from is not a demo, it's an outage.
+# Scenarios add themselves here before breaking anything and remove
+# themselves once they have recovered the Deployment on the happy path.
+# bad-deployment deliberately does NOT register here: leaving the bad
+# release in place is its entire point.
+PENDING_ROLLBACKS=()
 
 cleanup() {
   local status=$?
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" >/dev/null 2>&1 || true
+  done
+  # Named differently from the loop variable below so this doesn't leak a
+  # global that the ORIGINAL_REPLICAS loop then declares `local`.
+  for pending in "${PENDING_ROLLBACKS[@]:-}"; do
+    [ -z "$pending" ] && continue
+    echo "    Rolling back $pending (registered for automatic rollback)..." >&2
+    kubectl rollout undo deployment "$pending" -n "$NAMESPACE" >/dev/null 2>&1 || true
+    kubectl rollout status deployment "$pending" -n "$NAMESPACE" --timeout=120s >/dev/null 2>&1 || true
   done
   for entry in "${ORIGINAL_REPLICAS[@]:-}"; do
     [ -z "$entry" ] && continue
@@ -58,7 +90,10 @@ cleanup() {
     echo "!! Scenario exited with an error — see above. Fault state was still reset." >&2
   fi
 }
-trap cleanup EXIT
+# INT/TERM as well as EXIT: bash does not reliably run an EXIT trap when the
+# shell is killed by an untrapped signal, and Ctrl-C during the crashloop
+# scenario is precisely when we most need the rollback to happen.
+trap cleanup EXIT INT TERM
 
 require_token() {
   if [ -z "$CHAOS_TOKEN" ]; then
@@ -146,6 +181,72 @@ except Exception:
   else
     echo "    (not yet visible in Alertmanager — it polls Prometheus periodically; check manually if needed)"
   fi
+}
+
+unregister_rollback() {
+  # Called on the happy path once a scenario has recovered a Deployment
+  # itself, so cleanup() doesn't issue a second, pointless `rollout undo`
+  # that would take the Deployment back to a revision nobody asked for.
+  local target="$1" remaining=()
+  for deploy in "${PENDING_ROLLBACKS[@]:-}"; do
+    [ -z "$deploy" ] && continue
+    [ "$deploy" = "$target" ] && continue
+    remaining+=("$deploy")
+  done
+  PENDING_ROLLBACKS=("${remaining[@]:-}")
+}
+
+deployment_revision() {
+  # The revision counter Deployments keep in an annotation. Comparing it
+  # before/after is how we prove a rollout actually happened rather than
+  # trusting that `kubectl set env` changed something.
+  kubectl get deployment "$1" -n "$NAMESPACE" \
+    -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}'
+}
+
+wait_for_waiting_reason() {
+  # Polls the Pods of a Deployment for a container stuck in a specific
+  # waiting reason (e.g. CrashLoopBackOff). This is the same field the
+  # kubelet reports and `kubectl get pods` renders in its STATUS column, so
+  # asserting on it is asserting on exactly what an operator would see.
+  # $1 = deployment/app label, $2 = reason, $3 = max seconds.
+  local deploy="$1" reason="$2" timeout="$3" waited=0
+  echo "    Waiting up to ${timeout}s for a $deploy container to report '$reason'..."
+  while [ "$waited" -lt "$timeout" ]; do
+    local reasons
+    reasons=$(kubectl get pods -n "$NAMESPACE" -l "app=$deploy" \
+      -o jsonpath='{range .items[*]}{range .status.containerStatuses[*]}{.state.waiting.reason}{"\n"}{end}{end}' 2>/dev/null || true)
+    if echo "$reasons" | grep -q "^$reason$"; then
+      echo "    OK — $deploy is in $reason (took ~${waited}s)"
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "FAILED: no $deploy container reached '$reason' within ${timeout}s" >&2
+  echo "        Check: kubectl get pods -n $NAMESPACE -l app=$deploy" >&2
+  return 1
+}
+
+wait_for_no_ready_replicas() {
+  # Inverse of `kubectl rollout status`: waits for a Deployment to have zero
+  # ready replicas, i.e. for the broken release to have actually taken the
+  # service down rather than being quietly held back by maxUnavailable.
+  local deploy="$1" timeout="$2" waited=0
+  echo "    Waiting up to ${timeout}s for $deploy to have no ready replicas..."
+  while [ "$waited" -lt "$timeout" ]; do
+    local ready
+    ready=$(kubectl get deployment "$deploy" -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
+    if [ -z "$ready" ] || [ "$ready" = "0" ]; then
+      echo "    OK — $deploy has no ready replicas (took ~${waited}s)"
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "FAILED: $deploy still had ready replicas after ${timeout}s — the broken" >&2
+  echo "        release may not be rolling out (check maxUnavailable / probes)." >&2
+  return 1
 }
 
 generate_traffic() {
@@ -339,6 +440,194 @@ scenario_full_outage() {
   echo "=== full-outage: PASSED ==="
 }
 
+scenario_high_cpu() {
+  echo "=== Scenario: citizen-service CPU exhaustion ==="
+  echo "    What an operator/Sentinel would see: rate(process_cpu_seconds_total[2m])"
+  echo "    for this pod climbs and stays climbed, requests get slower as the"
+  echo "    event loop competes with the burn, but /healthz and /metrics keep"
+  echo "    answering — the burner runs on an 80/20 duty cycle precisely so the"
+  echo "    incident stays observable and remediable instead of silently killing"
+  echo "    the pod via its liveness probe (see app/chaos/state.py)."
+  echo "    Note the pod's 500m CPU limit caps the observed rate near 0.5 cores;"
+  echo "    HighCPUUsage's threshold has to sit below that to ever fire here."
+  require_token
+  pin_single_replica citizen-service
+  port_forward citizen-service "$CITIZEN_PORT" 8000
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
+
+  echo "    Enabling the CPU burn worker..."
+  set_chaos_fault "$CITIZEN_PORT" '{"cpu_burn": true}'
+
+  # Sanity check that the fault did not cost us the observability we need to
+  # detect it — the single most important property of this scenario.
+  local healthz_status
+  healthz_status=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$CITIZEN_PORT/healthz")
+  echo "    /healthz still returns HTTP $healthz_status while burning (expected 200)"
+
+  # Generous timeout: the alert is built on a 2m rate window, so Prometheus
+  # needs at least that much history before the expression is even true,
+  # plus the rule's own `for:` duration on top.
+  wait_for_alert "HighCPUUsage" 420
+  check_alertmanager_seen "HighCPUUsage"
+
+  echo "    Resetting fault..."
+  reset_chaos_fault "$CITIZEN_PORT"
+  echo "=== high-cpu: PASSED ==="
+}
+
+scenario_memory_leak() {
+  # 64 MiB, deliberately: the pod's limit is 256Mi and the app's steady-state
+  # RSS is already well over 100Mi, so a bigger leak risks the kubelet
+  # OOMKilling the container partway through the wait — which would replace
+  # the memory incident with a restart incident and lose the very signal this
+  # scenario exists to produce. 64Mi is a large, unmistakable step on
+  # process_resident_memory_bytes while staying under the limit. Demoing the
+  # OOMKill path is legitimate and supported (the API accepts up to 2048), it
+  # just is not what *this* scenario asserts.
+  local leak_mb=64
+  echo "=== Scenario: citizen-service memory leak (${leak_mb} MiB retained) ==="
+  echo "    What an operator/Sentinel would see: process_resident_memory_bytes"
+  echo "    steps up and never comes back down on its own — the signature that"
+  echo "    separates a leak from a traffic spike. Nothing else degrades, which"
+  echo "    is what makes leaks dangerous: the service looks fine right up to"
+  echo "    the moment the container hits its memory limit and is OOMKilled."
+  require_token
+  pin_single_replica citizen-service
+  port_forward citizen-service "$CITIZEN_PORT" 8000
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
+
+  echo "    Retaining ${leak_mb} MiB in the leak buffer..."
+  set_chaos_fault "$CITIZEN_PORT" "{\"memory_leak_mb\": $leak_mb}"
+
+  wait_for_alert "MemoryLeakSuspected" 420
+  check_alertmanager_seen "MemoryLeakSuspected"
+
+  echo "    Resetting fault (frees every retained chunk — the leak is reversible"
+  echo "    here, which a real leak would not be)..."
+  reset_chaos_fault "$CITIZEN_PORT"
+  echo "=== memory-leak: PASSED ==="
+}
+
+scenario_crashloop() {
+  echo "=== Scenario: citizen-service CrashLoopBackOff ==="
+  echo "    Deliberately NOT a chaos-API scenario: the whole point is a pod that"
+  echo "    dies before the application — and therefore before the chaos control"
+  echo "    plane — exists at all. This is the failure mode that no amount of"
+  echo "    in-process instrumentation can report on itself, so it is the one"
+  echo "    that proves the platform-level signals (kube-state / pod phase /"
+  echo "    ServiceDown) are doing real work."
+  echo "    Mechanism: override the container's command with one that exits"
+  echo "    non-zero immediately. Reversible with a single 'kubectl rollout"
+  echo "    undo', and registered for automatic rollback even if this script is"
+  echo "    interrupted."
+  local container
+  container=$(kubectl get deployment citizen-service -n "$NAMESPACE" \
+    -o jsonpath='{.spec.template.spec.containers[0].name}')
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
+
+  local before_revision
+  before_revision=$(deployment_revision citizen-service)
+  echo "    Current revision: $before_revision"
+
+  echo "    Patching container '$container' to exit 1 on startup..."
+  PENDING_ROLLBACKS+=("citizen-service")
+  kubectl patch deployment citizen-service -n "$NAMESPACE" --type=strategic -p \
+    "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$container\",\"command\":[\"/bin/sh\",\"-c\",\"echo 'simulated startup failure (incident-scenarios.sh crashloop)'; exit 1\"]}]}}}}"
+
+  # Not rollout status: we *want* this rollout to fail. CrashLoopBackOff only
+  # appears after the kubelet's back-off kicks in on the second restart, so
+  # this needs more than a few seconds.
+  wait_for_waiting_reason citizen-service CrashLoopBackOff 240
+
+  echo "    Restart counts now:"
+  kubectl get pods -n "$NAMESPACE" -l app=citizen-service \
+    -o custom-columns='POD:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,STATUS:.status.containerStatuses[0].state.waiting.reason' \
+    2>/dev/null || true
+
+  echo "    Recovering with 'kubectl rollout undo'..."
+  kubectl rollout undo deployment citizen-service -n "$NAMESPACE"
+  kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s
+  unregister_rollback citizen-service
+
+  local after_revision
+  after_revision=$(deployment_revision citizen-service)
+  echo "    Recovered on revision $after_revision (was $before_revision before the break)"
+  local ready
+  ready=$(kubectl get deployment citizen-service -n "$NAMESPACE" -o jsonpath='{.status.readyReplicas}')
+  if [ -z "$ready" ] || [ "$ready" = "0" ]; then
+    echo "FAILED: citizen-service has no ready replicas after the rollback" >&2
+    return 1
+  fi
+  echo "    OK — $ready ready replica(s) after rollback"
+  echo "=== crashloop: PASSED ==="
+}
+
+scenario_bad_deployment() {
+  # Auto-rollback is opt-in via a third positional arg or the env var, so the
+  # same scenario serves two very different purposes:
+  #   * default (agent mode): break it and WALK AWAY. Sentinel is supposed to
+  #     notice and roll back by itself; a script that tidies up after itself
+  #     would be grading its own homework.
+  #   * auto-rollback (smoke-test mode): prove the mechanics work in CI
+  #     without leaving a broken cluster behind for the next job.
+  local auto_rollback="$AUTO_ROLLBACK"
+  echo "=== Scenario: bad citizen-service release (rollback required) ==="
+  echo "    What an operator/Sentinel would see: a rollout that completes as far"
+  echo "    as Kubernetes is concerned but whose new pods never pass /readyz,"
+  echo "    because the app now points at a database host that does not exist."
+  echo "    The only real fix is a rollback — no amount of restarting helps,"
+  echo "    which is exactly what distinguishes a bad release from a transient"
+  echo "    fault, and exactly the judgement call this scenario is here to test."
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
+
+  local before_revision
+  before_revision=$(deployment_revision citizen-service)
+  echo "    Good revision (the rollback target): $before_revision"
+
+  echo "    Pointing DATABASE_HOST at a nonexistent host..."
+  kubectl set env deployment/citizen-service -n "$NAMESPACE" \
+    DATABASE_HOST=citizen-postgres-does-not-exist.invalid
+
+  local after_revision
+  after_revision=$(deployment_revision citizen-service)
+  if [ "$after_revision" = "$before_revision" ]; then
+    echo "FAILED: revision did not advance ($before_revision) — the bad change" >&2
+    echo "        never became a rollout, so there is nothing to roll back." >&2
+    return 1
+  fi
+  echo "    OK — new revision $after_revision created (rollback target remains $before_revision)"
+  echo "    Deployment history:"
+  kubectl rollout history deployment citizen-service -n "$NAMESPACE" || true
+
+  wait_for_no_ready_replicas citizen-service 240
+
+  if [ "$auto_rollback" = "true" ]; then
+    echo "    Auto-rollback requested — rolling back instead of leaving the"
+    echo "    incident open (smoke-test mode, not agent mode)."
+    kubectl rollout undo deployment citizen-service -n "$NAMESPACE"
+    kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s
+    echo "    Recovered on revision $(deployment_revision citizen-service)"
+  else
+    echo
+    echo "    >>> THE SYSTEM IS INTENTIONALLY LEFT BROKEN. <<<"
+    echo "    This is the scenario an autonomous agent (Sentinel) is expected to"
+    echo "    detect and remediate on its own, without being told what happened."
+    echo "    Nothing below this line will fix it — that is the test."
+    echo
+    echo "    Expected agent action:"
+    echo "      kubectl rollout undo deployment citizen-service -n $NAMESPACE"
+    echo "    To recover by hand, run exactly that. To run this scenario as a"
+    echo "    non-agent smoke test instead, pass 'true' as the third argument or"
+    echo "    set BAD_DEPLOYMENT_AUTO_ROLLBACK=true."
+    echo
+  fi
+  echo "=== bad-deployment: PASSED ==="
+}
+
 SCENARIO="${1:-}"
 case "$SCENARIO" in
   db-outage) scenario_db_outage ;;
@@ -346,19 +635,50 @@ case "$SCENARIO" in
   latency) scenario_latency ;;
   notification-degradation) scenario_notification_degradation ;;
   full-outage) scenario_full_outage ;;
+  high-cpu) scenario_high_cpu ;;
+  memory-leak) scenario_memory_leak ;;
+  crashloop) scenario_crashloop ;;
+  bad-deployment) scenario_bad_deployment ;;
   all)
+    # 'all' runs the seven scenarios that leave the cluster the way they
+    # found it, in roughly increasing order of disruption. bad-deployment is
+    # deliberately EXCLUDED: it is the one scenario whose contract is to walk
+    # away from a broken system, so including it would mean 'all' ends with
+    # citizen-service down and every subsequent run of any scenario failing
+    # for reasons that have nothing to do with the scenario. Anything that
+    # makes a test suite non-repeatable does not belong in the "run
+    # everything" path — run it explicitly when you want it.
     scenario_db_outage
     scenario_http_errors
     scenario_latency
     scenario_notification_degradation
+    scenario_high_cpu
+    scenario_memory_leak
+    scenario_crashloop
     scenario_full_outage
     echo
     echo "============================================================"
     echo " All incident scenarios passed."
+    echo " (bad-deployment excluded from 'all' by design — it leaves the"
+    echo "  system broken on purpose. Run it explicitly.)"
     echo "============================================================"
     ;;
   *)
-    echo "Usage: $0 <db-outage|http-errors|latency|notification-degradation|full-outage|all> [namespace]" >&2
+    echo "Usage: $0 <scenario> [namespace] [auto-rollback]" >&2
+    echo >&2
+    echo "Scenarios:" >&2
+    echo "  db-outage                simulated DB failure (chaos API)" >&2
+    echo "  http-errors              forced HTTP 5xx (chaos API)" >&2
+    echo "  latency                  injected request latency (chaos API)" >&2
+    echo "  notification-degradation notification delivery failures (chaos API)" >&2
+    echo "  high-cpu                 CPU exhaustion via the burn worker (chaos API)" >&2
+    echo "  memory-leak              retained-memory leak (chaos API)" >&2
+    echo "  crashloop                container exits at startup (kubectl, reversible)" >&2
+    echo "  bad-deployment           bad release needing a rollback — LEAVES THE" >&2
+    echo "                           SYSTEM BROKEN unless the third argument is" >&2
+    echo "                           'true' (or BAD_DEPLOYMENT_AUTO_ROLLBACK=true)" >&2
+    echo "  full-outage              deployment scaled to 0 replicas (kubectl)" >&2
+    echo "  all                      every scenario except bad-deployment" >&2
     exit 1
     ;;
 esac

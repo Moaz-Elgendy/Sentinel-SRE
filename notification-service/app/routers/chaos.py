@@ -15,6 +15,12 @@ class ChaosFaultRequest(BaseModel):
     error_rate: float | None = Field(default=None, ge=0.0, le=1.0)
     db_failure: bool | None = None
     notification_failure_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    cpu_burn: bool | None = None
+    # Upper bound is 2048 MiB, well above the pod's 256Mi limit on purpose:
+    # leaking past the limit OOMKills the container, which is a legitimate
+    # incident to demo rather than something to defend against. See the long
+    # note on ChaosState.memory_leak_mb in app/chaos/state.py.
+    memory_leak_mb: int | None = Field(default=None, ge=0, le=2048)
 
 
 class ChaosStateOut(BaseModel):
@@ -23,6 +29,8 @@ class ChaosStateOut(BaseModel):
     error_rate: float
     db_failure: bool
     notification_failure_rate: float
+    cpu_burn: bool
+    memory_leak_mb: int
 
 
 def _require_admin(x_chaos_token: Annotated[str | None, Header()] = None) -> None:
@@ -40,6 +48,8 @@ def _out(state: ChaosState) -> ChaosStateOut:
         error_rate=state.error_rate,
         db_failure=state.db_failure,
         notification_failure_rate=state.notification_failure_rate,
+        cpu_burn=state.cpu_burn,
+        memory_leak_mb=state.memory_leak_mb,
     )
 
 
@@ -61,6 +71,8 @@ def set_chaos_fault(
             error_rate=payload.error_rate,
             db_failure=payload.db_failure,
             notification_failure_rate=payload.notification_failure_rate,
+            cpu_burn=payload.cpu_burn,
+            memory_leak_mb=payload.memory_leak_mb,
         )
     )
 

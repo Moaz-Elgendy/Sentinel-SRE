@@ -1,0 +1,177 @@
+# Sentinel's ServiceAccount and RBAC.
+#
+# ===========================================================================
+# The security argument, in full
+# ===========================================================================
+# Sentinel decides what to do with help from an LLM, and then acts on a real
+# Kubernetes cluster without asking a human first. That combination is only
+# defensible if the blast radius is bounded by something the LLM cannot
+# influence. RBAC is that bound, and it is the last line — not the first.
+#
+# There are three layers, and each one is independently sufficient to stop a
+# bad action:
+#
+#   1. The Policy Engine (sentinel-ai/app/lifecycle/policy.py) checks the
+#      action name against a fixed enum, the target against an allow-list,
+#      and the confidence against a threshold.
+#   2. The Remediation Engine is the only code permitted to call the
+#      Kubernetes API, and it accepts structured parameters
+#      (namespace/deployment/target_revision) — never a command string.
+#   3. This Role. Even if layers 1 and 2 were both bypassed by a bug, the
+#      API server itself will refuse anything not listed below.
+#
+# Layer 3 matters precisely because layers 1 and 2 are ordinary application
+# code that could contain a mistake. A cluster-admin ServiceAccount would
+# make this whole structure decorative.
+#
+# ===========================================================================
+# What Sentinel deliberately CANNOT do
+# ===========================================================================
+# Not granted anywhere in this file, and each omission is intentional:
+#
+#   * pods/exec, pods/attach, pods/portforward
+#       No arbitrary command execution inside containers. This is the single
+#       most important omission: it is what makes "the LLM never gets shell
+#       access" a structural fact rather than a coding convention.
+#   * delete on anything
+#       Sentinel restarts pods by patching the Deployment's pod template
+#       (what `kubectl rollout restart` does), not by deleting pods. So it
+#       needs no delete verb at all, and therefore cannot delete a pod, a
+#       PVC, a Secret, or a namespace even by accident.
+#   * secrets (any verb)
+#       Sentinel has no reason to read application credentials. Not reading
+#       them means a compromised or confused agent cannot exfiltrate them,
+#       and cannot include them in an incident report, a GitHub issue, or a
+#       prompt sent to an LLM. That last one is the real risk.
+#   * persistentvolumeclaims / persistentvolumes
+#       Cannot touch storage, so cannot destroy database data.
+#   * nodes, or anything else cluster-scoped
+#       Everything here is a namespaced Role, not a ClusterRole. Sentinel
+#       cannot see or affect kube-system, cannot drain or cordon the node,
+#       and cannot reach any other namespace — including one created later.
+#   * rbac.authorization.k8s.io (any resource)
+#       Cannot grant itself more permission. This is what makes every other
+#       restriction in this file durable rather than advisory.
+#   * serviceaccounts, roles, rolebindings, ClusterRoleBindings
+#       Same reason.
+#   * create on anything except events
+#       Cannot introduce new workloads.
+#
+# It also has no AWS permissions of any kind. Sentinel runs as a pod and
+# uses no IAM role, so it cannot touch ECR, EC2, or any AWS resource.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinel-ai
+  namespace: citizen-portal
+  labels:
+    app: sentinel-ai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinel-ai
+  namespace: citizen-portal
+  labels:
+    app: sentinel-ai
+rules:
+  # ---------------------------------------------------------------------
+  # READ — investigation and correlation
+  # ---------------------------------------------------------------------
+  - apiGroups: [""]
+    resources:
+      - pods
+      - services
+      - endpoints
+      - configmaps
+    verbs: ["get", "list", "watch"]
+
+  # Events are how Sentinel sees OOMKilled, FailedScheduling,
+  # BackOff/CrashLoopBackOff, Unhealthy probe failures and image pull
+  # errors. Without this the Kubernetes-events half of correlation is
+  # blind, and CrashLoopBackOff in particular becomes very hard to
+  # diagnose from metrics alone.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+  # ReplicaSets are the mechanism behind deployment correlation and
+  # rollback. Their `deployment.kubernetes.io/revision` annotation is the
+  # rollout history, and each one holds the exact pod template (and so the
+  # exact image, and so the exact git SHA) of a past revision. Reading them
+  # is how Sentinel answers "did a deploy cause this, and what would
+  # rolling back actually restore".
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+
+  # Read-only view of pod logs. Sentinel primarily reads logs from Loki,
+  # but Loki only has what Alloy managed to ship — for a pod that is
+  # CrashLooping, the previous container's dying output is often the only
+  # useful evidence and reading it directly from the API is more reliable.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+
+  # ---------------------------------------------------------------------
+  # WRITE — exactly the three remediation actions, and nothing else
+  # ---------------------------------------------------------------------
+  # `patch` and `update` on deployments covers all three:
+  #
+  #   restart_deployment  -> patch spec.template.metadata.annotations
+  #                          (kubectl.kubernetes.io/restartedAt)
+  #   rollback_deployment -> patch spec.template back to a previous
+  #                          ReplicaSet's template
+  #   scale_deployment    -> patch spec.replicas
+  #
+  # Note what patch on a Deployment does NOT allow in practice: the Policy
+  # Engine restricts the target name to the allow-list, so even though the
+  # API server would permit patching citizen-postgres, Sentinel's own code
+  # refuses to. Both checks exist because they fail differently — RBAC
+  # cannot express "only these three deployment names", and application
+  # code can contain bugs.
+  #
+  # `create` is absent, so Sentinel cannot introduce a new Deployment.
+  # `delete` is absent, so it cannot remove one.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+
+  # The scale subresource, for scale_deployment. Kept separate from the
+  # deployment patch above because it is the narrower, more explicit way to
+  # change replica count.
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch", "update"]
+
+  # Emitting Kubernetes Events is how Sentinel's actions become visible in
+  # `kubectl describe` and `kubectl get events` alongside everything else
+  # that happened. An autonomous agent that acts without leaving a trace in
+  # the cluster's own audit surface would be much harder to trust or debug.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinel-ai
+  namespace: citizen-portal
+  labels:
+    app: sentinel-ai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinel-ai
+subjects:
+  - kind: ServiceAccount
+    name: sentinel-ai
+    namespace: citizen-portal

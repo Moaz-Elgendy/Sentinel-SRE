@@ -1,0 +1,33 @@
+# ClusterIP only, with no Ingress rule anywhere in this overlay.
+#
+# Sentinel's API is an internal control surface: the Alertmanager webhook
+# receiver that triggers incident processing, and read endpoints exposing
+# incident history. Neither is authenticated, because within the cluster the
+# only caller is Alertmanager.
+#
+# That lack of authentication is precisely why there is no Ingress path for
+# it. Exposing /api/alerts/webhook publicly would let anyone on the internet
+# fabricate an alert and cause Sentinel to investigate and remediate — an
+# unauthenticated trigger for autonomous cluster actions. Adding an Ingress
+# rule for this Service without first adding authentication would be a
+# serious mistake, so the comment is here rather than in a document nobody
+# reads.
+#
+# To inspect incidents from a laptop, port-forward through SSM:
+#   aws ssm start-session --target <instance-id>
+#   sudo kubectl -n citizen-portal port-forward svc/sentinel-ai 8080:8080
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-ai
+  namespace: citizen-portal
+  labels:
+    app: sentinel-ai
+spec:
+  type: ClusterIP
+  selector:
+    app: sentinel-ai
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
