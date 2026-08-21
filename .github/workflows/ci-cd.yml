@@ -188,6 +188,22 @@ jobs:
 
           all_names = defaultdict(dict)
           refs = []
+
+          # Kustomize generators (secretGenerator/configMapGenerator) create
+          # Secrets/ConfigMaps that never appear as a literal kind: Secret /
+          # kind: ConfigMap document anywhere in the tree, so the scan below
+          # would never see them. Register their names up front from every
+          # kustomization.yaml instead of trying to render the generators
+          # themselves (that needs the gitignored secrets/*.env files, which
+          # deliberately do not exist in a fresh checkout).
+          for f in sorted(glob.glob('k8s/**/kustomization.yaml', recursive=True)):
+              kdoc = yaml.safe_load(open(f)) or {}
+              for gen_key, kind in (('secretGenerator', 'Secret'), ('configMapGenerator', 'ConfigMap')):
+                  for gen in kdoc.get(gen_key, []) or []:
+                      name = gen.get('name')
+                      if name:
+                          all_names[kind][name] = f
+
           for f in sorted(glob.glob('k8s/**/*.yaml', recursive=True)):
               for d in yaml.safe_load_all(open(f)):
                   if not d: continue
