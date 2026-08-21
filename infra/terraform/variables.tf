@@ -256,20 +256,24 @@ variable "github_allowed_branches" {
   default     = ["main"]
 }
 
-variable "github_oidc_subject_override" {
+variable "github_oidc_immutable_prefix" {
   description = <<-EOT
-    Escape hatch for GitHub's immutable OIDC subject claim format
-    (repo:owner@OWNER_ID/repo@REPO_ID:environment:NAME instead of
-    repo:owner/repo:environment:NAME), rolled out to repositories created
-    or opted-in after July 15, 2026. If your repository uses that format,
-    get the EXACT current subject by decoding a live token from a
-    workflow run (see docs/aws-deployment.md) rather than guessing the
-    owner/repo numeric IDs, and set that full string here. When set, this
-    REPLACES the branch-ref and environment conditions built from
-    github_repository/github_allowed_branches/github_environment_name
-    entirely, so it must be the single subject value the workflow's OIDC
-    token actually presents. Leave as null for the standard name-based
-    format most repositories still use.
+    Set this if your repository uses GitHub's immutable OIDC subject
+    claim format (rolled out to repos created/opted-in after July 15,
+    2026): "repo:OWNER@OWNER_ID/REPO@REPO_ID" instead of "repo:OWNER/REPO".
+
+    Get the EXACT value by decoding a live OIDC token from a workflow run
+    (see docs/aws-deployment.md) — do not guess the numeric owner/repo
+    IDs. Decode just ONE token (from any job); the owner_id/repo_id
+    portion is identical across every job in the repo, only the suffix
+    after the final colon (:ref:refs/heads/main vs :environment:NAME)
+    differs by trigger type. Once you have the prefix, both the
+    branch-ref and environment trust conditions below are built from it
+    automatically, so every job — push-triggered and
+    environment-gated — is trusted with a single confirmed value.
+
+    Leave as null for the standard mutable name-based format
+    ("repo:OWNER/REPO:...") that most repositories still use.
   EOT
   type        = string
   default     = null

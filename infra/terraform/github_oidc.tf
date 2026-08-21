@@ -73,19 +73,29 @@ data "aws_iam_policy_document" "github_assume_role" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values = var.github_oidc_subject_override != null ? [var.github_oidc_subject_override] : concat(
+      values = concat(
         [
           for branch in var.github_allowed_branches :
-          "repo:${var.github_repository}:ref:refs/heads/${branch}"
+          # When github_oidc_immutable_prefix is set, every subject this
+          # workflow can present — branch-ref AND environment — is built
+          # from that ONE confirmed prefix, so fixing one job's OIDC claim
+          # can never silently break another job that uses a different
+          # suffix. See that variable's description for how to get it.
+          var.github_oidc_immutable_prefix != null
+          ? "${var.github_oidc_immutable_prefix}:ref:refs/heads/${branch}"
+          : "repo:${var.github_repository}:ref:refs/heads/${branch}"
         ],
         # A job bound to a GitHub Environment (e.g. `environment: aws-demo`)
-        # presents repo:<owner>/<repo>:environment:<name> as its subject,
-        # NOT the branch-ref form above — even when triggered from an
-        # allowed branch. deploy-to-k3s and test-aws-connectivity both use
-        # `environment: aws-demo`, so that subject must be trusted
-        # explicitly or every OIDC assume-role call from those jobs fails.
+        # presents repo:<owner>/<repo>:environment:<name> as its subject
+        # (or the immutable-prefix equivalent), NOT the branch-ref form
+        # above — even when triggered from an allowed branch. deploy-to-k3s
+        # and test-aws-connectivity both use `environment: aws-demo`, so
+        # that subject must be trusted explicitly or role assumption from
+        # those jobs fails.
         [
-          "repo:${var.github_repository}:environment:${var.github_environment_name}"
+          var.github_oidc_immutable_prefix != null
+          ? "${var.github_oidc_immutable_prefix}:environment:${var.github_environment_name}"
+          : "repo:${var.github_repository}:environment:${var.github_environment_name}"
         ]
       )
     }
