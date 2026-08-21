@@ -233,8 +233,29 @@ jobs:
           if not ok: sys.exit(1)
           print('All ConfigMap/Secret/PVC/ServiceAccount references resolve')
 
-          services = {n: d['spec'].get('selector', {}) for f in glob.glob('k8s/**/*.yaml', recursive=True) for d in yaml.safe_load_all(open(f)) if d and d.get('kind') == 'Service' for n in [d['metadata']['name']]}
-          pods = {n: d['spec']['template']['metadata']['labels'] for f in glob.glob('k8s/**/*.yaml', recursive=True) for d in yaml.safe_load_all(open(f)) if d and d.get('kind') in ('Deployment', 'DaemonSet') for n in [d['metadata']['name']]}
+          services = {}
+          for f in glob.glob('k8s/**/*.yaml', recursive=True):
+              for d in yaml.safe_load_all(open(f)):
+                  if not d or d.get('kind') != 'Service': continue
+                  name = d.get('metadata', {}).get('name')
+                  # Skip fragments with no name to key on (e.g. Kustomize
+                  # patches that target by label/kind selector rather than
+                  # by metadata.name, and so legitimately omit metadata).
+                  if not name: continue
+                  services[name] = d.get('spec', {}).get('selector', {})
+
+          pods = {}
+          for f in glob.glob('k8s/**/*.yaml', recursive=True):
+              for d in yaml.safe_load_all(open(f)):
+                  if not d or d.get('kind') not in ('Deployment', 'DaemonSet'): continue
+                  name = d.get('metadata', {}).get('name')
+                  if not name: continue
+                  labels = d.get('spec', {}).get('template', {}).get('metadata', {}).get('labels')
+                  # Same reasoning: a patch fragment may only touch
+                  # spec.replicas or similar and never mention pod labels
+                  # at all, which is not itself a mismatch to report.
+                  if labels: pods[name] = labels
+
           for svc, sel in services.items():
               labels = pods.get(svc)
               if labels and not all(labels.get(k) == v for k, v in sel.items()):
