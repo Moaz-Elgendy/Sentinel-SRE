@@ -353,16 +353,21 @@ jobs:
   # it only exists to check AWS wiring, so there is no reason to wait on or
   # be blocked by unrelated test failures. Only ever runs on a manual
   # workflow_dispatch — push/PR events never touch this job.
+  #
+  # Bound to the same aws-demo Environment as deploy-to-k3s, so it picks up
+  # whatever protection rules (required reviewers, etc.) that Environment
+  # has — even though this job is read-only plus one harmless SSM echo.
   # -------------------------------------------------------------------------
   test-aws-connectivity:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    environment: aws-demo
     permissions:
       contents: read
       id-token: write
     steps:
       - name: Assume AWS role via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
@@ -461,7 +466,7 @@ jobs:
       - uses: docker/setup-buildx-action@v4
 
       - name: Assume AWS role via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
@@ -525,7 +530,7 @@ jobs:
       - uses: docker/setup-buildx-action@v4
 
       - name: Assume AWS role via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           # An IAM role ARN is not a credential — it is an identifier, and
           # useless without a valid OIDC token from this specific repository
@@ -600,7 +605,7 @@ jobs:
       id-token: write
     steps:
       - name: Assume AWS role via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
