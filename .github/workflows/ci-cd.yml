@@ -359,32 +359,13 @@ jobs:
   # has — even though this job is read-only plus one harmless SSM echo.
   # -------------------------------------------------------------------------
   test-aws-connectivity:
-    
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: aws-demo
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Check OIDC token claims
-        shell: bash
-        run: |
-            TOKEN=$(curl -sS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
-            | jq -r '.value')
-
-            echo "$TOKEN" | cut -d '.' -f2 | base64 -d 2>/dev/null | jq .
-
-      - name: Debug — decode the actual OIDC claims GitHub is sending
-        run: |
-          TOKEN=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-          echo "$TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq '{sub, aud, repository, ref, environment}'  
-      
       - name: Assume AWS role via OIDC
         uses: aws-actions/configure-aws-credentials@v5
         with:

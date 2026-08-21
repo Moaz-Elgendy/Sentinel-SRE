@@ -73,7 +73,7 @@ data "aws_iam_policy_document" "github_assume_role" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values = concat(
+      values = var.github_oidc_subject_override != null ? [var.github_oidc_subject_override] : concat(
         [
           for branch in var.github_allowed_branches :
           "repo:${var.github_repository}:ref:refs/heads/${branch}"

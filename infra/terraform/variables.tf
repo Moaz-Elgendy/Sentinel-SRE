@@ -256,6 +256,25 @@ variable "github_allowed_branches" {
   default     = ["main"]
 }
 
+variable "github_oidc_subject_override" {
+  description = <<-EOT
+    Escape hatch for GitHub's immutable OIDC subject claim format
+    (repo:owner@OWNER_ID/repo@REPO_ID:environment:NAME instead of
+    repo:owner/repo:environment:NAME), rolled out to repositories created
+    or opted-in after July 15, 2026. If your repository uses that format,
+    get the EXACT current subject by decoding a live token from a
+    workflow run (see docs/aws-deployment.md) rather than guessing the
+    owner/repo numeric IDs, and set that full string here. When set, this
+    REPLACES the branch-ref and environment conditions built from
+    github_repository/github_allowed_branches/github_environment_name
+    entirely, so it must be the single subject value the workflow's OIDC
+    token actually presents. Leave as null for the standard name-based
+    format most repositories still use.
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "github_environment_name" {
   description = <<-EOT
     Name of the GitHub Environment (Settings -> Environments) that gates
