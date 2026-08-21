@@ -12,7 +12,7 @@ variable "aws_region" {
     `apply` fails with an unsupported-instance-type error, that is why.
   EOT
   type        = string
-  default     = "eu-west-1"
+  default     = "eu-central-1"
 }
 
 variable "environment" {
@@ -109,7 +109,7 @@ variable "instance_type" {
     Do not drop below 2 vCPU / 4 GiB — K3s plus this stack will not fit.
   EOT
   type        = string
-  default     = "t3a.large"
+  default     = "m7i-flex.large"
 }
 
 variable "root_volume_size_gb" {
