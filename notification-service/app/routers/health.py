@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, Response, status
+
+from app.chaos.state import controller
 import time
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -20,6 +22,15 @@ def liveness():
 def readiness(response: Response, db: Session = Depends(get_db)):
     """Readiness probe: process AND its dependencies (DB) are ready."""
     uptime_seconds = round(time.time() - START_TIME, 1)
+    if controller.get().db_failure:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {
+            "status": "not_ready",
+            "checks": {"database": "down"},
+            "version": "0.1.0",
+            "uptime_seconds": uptime_seconds,
+        }
+
     try:
         db.execute(text("SELECT 1"))
         return {

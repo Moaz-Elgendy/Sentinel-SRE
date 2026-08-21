@@ -14,6 +14,7 @@ import logging
 import random
 import time
 
+from app.chaos.state import controller
 from app.core.config import settings
 from app.core.metrics import notification_delivery_duration_seconds
 from app.models.notification import NotificationStatus
@@ -28,7 +29,9 @@ def deliver(*, channel: str, recipient: str, message: str) -> tuple[Notification
     """
     start_time = time.time()
     
-    if settings.chaos_mode and random.random() < settings.chaos_failure_rate:
+    failure_rate = controller.get().notification_failure_rate
+    if settings.chaos_mode and random.random() < failure_rate:
+        controller.record("notification_delivery")
         error_detail = f"simulated {channel} provider timeout"
         logger.warning(
             "notification_delivery_failed",

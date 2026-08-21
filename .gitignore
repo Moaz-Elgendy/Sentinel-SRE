@@ -9,3 +9,9 @@ venv/
 node_modules/
 dist/
 build/
+infra/
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl

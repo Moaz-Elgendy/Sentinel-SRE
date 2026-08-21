@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     # Chaos engineering (Phase 10 — disabled by default)
     chaos_mode: bool = False
+    chaos_admin_token: str = ""
 
     # File uploads
     upload_dir: str = "/data/uploads"

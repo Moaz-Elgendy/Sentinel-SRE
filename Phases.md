@@ -20,12 +20,13 @@ everything that was in them is preserved here, in one place, alongside Phases 4 
 - [x] Phase 4 — Dockerize everything
 - [x] Phase 5 — Docker Compose (full stack)
 - [x] Phase 6 — Health checks, metrics, structured logs, request IDs
-- [ ] Phase 7 — Kubernetes manifests
-- [ ] Phase 8 — Deploy to Kubernetes
-- [ ] Phase 9 — Prometheus / Grafana / Loki / Alertmanager
-- [ ] Phase 10 — Chaos / failure injection
-- [ ] Phase 11 — CI/CD
-- [ ] Phase 12 — End-to-end incident simulations
+- [x] Phase 7 — Kubernetes manifests
+- [x] Phase 8 — Deploy to Kubernetes
+- [x] Phase 9 — Prometheus / Grafana / Loki / Alertmanager
+- [x] Phase 10 — Chaos / failure injection
+- [x] Phase 11 — CI/CD
+- [x] Phase 12 — End-to-end incident simulations
+
 
 ## Architecture (current)
 
@@ -555,6 +556,31 @@ digital-citizen-portal/
 ├── .env.example
 ├── README.md
 ├── Phases.md                    # this file
+├── .github/
+│   └── workflows/
+│       └── ci-cd.yml             # Phase 11 — test, lint, validate, build & push to GHCR
+├── k8s/                          # Phase 7 — Kubernetes manifests (see k8s/README.md)
+│   ├── kustomization.yaml
+│   ├── kind-config.yaml
+│   ├── namespace.yaml
+│   ├── postgres/
+│   ├── notification-postgres/
+│   ├── citizen-service/
+│   ├── notification-service/
+│   ├── frontend/
+│   ├── ingress/
+│   └── monitoring/                # Phase 9 — observability stack
+│       ├── prometheus/
+│       ├── alertmanager/
+│       ├── loki/
+│       ├── alloy/
+│       └── grafana/
+├── scripts/                      # Phase 8 — deploy automation (see k8s/README.md)
+│   ├── deploy-docker-desktop.sh
+│   ├── deploy-kind.sh
+│   ├── deploy-minikube.sh
+│   ├── teardown.sh
+│   └── smoke-test.sh
 ├── citizen-service/
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -655,8 +681,615 @@ digital-citizen-portal/
   `notification_dispatch_failed` log lines, and `docker compose ps` to confirm
   `notification-service` itself is healthy.
 
+## Phase 7 — Kubernetes manifests
+
+### What's implemented
+
+Plain Kubernetes YAML (no Helm yet) that mirrors `docker-compose.yml` exactly, in a `k8s/`
+directory at the repo root — see `k8s/README.md` for the full breakdown, build/deploy commands,
+and every design decision explained. Summary:
+
+- **`k8s/namespace.yaml`** — everything lives in the `citizen-portal` namespace.
+- **`k8s/postgres/`** and **`k8s/notification-postgres/`** — Secret, PersistentVolumeClaim,
+  Deployment (`replicas: 1`, `strategy: Recreate` — these are stateful, single-instance
+  databases, not horizontally scaled), Service. One Postgres per microservice, matching the
+  Phase 2/5 database-per-service boundary.
+- **`k8s/citizen-service/`** and **`k8s/notification-service/`** — ConfigMap (non-secret env),
+  Secret (DB credentials, JWT secret), Deployment at `replicas: 2` with an `initContainer` that
+  runs `alembic upgrade head` (and `python -m app.seed` for citizen-service) once per rollout
+  before the app container starts, liveness on `GET /healthz`, readiness on `GET /readyz`
+  (which — per Phase 6 — can report a non-503 "degraded" status without pulling the pod out of
+  rotation). `citizen-service` also gets a PVC for `/data/uploads`.
+- **`k8s/frontend/`** — Deployment at `replicas: 2`, both probes on nginx's `/healthz`.
+- **`k8s/ingress/ingress.yaml`** — one host, `/api` → citizen-service, `/` → frontend.
+  `notification-service` deliberately has **no** Ingress rule — it's server-to-server only.
+- **`k8s/kustomization.yaml`** — `kubectl apply -k k8s/` applies all 21 manifests in one command.
+
+The trickiest real design decision: the frontend bakes `VITE_API_BASE_URL` into its JS bundle at
+Vite *build* time, not at container runtime. For the Ingress's same-origin routing to work, the
+image has to be built with `VITE_API_BASE_URL=""` so the browser calls relative `/api/...` paths
+— this is a different build than the one `docker-compose.yml` uses (which points at
+`http://localhost:8000` directly). Documented in `k8s/README.md` with the exact build command.
+
+### Fixed since first written
+
+Nothing — this is a new phase with no prior version to fix.
+
+### What's missing / deferred on purpose
+
+- **No live cluster validation.** No `kubectl` binary and no cluster were available in the
+  environment these manifests were built in. What *was* verified: all 21 YAML files parse, every
+  `ConfigMap`/`Secret`/`PVC` reference inside a Deployment resolves to a declared object, every
+  `Service` selector matches its Deployment's pod labels, namespaces are consistent, and every
+  path in `kustomization.yaml` exists on disk. A real `kubectl apply --dry-run=server` (or just
+  applying for real) against an actual cluster is the first thing to do in Phase 8 — treat these
+  manifests as reviewed-but-not-yet-cluster-tested.
+- **No actual deployment yet** — no cluster is running, nothing has been applied. That's Phase 8.
+- **Plaintext demo secrets** — the `Secret` manifests use the same placeholder credentials as
+  `.env.example` (`sentinal`), committed as plain YAML. Fine for a local kind/minikube demo,
+  explicitly not fine for anything real — SOPS/External Secrets lands in Phase 11.
+- **No HorizontalPodAutoscaler, no NetworkPolicy, no PodDisruptionBudget** — not needed yet at
+  this stage; worth adding once there's real traffic/failure data to size and scope them against.
+- **No Helm / Kustomize overlays for multiple environments** — intentional, see `k8s/README.md`;
+  one environment (local cluster) exists right now, so overlays would be speculative complexity.
+
+### Possible improvements
+
+- Add a `NetworkPolicy` restricting `notification-service`'s ingress to only
+  `citizen-service`'s pod selector, formalizing in-cluster what's currently just "no Ingress rule
+  points at it."
+- Add a `PodDisruptionBudget` for `citizen-service` and `notification-service` (`minAvailable: 1`)
+  once Phase 8 exercises rolling restarts, so a voluntary disruption (node drain, `kubectl
+  rollout restart`) can't take both replicas down at once.
+- Move `citizen-service`'s uploads off a `ReadWriteOnce` PVC and onto object storage (or a
+  `ReadWriteMany` StorageClass) before this ever runs on a multi-node cluster — see the comment
+  in `k8s/citizen-service/deployment.yaml`.
+
+### Tech stack
+
+Kubernetes YAML manifests (`apps/v1` Deployments, `v1` Services/Secrets/ConfigMaps/PVCs,
+`networking.k8s.io/v1` Ingress), Kustomize (bases only, no overlays) for the apply-everything
+entrypoint. No new application dependencies — this phase is pure infrastructure-as-code sitting
+on top of the images Phase 4 already builds.
+
+---
+
+## Phase 8 — Deploy to Kubernetes
+
+### What's implemented
+
+Deployment automation, built on top of Phase 7's manifests, plus a real deployment confirmed
+working on Docker Desktop's built-in Kubernetes:
+
+- **`scripts/deploy-docker-desktop.sh`** — targets Docker Desktop's Kubernetes specifically,
+  which turned out to be the simplest path for this project: the cluster is already running, and
+  it shares Docker Desktop's own image store directly, so `docker build` output is immediately
+  visible to the cluster with no `kind load` / `minikube image load` equivalent needed at all. It
+  also natively supports `LoadBalancer` Services bound to `localhost`, so ingress-nginx needs no
+  NodePort/extraPortMappings workaround. Refuses to run unless `kubectl`'s current context is
+  literally `docker-desktop`, so it can never accidentally apply to the wrong cluster.
+- **`k8s/kind-config.yaml`** + **`scripts/deploy-kind.sh`** — the kind-specific path (a
+  cluster-in-a-container, useful if you don't use Docker Desktop's own Kubernetes or want
+  something fully disposable): create cluster, install ingress-nginx (kind-specific manifest),
+  build images, load them into kind's image store, apply, wait for rollout.
+- **`scripts/deploy-minikube.sh`** — the equivalent for minikube.
+- **`scripts/teardown.sh`** and **`scripts/smoke-test.sh`** (registers a real citizen, logs in,
+  browses seeded services, submits a request, confirms it shows up — a real end-to-end check
+  against a live deployment, not just "pods are Running").
+
+### Confirmed working on a real cluster
+
+Unlike Phase 7, this phase has now actually been run: all 8 pods (`citizen-postgres`,
+`citizen-service` ×2, `frontend` ×2, `notification-postgres`, `notification-service` ×2) reached
+`Running` on Docker Desktop's Kubernetes, using plain `docker build -t <name>:latest .` images
+(no registry namespace) built directly from this repo's Dockerfiles. Two real things came out of
+that first run, both now fixed:
+
+1. **Image naming.** The manifests originally referenced `citizen-portal/citizen-service:latest`
+   etc. (a namespaced tag, from Phase 7's original — untested — assumptions). A straightforward
+   local `docker build -t citizen-service:latest ./citizen-service` doesn't produce that
+   namespace. Fixed by dropping the `citizen-portal/` prefix from every `image:` field across all
+   three Deployments (and updating every doc that referenced the old names) — the manifests now
+   match a plain local build exactly, which is what most people will actually run.
+2. **No Ingress applied yet in that first pass** — `frontend` was reached via
+   `kubectl port-forward svc/frontend 3000:3000`, which loads the page but breaks all API calls:
+   the frontend's JS bundle calls relative `/api/...` paths (built with `VITE_API_BASE_URL=""`,
+   see Phase 7's design decisions), expecting an Ingress in front of it to route those calls to
+   `citizen-service`. Port-forwarding the frontend alone has nothing to route `/api/...` to. This
+   is now the first item in `k8s/README.md`'s new **Troubleshooting** section, along with the
+   related (and also real) question of why pods don't show up in Docker Desktop's container GUI
+   (expected — Docker Desktop's Kubernetes runs pods via `containerd`/`kubelet`, a separate
+   runtime path from the one the GUI's Containers tab reads). The actual fix: apply
+   `k8s/ingress/ingress.yaml` (or just run `deploy-docker-desktop.sh`, which does it
+   automatically) and hit `http://citizen-portal.local` — no port-forwarding needed at all.
+
+### An important, uncomfortable finding
+
+Researching which ingress-nginx version to pin turned up something that changes this phase's
+risk profile: **the `kubernetes/ingress-nginx` project was retired by the Kubernetes Steering and
+Security Response Committees in March 2026** — announced November 2025, confirmed at retirement.
+No further releases, bugfixes, or security patches will ever be published for it again. It still
+installs and works correctly for local development, which is all this phase needs, and every
+deploy script pins the last maintained release (`v1.15.1`) rather than something already stale.
+But this is documented in `k8s/README.md`'s "Ingress controller note" as **not safe to carry past
+a local demo cluster** — before this project's Ingress layer ever faces real traffic, it needs to
+move to an actively maintained alternative (Traefik, the F5 NGINX Ingress Controller, or a
+Gateway API implementation). Flagging this now, while it's cheap to fix, rather than letting it
+become a silent landmine for a later phase.
+
+### What's missing / deferred on purpose
+
+- **Not yet re-verified with the Ingress actually in place end to end.** The pod-level deployment
+  and the image-naming fix are confirmed; a full `smoke-test.sh` run against
+  `http://citizen-portal.local` (post-Ingress-fix) hasn't been reported back yet. Worth doing as
+  the very next step before treating Phase 8 as fully closed.
+- **kind and minikube paths are still unverified against a real cluster** — only the Docker
+  Desktop path has been run for real so far. They're written the same way and reviewed the same
+  way `deploy-docker-desktop.sh` was before its first run, so the same "expect first-run friction"
+  caveat applies if/when someone runs them.
+- **No CI validation of the manifests** — that's Phase 11's job, once there's a pipeline to run
+  `kubectl apply --dry-run=server` or a tool like `kubeconform` against every PR.
+
+### Possible improvements
+
+- Add a `kubeconform` (or similar schema validator) step to the deploy scripts before the
+  `kubectl apply -k` step, so a manifest typo fails fast with a clear message instead of a
+  confusing mid-rollout error.
+- Extend `scripts/smoke-test.sh` to also verify the notification actually landed in
+  `notification-service` (currently it prints manual `kubectl port-forward` instructions instead,
+  since `notification-service` has no Ingress rule by design — see Phase 7).
+- Capture actual wall-clock timings for each step (now that real runs exist) and add progress
+  expectations to `k8s/README.md` ("ingress-nginx usually takes ~60-90s to become ready" etc.) so
+  a first-time user knows what's normal versus stuck.
+
+### Tech stack
+
+Docker Desktop's built-in Kubernetes (primary, confirmed working), kind and minikube (alternative
+paths, scripts written but not yet run for real), ingress-nginx `v1.15.1` (last maintained
+release — see the note above), bash for all automation scripts. No new application dependencies.
+
+---
+
+## Phase 9 — Prometheus / Grafana / Loki / Alertmanager
+
+### What's implemented
+
+The full observability stack, in `k8s/monitoring/`, following the same plain-YAML-per-component
+pattern Phase 7 established (no Helm, no Prometheus Operator CRDs):
+
+- **Prometheus** (`monitoring/prometheus/`) — scrapes `citizen-service` and
+  `notification-service` via annotation-based discovery: both Deployments' pod templates now
+  carry `prometheus.io/scrape`, `prometheus.io/port`, `prometheus.io/path` annotations, and
+  Prometheus's `kubernetes_sd_configs` (role: `pod`) matches on exactly those. A scoped `Role`
+  (not a cluster-wide `ClusterRole`) grants just enough RBAC for pod discovery within
+  `citizen-portal`. A first, deliberately small alerting rule set — `ServiceDown` (via the
+  synthetic `up` metric, no application code needed), `HighHTTPErrorRate`, and
+  `HighRequestLatency` (both built on `http_requests_total` / `http_request_duration_seconds`,
+  already emitted since Phase 1/6's `prometheus-fastapi-instrumentator` setup).
+- **Grafana** (`monitoring/grafana/`) — Prometheus and Loki datasources provisioned via
+  ConfigMap (no manual "Add data source" click-through), plus one starter dashboard
+  ("Citizen Portal Overview") showing pods-up, request rate, 5xx error rate, p95 latency, and a
+  live log panel — deliberately the same signals the alerting rules watch, so what you see on
+  the dashboard is what pages you.
+- **Loki** (`monitoring/loki/`) — single-binary mode, filesystem storage on an `emptyDir` (same
+  ephemeral-storage trade-off Prometheus makes — fine for a local demo, add a PVC before relying
+  on real retention).
+- **Alertmanager** (`monitoring/alertmanager/`) — wired to receive alerts from Prometheus. The
+  routing tree's default receiver has no integrations configured yet (see "What's missing"
+  below) — alerts are visible in Alertmanager's UI/API but nothing pages out yet.
+- Log shipping via **Grafana Alloy**, not Promtail (see the finding below) —
+  `monitoring/alloy/` is a DaemonSet using `loki.source.kubernetes` (Kubernetes API-based
+  tailing) to ship every `citizen-portal` pod's logs to Loki, parsing the structured JSON logs
+  Phase 6 already emits (`level`, `request_id`, `service`) into queryable Loki labels.
+- `k8s/README.md` gained an "Accessing the observability stack" section (everything here is
+  `kubectl port-forward`-only, deliberately not Ingress-exposed — these are internal tools, not
+  citizen-facing) and a "How scraping works" explainer.
+- All three deploy scripts (`deploy-docker-desktop.sh`, `deploy-kind.sh`, `deploy-minikube.sh`)
+  now wait on the new Deployments and the Alloy DaemonSet's rollout, and print a pointer to the
+  port-forward instructions once everything's up.
+
+### An important finding, same shape as Phase 8's
+
+While deciding how to ship logs to Loki, the obvious default — Promtail — turned out to already
+be **deprecated**: its functionality has been merged into Grafana Alloy. Building this phase on
+Promtail would have meant starting on a tool already headed for removal. `monitoring/alloy/`
+uses Alloy's River-syntax config from the start instead. As a side benefit (not the reason for
+the choice, but a nice one), Alloy's `loki.source.kubernetes` tails via the Kubernetes API rather
+than reading host log files, so this DaemonSet needs no `hostPath` mounts or elevated privileges
+the way a classic Promtail setup would.
+
+### What's missing / deferred on purpose
+
+- **No real Alertmanager receiver wired up.** The default receiver has zero integrations — no
+  Slack webhook, no PagerDuty, no email. This is deliberate: faking a receiver with a placeholder
+  webhook URL would just silently fail on every alert, which is worse than being honest that this
+  decision (which channel? whose on-call?) hasn't been made yet. Alerts are inspectable via
+  Alertmanager's UI/API in the meantime.
+- **Not yet run against a real cluster.** Like Phase 7's original manifests, everything in
+  `k8s/monitoring/` was built and internally validated (all YAML parses, every
+  ConfigMap/Secret/PVC/ServiceAccount reference resolves, every Service selector matches its
+  Deployment/DaemonSet's pod labels, the dashboard JSON is valid, all scripts pass `bash -n`) but
+  has not yet been applied to a live cluster. Unlike Phase 8's first pass, there's no confirmed
+  real-cluster run to report on yet for this phase specifically — that's the next step.
+- **No readiness-degraded-vs-down alert.** Phase 6 built `/readyz` to distinguish "down" from
+  "degraded" (e.g., notification-service unreachable but citizen-service still functional) in the
+  JSON response body — but that distinction isn't yet exposed as a Prometheus metric, so
+  Alertmanager can't currently alert on "degraded" specifically, only on a scrape actually
+  failing. Needs a new gauge metric in Phase 6's health router before this is alertable.
+- **No Postgres-specific alerting.** Alerting on a Postgres pod going down currently relies on
+  Kubernetes' own pod-readiness safety net, not a Prometheus rule — `postgres_exporter` isn't
+  deployed, so there's no Postgres-level metric to write a rule against yet.
+- **No CI validation of the manifests** — still Phase 11's job, same as noted in Phase 8.
+
+### Possible improvements
+
+- Deploy `postgres_exporter` alongside both Postgres instances and add a `PostgresDown` /
+  `PostgresReplicationLag`-style rule once there's a real metric to alert on.
+- Expose the readiness-degraded state as a Prometheus gauge (e.g.
+  `citizen_service_readiness_status{status="degraded"}`) so Alertmanager can distinguish
+  "notification-service is unreachable but citizen-service still works" from a full outage,
+  instead of only seeing the binary `up`/`down` signal.
+- Wire a real Alertmanager receiver once there's an actual channel to send to.
+- Move to the Prometheus Operator's `ServiceMonitor`/`PodMonitor` CRDs once there's a reason to
+  manage more than two scrape targets — annotation-based discovery is the right amount of
+  complexity for two services, not necessarily for more.
+- Add a PVC for Prometheus's and Loki's storage (matching the pattern already used for both
+  Postgres instances) before treating either's data as anything but disposable.
+
+### Tech stack
+
+Prometheus `v3.13.2`, Grafana `13.1.3`, Loki `3.7.5`, Grafana Alloy `v1.16.3` (not Promtail — see
+the finding above), Alertmanager `v0.33.1`. All versions confirmed current via search rather than
+assumed from training data, consistent with how ingress-nginx's version was handled in Phase 8.
+
+---
+
+## Phase 10 — Chaos engineering / failure injection
+
+### What's implemented
+
+Chaos is deliberately **off by default** and is controlled at runtime only when
+`CHAOS_MODE=true` and a separate `CHAOS_ADMIN_TOKEN` is configured. The control surface is
+intentionally kept out of the frontend; Sentinel or an operator can drive it through the backend
+API.
+
+**Citizen Service** exposes:
+
+- `GET /api/chaos/status` — inspect the current fault state
+- `POST /api/chaos/fault` — configure artificial latency, forced HTTP 5xx probability, and
+  simulated database failure
+- `POST /api/chaos/reset` — clear all active faults
+
+**Notification Service** exposes the same endpoints and additionally controls
+`notification_failure_rate`, which drives the existing simulated email/SMS provider failure
+path. The older `CHAOS_FAILURE_RATE` environment variable remains supported as the initial
+provider-failure rate for backwards-compatible Docker/Kubernetes startup configuration.
+
+All chaos control requests require the `X-Chaos-Token` header. Missing/incorrect tokens return
+404, so the existence of the control surface is not advertised to unauthenticated callers. The
+control endpoints, health probes, OpenAPI endpoints, and Prometheus `/metrics` are excluded from
+fault injection. Artificial latency is therefore observable without making Kubernetes believe the
+pod is unhealthy, while database failure deliberately makes `/readyz` return HTTP 503 and normal
+application requests return HTTP 503.
+
+The services export Prometheus telemetry for the active fault configuration and every injected
+fault: `chaos_latency_ms`, `chaos_error_rate`, `chaos_db_failure`,
+`chaos_notification_failure_rate` (notification service), and
+`chaos_injections_total{fault_type=...}`. Phase 9's Prometheus rules now include explicit
+chaos-observation alerts plus a notification-delivery failure-rate alert, and the Grafana
+overview has panels for active chaos configuration, injection events, and notification failures.
+
+### Test scenarios
+
+The test suites now cover authentication of the chaos control API, fault configuration/reset,
+forced 5xx responses, latency injection, simulated DB failure/readiness degradation, and
+notification delivery failure injection (29 tests in citizen-service, 16 in notification-service
+— both suites confirmed passing). The normal notification chaos test was updated to drive the
+new runtime controller while retaining the existing failure-rate behavior.
+
+Example local control flow when running Docker Compose:
+
+```bash
+# Enable the control plane in .env first:
+CHAOS_MODE=true
+CHAOS_ADMIN_TOKEN=use-a-strong-random-token
+
+# Then configure a 100% HTTP failure rate:
+curl -H "X-Chaos-Token: use-a-strong-random-token" \
+  -H "Content-Type: application/json" \
+  -d '{"error_rate":1.0}' \
+  http://localhost:8000/api/chaos/fault
+
+# Reset afterward:
+curl -X POST \
+  -H "X-Chaos-Token: use-a-strong-random-token" \
+  http://localhost:8000/api/chaos/reset
+```
+
+For Kubernetes, replace the demo `CHAOS_ADMIN_TOKEN` value in both service Secrets before
+enabling `CHAOS_MODE`. Because each deployment has two replicas and chaos state is intentionally
+in-memory, setting a fault through one pod affects that pod only. This is useful for
+demonstrating partial failures; target a specific pod with `kubectl port-forward` when you need
+deterministic single-pod experiments.
+
+### What's missing / deferred on purpose
+
+- **Phase 9's observability stack, applied against this Phase 10 code, hasn't been confirmed on
+  a real cluster yet** — see the Phase 9 section's own "not yet run against a real cluster" note;
+  that first real run (deploy, trigger `ServiceDown`, watch it appear in Alertmanager) still
+  applies, now with chaos fault injection as an even better way to trigger it deliberately rather
+  than by scaling a Deployment to 0.
+- No chaos scenario library yet (a documented set of "here's what a database outage looks like on
+  the dashboard" walkthroughs) — that's really Phase 12's job, once there's a reason to script a
+  full incident narrative rather than a single curl command.
+
+### Tech stack
+
+No new dependencies — chaos state lives in-memory in each service's existing FastAPI process,
+using the same Prometheus client library and structured logging already in place since Phase 6.
+
+---
+
+## Phase 11 — CI/CD
+
+### What's implemented
+
+A single GitHub Actions workflow, `.github/workflows/ci-cd.yml`, with five jobs:
+
+- **`test-citizen-service`** / **`test-notification-service`** — the same pytest suites run
+  locally throughout this project (29 and 16 tests respectively), against the same in-memory
+  SQLite setup `tests/conftest.py` already uses — no live Postgres needed in CI either.
+- **`lint-and-build-frontend`** — `npm run lint` (oxlint) and `npm run build`, with
+  `VITE_API_BASE_URL=""` — matching the k8s-targeted build, not docker-compose's.
+- **`validate-k8s-manifests`** — everything the manual Python validation script did in Phases 7–9
+  (YAML parses, every `ConfigMap`/`Secret`/`PVC`/`ServiceAccount` reference resolves, every
+  `Service` selector matches its `Deployment`/`DaemonSet`'s pod labels), **plus** something none
+  of those phases could actually do: a real `kubeconform` schema check of `kubectl kustomize
+  k8s/`'s rendered output against the genuine Kubernetes API schemas. Every previous phase's
+  manifest "validation" was structural-consistency-only, because the sandbox those phases were
+  built in had no cluster, no `kubectl`, and no internet access to fetch schemas with. GitHub's
+  runners have both — this is the first time these manifests get checked against what Kubernetes
+  itself would actually accept.
+- **`build-and-push-images`** — only on a push to `main`, only after all four jobs above pass:
+  builds and pushes `citizen-service`, `notification-service`, and `frontend` to GHCR
+  (`ghcr.io/<owner>/citizen-portal-<service>`), tagged with both `latest` and the commit SHA.
+  Uses `GITHUB_TOKEN` (no external registry credentials or cloud secrets to configure).
+
+### An important finding, third in this series
+
+Researching which image-scanning Action to wire in surfaced something serious enough to change
+the plan: **`aquasecurity/trivy-action` — the default choice for this — was compromised twice in
+2026.** A full repository takeover in late February, and, separately, a credential-stealing
+supply-chain attack in March that affected *every* published tag from `0.0.1` through `0.34.2`,
+exfiltrating CI secrets (which, in this pipeline, would include the `GITHUB_TOKEN` used to push
+to GHCR) to an attacker-controlled domain. Clean tags exist post-incident, but wiring a
+secret-bearing CI job to a third-party Action with that specific history, on the strength of "the
+new tags are probably fine now," isn't a call worth making silently. Image vulnerability scanning
+was left out of this phase entirely rather than added on that basis — see "What's missing" below
+for what to evaluate before adding it back. This is the third time in three phases that version
+research has surfaced something that changed the plan (ingress-nginx's retirement in Phase 8,
+Promtail's deprecation in Phase 9) — worth noting as a pattern: verifying current tooling status
+before adopting it has caught something real every single time it's been done in this project.
+
+### What's missing / deferred on purpose
+
+- **No automated deployment.** This pipeline builds, tests, validates, and publishes versioned
+  images — it does not deploy them anywhere. There is no standing cloud cluster for this project
+  to deploy to; every deployment so far has been a deliberate local step
+  (`scripts/deploy-docker-desktop.sh` / `deploy-kind.sh` / `deploy-minikube.sh`), and that
+  remains true after this phase. If a real hosting target gets chosen later, this workflow is the
+  natural place to add a `deploy` job — until then, treating "push a versioned image to GHCR" as
+  the actual CD deliverable is honest about what this project currently has to deploy *to*.
+- **No image vulnerability scanning** — see the finding above. Before adding it back: prefer
+  pinning any scanning Action by commit SHA rather than a tag (tags can be force-moved after
+  compromise the way trivy-action's were), and evaluate current alternatives (Docker Scout,
+  Anchore Grype, or GitHub's own Dependabot/code-scanning) rather than defaulting back to the
+  same tool without re-checking its status at that time.
+- **No real secret management.** The k8s `Secret` manifests still hold the same demo-only
+  placeholder values used since Phase 7/8 (`sentinal`, `replace_me`) — this pipeline doesn't
+  touch them, and neither SOPS nor External Secrets got wired in. This depends on a decision this
+  project hasn't made yet: what actually holds the real secrets in a non-local deployment. Worth
+  revisiting once that's decided, not before.
+- **ingress-nginx migration still not done.** Flagged as deferred-to-Phase-11 back in Phase 8's
+  writeup; it didn't happen here either. The reasoning holds either way: it's still fine for
+  local kind/minikube/Docker Desktop use, and still not something to carry into a real
+  deployment target without addressing first. Pushed forward again rather than done reflexively
+  just because a phase number said to.
+- **No branch protection / required-checks configuration documented.** The workflow runs on every
+  push and PR to `main`, but nothing in this repo enforces that these checks must pass before a
+  PR merges — that's a GitHub repository setting, not something a workflow file can configure on
+  its own, and hasn't been set.
+
+### Possible improvements
+
+- Add a `deploy` job once a real target exists, gated on `build-and-push-images` succeeding and
+  probably on a manual approval step (GitHub Environments support this natively) rather than
+  auto-deploying every merge to `main`.
+- Add Dependabot (or Renovate) configuration to keep the pinned versions in this workflow, the
+  Dockerfiles, and `k8s/monitoring/`'s images from silently drifting stale the way ingress-nginx
+  and Promtail did — this project has now hit that exact problem twice.
+- Revisit image scanning with a tool whose supply-chain trust has actually been checked at
+  decision time, not carried over from this write-up.
+- Multi-arch image builds (`linux/amd64,linux/arm64`) via `docker/setup-qemu-action` if this ever
+  needs to run on Apple Silicon or ARM-based cloud instances — not needed for local
+  kind/minikube/Docker Desktop use today.
+
+### Tech stack
+
+GitHub Actions, GHCR (GitHub Container Registry), `kubeconform` for real Kubernetes schema
+validation. No new application dependencies. Action versions used —
+`actions/checkout@v7`, `actions/setup-python@v7`, `actions/setup-node@v6`,
+`docker/setup-buildx-action@v4`, `docker/login-action@v4`, `docker/build-push-action@v7` — were
+all confirmed current via search rather than assumed, consistent with how every version decision
+has been handled since Phase 8's ingress-nginx finding.
+
+---
+
+## Phase 12 — End-to-end incident simulations
+
+### What's implemented
+
+`scripts/incident-scenarios.sh` — the closing piece that ties every previous phase together. It
+drives five named, repeatable incidents through Phase 10's chaos control API (plus one that
+doesn't need it) and confirms Phase 9's stack actually catches each one for real: the right
+Prometheus alert reaches `firing` within its `for:` window, and — best-effort, since
+Alertmanager polls on its own interval — that it also reached Alertmanager.
+
+| Scenario | Trigger | Alert(s) confirmed | `for:` |
+|---|---|---|---|
+| `db-outage` | `POST /api/chaos/fault {"db_failure": true}` | `ChaosDatabaseFailure` | 30s |
+| `http-errors` | `{"error_rate": 1.0}` | `ChaosForcedHTTPFailures` → `HighHTTPErrorRate` | 30s → 5m |
+| `latency` | `{"latency_ms": 1500}` + generated traffic | `ChaosLatencyInjection` → `HighRequestLatency` | 30s → 5m |
+| `notification-degradation` | notification-service `{"notification_failure_rate": 1.0}` + generated traffic | `NotificationDeliveryFailureRateHigh` | 5m |
+| `full-outage` | `kubectl scale citizen-service --replicas=0` | `ServiceDown` | 2m |
+
+Each scenario:
+
+- **Pins the target Deployment to 1 replica first.** Chaos state is per-pod and in-memory
+  (Phase 10's own design), so a fault set through one pod's port-forward would otherwise only
+  affect whichever pod happened to receive that request — not a reliable thing to assert on with
+  two replicas. The script scales back to the original replica count afterward, even on failure
+  (`trap cleanup EXIT`).
+- **Generates real traffic where the alert needs it.** `HighRequestLatency` and
+  `NotificationDeliveryFailureRateHigh` are built on histograms/counters that only have data if
+  requests actually happen — injecting the fault alone produces zero observations, not a
+  passing or failing alert, just silence. The script reuses the same
+  register → login → browse → submit flow `scripts/smoke-test.sh` already established, looped for
+  the scenario's duration.
+- **Always resets the fault it injected** (`POST /api/chaos/reset`), whether the scenario passed,
+  failed, or the script was interrupted.
+
+Run one scenario or all of them:
+
+```bash
+export CHAOS_ADMIN_TOKEN=<the same token set in both services' Secrets>
+./scripts/incident-scenarios.sh db-outage
+./scripts/incident-scenarios.sh all
+```
+
+### What's missing / deferred on purpose
+
+- **Not yet run against a real cluster.** Same honest caveat as Phases 7–9 carried before their
+  first real runs: this script has been validated the way everything else here has been before a
+  live cluster existed to test it against — `bash -n` passes, every chaos-API field name was
+  cross-checked directly against `citizen-service/app/routers/chaos.py` and
+  `notification-service/app/routers/chaos.py`, every alert name and `for:` duration was
+  cross-checked directly against `k8s/monitoring/prometheus/rules-configmap.yaml` rather than
+  assumed. It has not yet actually been executed end-to-end on a live deployment. That first real
+  run — deploy, run `./scripts/incident-scenarios.sh all`, watch every alert actually fire — is
+  the natural next step, the same way it was flagged (and later closed) for Phase 8's manifests.
+- **No Grafana-side verification.** The script confirms alerts fire via the Prometheus/
+  Alertmanager APIs directly; it doesn't screenshot or programmatically assert on the Grafana
+  dashboard panels reacting the same way. Worth doing manually once the stack is running for
+  real — watching the "Citizen Portal Overview" dashboard's error-rate and latency panels move
+  in response to each scenario is a big part of the point of Phase 9 existing at all.
+- **No Postgres-outage scenario.** `ChaosDatabaseFailure` simulates the *application* believing
+  its DB is down (Phase 10's `db_failure` flag short-circuits the app layer); it doesn't actually
+  take Postgres itself down. A real Postgres-pod-killed scenario needs `postgres_exporter` and a
+  Postgres-specific alert first — both flagged as missing back in Phase 9.
+- **Single-cluster, single-namespace only.** No cross-region or multi-cluster failure scenario —
+  out of scope for what this project's current infrastructure could even simulate.
+
+### Possible improvements
+
+- Add the Postgres-outage scenario once `postgres_exporter` + a `PostgresDown` rule exist (Phase 9's own "possible improvements").
+- Feed this script's pass/fail output into the CI/CD workflow (Phase 11) as a scheduled job
+  against a long-lived staging cluster, if one ever exists — turning it from a manual
+  verification tool into a continuously-running synthetic-incident suite.
+- This is exactly the script Sentinel's own test harness should be able to run against
+  itself: trigger a scenario, then check whether Sentinel detected, diagnosed, and reported it
+  correctly — see the Sentinel integration doc below for how that loop is meant to work once
+  Sentinel has something real to watch.
+
+### Tech stack
+
+No new dependencies — bash, `kubectl`, `curl`, and the Prometheus/Alertmanager HTTP APIs already
+running since Phase 9.
+
+---
+
 ## What's next
 
+**All 12 phases are implemented.** Two loose ends flagged along the way are still open and worth
+closing before treating any of this as "done-done": Phase 9's observability stack and this
+Phase 12 script have both been validated internally but never run against a real cluster; Phase
+11's CI/CD workflow has never actually run on GitHub. Pushing this repo and watching all of it run
+for real — the workflow, then a live deployment, then `./scripts/incident-scenarios.sh all`
+against it — is the natural next step before trusting any of these write-ups as more than
+"should work."
+
+Beyond the 12-phase local/Kubernetes build plan, two further design docs cover taking this to AWS
+and connecting it to Sentinel AI, the platform this project exists to be a realistic workload for:
+
+### Phase 10 — Chaos engineering / failure injection
+
+Phase 10 is now implemented in both backend services. Chaos is deliberately **off by default** and
+is controlled at runtime only when `CHAOS_MODE=true` and a separate `CHAOS_ADMIN_TOKEN` is configured.
+The control surface is intentionally kept out of the frontend; Sentinel or an operator can drive it
+through the backend API.
+
+**Citizen Service** exposes:
+
+- `GET /api/chaos/status` — inspect the current fault state
+- `POST /api/chaos/fault` — configure artificial latency, forced HTTP 5xx probability, and simulated
+  database failure
+- `POST /api/chaos/reset` — clear all active faults
+
+**Notification Service** exposes the same endpoints and additionally controls
+`notification_failure_rate`, which drives the existing simulated email/SMS provider failure path.
+The older `CHAOS_FAILURE_RATE` environment variable remains supported as the initial provider-failure
+rate for backwards-compatible Docker/Kubernetes startup configuration.
+
+All chaos control requests require the `X-Chaos-Token` header. Missing/incorrect tokens return 404,
+so the existence of the control surface is not advertised to unauthenticated callers. The control
+endpoints, health probes, OpenAPI endpoints, and Prometheus `/metrics` are excluded from fault
+injection. Artificial latency is therefore observable without making Kubernetes believe the pod is
+unhealthy, while database failure deliberately makes `/readyz` return HTTP 503 and normal application
+requests return HTTP 503.
+
+The services export Prometheus telemetry for the active fault configuration and every injected fault:
+`chaos_latency_ms`, `chaos_error_rate`, `chaos_db_failure`, `chaos_notification_failure_rate` (notification
+service), and `chaos_injections_total{fault_type=...}`. Phase 9's Prometheus rules now include explicit
+chaos-observation alerts plus a notification-delivery failure-rate alert, and the Grafana overview has
+panels for active chaos configuration, injection events, and notification failures.
+
+### Phase 10 test scenarios
+
+The test suites now cover authentication of the chaos control API, fault configuration/reset, forced
+5xx responses, latency injection, simulated DB failure/readiness degradation, and notification delivery
+failure injection. The normal notification chaos test was updated to drive the new runtime controller
+while retaining the existing failure-rate behavior.
+
+Example local control flow when running Docker Compose:
+
+```bash
+# Enable the control plane in .env first:
+CHAOS_MODE=true
+CHAOS_ADMIN_TOKEN=use-a-strong-random-token
+
+# Then configure a 100% HTTP failure rate:
+curl -H "X-Chaos-Token: use-a-strong-random-token" \
+  -H "Content-Type: application/json" \
+  -d '{"error_rate":1.0}' \
+  http://localhost:8000/api/chaos/fault
+
+# Reset afterward:
+curl -X POST \
+  -H "X-Chaos-Token: use-a-strong-random-token" \
+  http://localhost:8000/api/chaos/reset
+```
+
+For Kubernetes, replace the demo `CHAOS_ADMIN_TOKEN` value in both service Secrets before enabling
+`CHAOS_MODE`. Because each deployment has two replicas and chaos state is intentionally in-memory,
+setting a fault through one pod affects that pod only. This is useful for demonstrating partial
+failures; target a specific pod with `kubectl port-forward` when you need deterministic single-pod
+experiments.
+
+
+Phases 11 and 12 remain: a CI/CD pipeline (also where the ingress-nginx retirement finding from
+Phase 8 should get resolved), and finally end-to-end incident simulations for Sentinel to detect
+and respond to, using the exact observability stack this phase just built.
+=======
 **Phase 6 is done.** Both services are now fully observable: every request carries a traceable
 ID, every log line is structured JSON tagged with `service` and `request_id`, business-meaningful
 metrics are being recorded, and the health probes surface degraded-vs-down distinctions that
