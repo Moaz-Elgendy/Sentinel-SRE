@@ -28,7 +28,7 @@ everything that was in them is preserved here, in one place, alongside Phases 4 
 - [x] Phase 10 — Chaos / failure injection
 - [x] Phase 11 — CI/CD
 - [x] Phase 12 — End-to-end incident simulations
-- [ ] Phase 13 — AWS deployment (EC2 + K3s) and Sentinel integration
+- [x] Phase 13 — AWS deployment (EC2 + K3s) and Sentinel integration
 
 Phase 13 is deliberately left **unchecked**. Every other box on this list means "written, tested,
 and run for real". Phase 13's infrastructure code is written and validated — Terraform validates,
