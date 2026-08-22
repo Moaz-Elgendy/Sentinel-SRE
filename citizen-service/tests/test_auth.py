@@ -9,6 +9,7 @@ def test_register_creates_citizen(client):
             "password": "SuperSecret123",
         },
     )
+    
     assert resp.status_code == 201
     body = resp.json()
     assert body["email"] == "omar@example.com"

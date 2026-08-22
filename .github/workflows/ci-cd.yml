@@ -18,6 +18,8 @@
 #     `latest` and the commit SHA
 #   - Deploys to the K3s cluster on EC2
 #
+# What this does on a manual run (workflow_dispatch) — see "Phase 14" below.
+#
 # ---------------------------------------------------------------------------
 # Phase 13 — what changed and why
 # ---------------------------------------------------------------------------
@@ -56,6 +58,27 @@
 # project exists to demonstrate — Sentinel is supposed to detect and roll it
 # back autonomously. Blocking CI until the rollout succeeds would mask
 # exactly the failure mode under test.
+#
+# ---------------------------------------------------------------------------
+# Phase 14 — manual smoke test (workflow_dispatch)
+# ---------------------------------------------------------------------------
+# Added a way to verify the OIDC role, ECR access, and the SSM path to the
+# node all still work, WITHOUT pushing to main and WITHOUT touching the
+# cluster or the real deploy tags. Trigger from the Actions tab.
+#
+# test_mode = connectivity-only (default): assumes the role, reads ECR,
+#   sends one harmless echo command to the node over SSM. No image is built,
+#   nothing is deployed. This is the one to run when you just want to know
+#   "is the pipeline's AWS wiring still good."
+#
+# test_mode = full-dry-run: also builds and pushes all four images, but
+#   tagged :manual-test-<run_id> — never :latest, never :<sha> — so it can
+#   never be picked up by a real deploy and never collides with a tag
+#   Sentinel might need to correlate or roll back to. Still does not deploy.
+#
+# This job is intentionally isolated from build-and-push-images and
+# deploy-to-k3s: it does not share their tags, does not run on push/PR, and
+# cannot trigger either of them. A manual run can never cause a real deploy.
 name: CI/CD
 
 on:
@@ -63,6 +86,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "connectivity-only = verify OIDC/ECR/SSM only. full-dry-run = also build+push images tagged manual-test-<run_id> (still no deploy)."
+        type: choice
+        options:
+          - connectivity-only
+          - full-dry-run
+        default: connectivity-only
 
 env:
   # Non-secret. The account id is not sensitive, but it is also not needed
@@ -173,7 +205,7 @@ jobs:
           print(f'{len(files)} k8s YAML files parse OK')
 
           k = yaml.safe_load(open('k8s/kustomization.yaml'))
-          missing = [r for r in k['resources'] if not os.path.isfile(f'k8s/{r}')]
+          missing = [r for r in k['resources'] if not os.path.exists(f'k8s/{r}')]
           if missing:
               print('MISSING kustomization resources:', missing)
               sys.exit(1)
@@ -188,6 +220,22 @@ jobs:
 
           all_names = defaultdict(dict)
           refs = []
+
+          # Kustomize generators (secretGenerator/configMapGenerator) create
+          # Secrets/ConfigMaps that never appear as a literal kind: Secret /
+          # kind: ConfigMap document anywhere in the tree, so the scan below
+          # would never see them. Register their names up front from every
+          # kustomization.yaml instead of trying to render the generators
+          # themselves (that needs the gitignored secrets/*.env files, which
+          # deliberately do not exist in a fresh checkout).
+          for f in sorted(glob.glob('k8s/**/kustomization.yaml', recursive=True)):
+              kdoc = yaml.safe_load(open(f)) or {}
+              for gen_key, kind in (('secretGenerator', 'Secret'), ('configMapGenerator', 'ConfigMap')):
+                  for gen in kdoc.get(gen_key, []) or []:
+                      name = gen.get('name')
+                      if name:
+                          all_names[kind][name] = f
+
           for f in sorted(glob.glob('k8s/**/*.yaml', recursive=True)):
               for d in yaml.safe_load_all(open(f)):
                   if not d: continue
@@ -217,8 +265,29 @@ jobs:
           if not ok: sys.exit(1)
           print('All ConfigMap/Secret/PVC/ServiceAccount references resolve')
 
-          services = {n: d['spec'].get('selector', {}) for f in glob.glob('k8s/**/*.yaml', recursive=True) for d in yaml.safe_load_all(open(f)) if d and d.get('kind') == 'Service' for n in [d['metadata']['name']]}
-          pods = {n: d['spec']['template']['metadata']['labels'] for f in glob.glob('k8s/**/*.yaml', recursive=True) for d in yaml.safe_load_all(open(f)) if d and d.get('kind') in ('Deployment', 'DaemonSet') for n in [d['metadata']['name']]}
+          services = {}
+          for f in glob.glob('k8s/**/*.yaml', recursive=True):
+              for d in yaml.safe_load_all(open(f)):
+                  if not d or d.get('kind') != 'Service': continue
+                  name = d.get('metadata', {}).get('name')
+                  # Skip fragments with no name to key on (e.g. Kustomize
+                  # patches that target by label/kind selector rather than
+                  # by metadata.name, and so legitimately omit metadata).
+                  if not name: continue
+                  services[name] = d.get('spec', {}).get('selector', {})
+
+          pods = {}
+          for f in glob.glob('k8s/**/*.yaml', recursive=True):
+              for d in yaml.safe_load_all(open(f)):
+                  if not d or d.get('kind') not in ('Deployment', 'DaemonSet'): continue
+                  name = d.get('metadata', {}).get('name')
+                  if not name: continue
+                  labels = d.get('spec', {}).get('template', {}).get('metadata', {}).get('labels')
+                  # Same reasoning: a patch fragment may only touch
+                  # spec.replicas or similar and never mention pod labels
+                  # at all, which is not itself a mismatch to report.
+                  if labels: pods[name] = labels
+
           for svc, sel in services.items():
               labels = pods.get(svc)
               if labels and not all(labels.get(k) == v for k, v in sel.items()):
@@ -277,6 +346,151 @@ jobs:
           fi
           echo "OK: no tracked secret env files."
 
+  # -------------------------------------------------------------------------
+  # Manual smoke test — see "Phase 14" note at the top of this file.
+  #
+  # Deliberately does NOT `need:` any of the test/lint/validate jobs above:
+  # it only exists to check AWS wiring, so there is no reason to wait on or
+  # be blocked by unrelated test failures. Only ever runs on a manual
+  # workflow_dispatch — push/PR events never touch this job.
+  #
+  # Bound to the same aws-demo Environment as deploy-to-k3s, so it picks up
+  # whatever protection rules (required reviewers, etc.) that Environment
+  # has — even though this job is read-only plus one harmless SSM echo.
+  # -------------------------------------------------------------------------
+  test-aws-connectivity:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: aws-demo
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-smoketest-${{ github.run_id }}
+
+      - name: Confirm the OIDC role assumption actually worked
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Confirm ECR read access
+        run: |
+          for svc in citizen-service notification-service frontend sentinel-ai; do
+            echo "--- ${ECR_REPOSITORY_PREFIX}/${svc} ---"
+            aws ecr describe-repositories \
+              --repository-names "${ECR_REPOSITORY_PREFIX}/${svc}" \
+              --query 'repositories[0].{Name:repositoryName,URI:repositoryUri}' \
+              --output table
+          done
+
+      - name: Confirm the SSM path to the node works (no kubectl, no deploy)
+        run: |
+          set -euo pipefail
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "CI connectivity smoke test (run ${GITHUB_RUN_ID})" \
+            --parameters commands="echo SSM connectivity OK: \$(date -Is)" \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM command: ${command_id}"
+
+          for _ in $(seq 1 20); do
+            status=$(aws ssm get-command-invocation \
+              --command-id "${command_id}" \
+              --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "${status}" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 3
+          done
+
+          echo "--- status: ${status} ---"
+          aws ssm get-command-invocation \
+            --command-id "${command_id}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query StandardOutputContent --output text
+
+          if [ "${status}" != "Success" ]; then
+            echo "SSM smoke test did not succeed (status: ${status})." >&2
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          echo "OIDC role assumption: OK"
+          echo "ECR read access: OK"
+          echo "SSM path to node: OK"
+          echo "Nothing was built, pushed, or deployed by this job."
+
+  # -------------------------------------------------------------------------
+  # Optional second half of the manual smoke test — only runs if the person
+  # triggering workflow_dispatch chose full-dry-run. Builds and pushes all
+  # four images, same as build-and-push-images below, but under a tag that
+  # can never be confused with a real deploy tag and is never deployed.
+  # -------------------------------------------------------------------------
+  test-build-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.test_mode == 'full-dry-run'
+    needs: test-aws-connectivity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - service: citizen-service
+            context: citizen-service
+            build_args: ""
+          - service: notification-service
+            context: notification-service
+            build_args: ""
+          - service: frontend
+            context: frontend
+            build_args: |
+              VITE_API_BASE_URL=
+          - service: sentinel-ai
+            context: sentinel-ai
+            build_args: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-dryrun-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push ${{ matrix.service }} (manual-test tag only)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          build-args: ${{ matrix.build_args }}
+          push: true
+          # manual-test-<run_id> only — never :latest, never :${{ github.sha }}.
+          # This can never be picked up by sentinel-deploy.sh, never
+          # overwrites a real tag, and never becomes something Sentinel has
+          # to correlate a rollback against.
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.service }}:manual-test-${{ github.run_id }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
   build-and-push-images:
     needs:
       - test-citizen-service
@@ -316,7 +530,7 @@ jobs:
       - uses: docker/setup-buildx-action@v4
 
       - name: Assume AWS role via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           # An IAM role ARN is not a credential — it is an identifier, and
           # useless without a valid OIDC token from this specific repository
@@ -391,7 +605,7 @@ jobs:
       id-token: write
     steps:
       - name: Assume AWS role via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}

@@ -114,11 +114,11 @@ class RemediationAction(str, Enum):
         if not isinstance(raw, str):
             return None
 
-        # Reject control/whitespace characters inside or around the value.
-        if raw != raw.strip() or any(char in raw for char in "\r\n\t"):
+        # Reject newline/tab control characters.
+        if "\r" in raw or "\n" in raw or "\t" in raw:
             return None
 
-        candidate = raw.lower()
+        candidate = raw.strip().lower()
 
         for member in cls:
             if member.value == candidate:

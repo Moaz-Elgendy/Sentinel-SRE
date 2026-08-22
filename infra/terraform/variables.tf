@@ -12,7 +12,7 @@ variable "aws_region" {
     `apply` fails with an unsupported-instance-type error, that is why.
   EOT
   type        = string
-  default     = "eu-west-1"
+  default     = "eu-central-1"
 }
 
 variable "environment" {
@@ -109,7 +109,7 @@ variable "instance_type" {
     Do not drop below 2 vCPU / 4 GiB — K3s plus this stack will not fit.
   EOT
   type        = string
-  default     = "t3a.large"
+  default     = "m7i-flex.large"
 }
 
 variable "root_volume_size_gb" {
@@ -254,6 +254,43 @@ variable "github_allowed_branches" {
   EOT
   type        = list(string)
   default     = ["main"]
+}
+
+variable "github_oidc_immutable_prefix" {
+  description = <<-EOT
+    Set this if your repository uses GitHub's immutable OIDC subject
+    claim format (rolled out to repos created/opted-in after July 15,
+    2026): "repo:OWNER@OWNER_ID/REPO@REPO_ID" instead of "repo:OWNER/REPO".
+
+    Get the EXACT value by decoding a live OIDC token from a workflow run
+    (see docs/aws-deployment.md) — do not guess the numeric owner/repo
+    IDs. Decode just ONE token (from any job); the owner_id/repo_id
+    portion is identical across every job in the repo, only the suffix
+    after the final colon (:ref:refs/heads/main vs :environment:NAME)
+    differs by trigger type. Once you have the prefix, both the
+    branch-ref and environment trust conditions below are built from it
+    automatically, so every job — push-triggered and
+    environment-gated — is trusted with a single confirmed value.
+
+    Leave as null for the standard mutable name-based format
+    ("repo:OWNER/REPO:...") that most repositories still use.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "github_environment_name" {
+  description = <<-EOT
+    Name of the GitHub Environment (Settings -> Environments) that gates
+    the deploy and connectivity-test jobs, e.g. "aws-demo". Any job that
+    sets `environment: <this-name>` in the workflow presents
+    repo:<repository>:environment:<this-name> as its OIDC subject instead
+    of the branch-ref form, so the trust policy must trust this value
+    explicitly or role assumption from that job fails. Must match the
+    `environment:` value in .github/workflows/ci-cd.yml exactly.
+  EOT
+  type        = string
+  default     = "aws-demo"
 }
 
 variable "create_github_oidc_provider" {
