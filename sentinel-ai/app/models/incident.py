@@ -110,20 +110,31 @@ class RemediationAction(str, Enum):
 
     @classmethod
     def parse(cls, raw: Any) -> "RemediationAction | None":
-        """Strict parse used on the LLM boundary."""
+        """Strict parse used on the LLM boundary.
+
+        Returns None (never raises, never guesses) for anything that is not
+        an exact enum value. A model that hallucinates "delete_namespace" or
+        "restart_deployment; rm -rf /" gets None, and the caller falls back
+        to the rule-based recommendation.
+
+        The only leniency permitted is surrounding plain spaces and case —
+        e.g. " Restart_Deployment " is accepted, since JSON-formatted model
+        output legitimately varies that way. Embedded control/whitespace
+        characters (\\n, \\r, \\t) anywhere in the string are NOT stripped
+        and cause an immediate rejection instead: a trailing newline is not
+        cosmetic noise the way a leading space is, and treating it as
+        harmless would make "restart_deployment\\n; rm -rf /"-shaped payloads
+        one silent normalisation away from slipping past this gate depending
+        on what a future caller does with the parsed value downstream.
+        """
         if not isinstance(raw, str):
             return None
-
-        # Reject newline/tab control characters.
-        if "\r" in raw or "\n" in raw or "\t" in raw:
+        if any(c in raw for c in ("\n", "\r", "\t")):
             return None
-
-        candidate = raw.strip().lower()
-
+        candidate = raw.strip(" ").lower()
         for member in cls:
             if member.value == candidate:
                 return member
-
         return None
 
 
@@ -348,6 +359,13 @@ class Evidence:
     restart_count_total: int = 0
     latest_revision_age_seconds: float | None = None
 
+    # GitHub commit correlation for the currently-running image tag (see
+    # investigation.py). None whenever GITHUB_TOKEN/GITHUB_REPOSITORY are
+    # not configured, the image tag is not a real commit SHA (e.g. a
+    # CI smoke-test tag), or the lookup failed — never a hard error, since
+    # this is correlation context, not something remediation depends on.
+    deploy_commit: dict[str, Any] | None = None
+
     # Health endpoint (parsed JSON `status`, not just the status code — a
     # downstream outage yields HTTP 200 + {"status":"degraded"})
     health_status: str | None = None
@@ -383,6 +401,7 @@ class Evidence:
             "replicaset_history": self.replicaset_history,
             "restart_count_total": self.restart_count_total,
             "latest_revision_age_seconds": self.latest_revision_age_seconds,
+            "deploy_commit": self.deploy_commit,
             "health_status": self.health_status,
             "health_http_code": self.health_http_code,
             "health_checks": self.health_checks,

@@ -87,6 +87,47 @@ def test_bad_deployment_with_image_change_clears_the_rollback_gate(incident):
     assert h.confidence >= 0.95, "must clear the rollback threshold"
 
 
+def test_bad_deployment_reasoning_includes_github_commit_when_available(incident):
+    """GitHub correlation enriches the narrative but must NOT move confidence.
+
+    Same findings as the image-change test above, with and without commit
+    evidence attached to Evidence — the two confidence values must be
+    identical. Confidence for an autonomous rollback rests on Kubernetes
+    facts (revision + image change), not on whether GitHub happened to be
+    reachable when RCA ran.
+    """
+    f = findings(
+        deploy_correlates_with_onset=True,
+        previous_revision=2,
+        current_revision=3,
+        revision_count=3,
+        image_changed=True,
+        error_spike=True,
+    )
+    h_without = analyse(incident, Evidence(), f)
+
+    commit = {
+        "sha": "abc1234",
+        "message": "widen db connection pool timeout",
+        "author": "moaz",
+        "changed_files": ["app/db.py", "app/config.py"],
+        "changed_file_count": 2,
+        "pull_request": {"number": 42, "title": "fix pool timeout"},
+        "url": "https://github.com/example/repo/commit/abc1234",
+    }
+    h_with = analyse(incident, Evidence(deploy_commit=commit), f)
+
+    assert h_with.confidence == h_without.confidence, (
+        "commit evidence must enrich reasoning only, never shift confidence"
+    )
+    assert "abc1234" in h_with.reasoning
+    assert "widen db connection pool timeout" in h_with.reasoning
+    assert "app/db.py" in h_with.reasoning
+    assert "PR #42" in h_with.reasoning
+    # And the no-commit case must not fabricate any of this.
+    assert "abc1234" not in h_without.reasoning
+
+
 def test_bad_deployment_without_an_image_change_stays_below_the_rollback_gate(incident):
     """A revision bump with identical images is usually an annotation-only
     change (a rollout restart). Rolling 'back' to an identical template

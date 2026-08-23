@@ -25,6 +25,7 @@ import logging
 import time
 from typing import Any
 
+from app.clients.github_client import GitHubClient
 from app.clients.kubernetes_client import KubernetesClient
 from app.clients.loki import LokiClient, looks_like_chaos_silence, summarise
 from app.clients.prometheus import PrometheusClient
@@ -38,18 +39,40 @@ logger = logging.getLogger(__name__)
 LOOKBACK_SECONDS = 900
 
 
+def _extract_sha_from_image(image: str) -> str | None:
+    """"<registry>/<prefix>/<service>:<tag>" -> "<tag>".
+
+    CI (see .github/workflows/ci-cd.yml) always tags images with the git
+    SHA that built them, so the tag IS the commit to correlate against —
+    no separate deploy-metadata store needed. Returns None for images with
+    no tag (bare digest references), which GitHubClient.get_commit()
+    would reject anyway, but returning None here keeps the "why is there
+    no commit" reason distinguishable at this layer too.
+    """
+    if not image or ":" not in image:
+        return None
+    return image.rsplit(":", 1)[-1] or None
+
+
 async def investigate(
     incident: Incident,
     prom: PrometheusClient,
     loki: LokiClient,
     k8s: KubernetesClient,
     health_probe: Any = None,
+    github: GitHubClient | None = None,
 ) -> Evidence:
     """Collect everything we can see about this incident.
 
     `health_probe` is an async callable ``(deployment) -> dict`` (normally
     validation.probe_health). It is injected rather than imported so tests can
     run this whole phase without a network stack.
+
+    `github` is optional and only ever used read-only (see github_client.py).
+    Passed in the same way for the same reason: tests exercise this phase
+    with no real network calls, and a missing/None github client degrades
+    identically to a missing GITHUB_TOKEN — commit correlation is simply
+    absent, nothing here fails.
     """
     evidence = Evidence()
     app = incident.app
@@ -156,6 +179,33 @@ async def investigate(
         created = newest.get("created_at")
         if created:
             evidence.latest_revision_age_seconds = max(0.0, now - created)
+
+        # ---- GitHub commit correlation for the currently-running image --
+        # Deliberately sequential, not folded into the asyncio.gather above:
+        # it depends on the image tag from the ReplicaSet fetch, which is
+        # itself one of the parallel tasks. One extra round trip only when
+        # there is a deployment to correlate at all.
+        if github is not None and github.enabled:
+            images = newest.get("images") or []
+            sha = _extract_sha_from_image(images[0]) if images else None
+            if sha:
+                try:
+                    evidence.deploy_commit = await github.get_commit(sha)
+                except Exception as exc:  # noqa: BLE001
+                    # Same fail-soft contract as every other collector here:
+                    # a GitHub outage must not affect the rest of the
+                    # investigation, only be recorded as a gap.
+                    evidence.errors.append(
+                        f"collector 'github_commit' failed: {str(exc)[:200]}"
+                    )
+                if evidence.deploy_commit is None and "github_commit" not in " ".join(
+                    evidence.errors
+                ):
+                    evidence.errors.append(
+                        "github commit lookup returned no result for the running "
+                        f"image tag ({(sha or 'unparseable')[:12]}) — see logs for "
+                        "whether this was 'not found' vs 'not a real SHA'"
+                    )
 
     health = collected.get("health") or {}
     if isinstance(health, dict):

@@ -55,6 +55,16 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     openai_timeout_seconds: float = 20.0
+    # Empty (default) = talk to real OpenAI. Any OpenAI-API-compatible
+    # provider works here without touching rca.py at all — e.g. Groq
+    # ("https://api.groq.com/openai/v1" with openai_model="llama-3.3-70b-
+    # versatile") or OpenRouter ("https://openrouter.ai/api/v1"). Sentinel
+    # only ever uses chat.completions.create() with response_format=
+    # json_object, so any provider advertising OpenAI-SDK compatibility and
+    # JSON mode for its chosen model is a drop-in swap — confirm both
+    # before relying on it, since not every free-tier model supports JSON
+    # mode.
+    openai_base_url: str = ""
 
     # ---- Documentation sinks (both optional, both no-op when unset) ------
     github_token: str = ""

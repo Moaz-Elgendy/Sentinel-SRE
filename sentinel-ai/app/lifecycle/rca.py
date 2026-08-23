@@ -148,12 +148,13 @@ def analyse(
             "running, which is why confidence is held below the rollback "
             "threshold."
         )
+        commit_note = _commit_reasoning(evidence.deploy_commit)
         return _hypothesis(
             RootCause.BAD_DEPLOYMENT,
             confidence,
             "Symptoms began within the deployment correlation window of a new "
             f"ReplicaSet (revision {findings.current_revision}), with no active "
-            f"chaos fault. {image_note}",
+            f"chaos fault. {image_note}{commit_note}",
             RemediationAction.ROLLBACK_DEPLOYMENT,
             supporting,
             findings,
@@ -281,6 +282,33 @@ def analyse(
         RemediationAction.ESCALATE,
         supporting,
         findings,
+    )
+
+
+def _commit_reasoning(deploy_commit: dict[str, Any] | None) -> str:
+    """Turn GitHub commit correlation (if any) into one appended sentence.
+
+    Deliberately does not touch confidence. GitHub evidence strengthens the
+    NARRATIVE — it tells a human *what* likely regressed, not just *that*
+    something regressed — but confidence for an autonomous rollback must
+    keep resting on Kubernetes-observed facts (revision + image change),
+    which do not depend on GitHub being reachable or configured at all.
+    """
+    if not deploy_commit:
+        return ""
+    sha = deploy_commit.get("sha", "unknown")
+    message = deploy_commit.get("message", "")
+    files = deploy_commit.get("changed_files") or []
+    file_note = ""
+    if files:
+        shown = ", ".join(files[:5])
+        more = f" (+{len(files) - 5} more)" if len(files) > 5 else ""
+        file_note = f" Changed files: {shown}{more}."
+    pr = deploy_commit.get("pull_request")
+    pr_note = f" (PR #{pr['number']}: {pr['title']})" if pr else ""
+    return (
+        f" This revision corresponds to commit {sha} (\"{message}\"){pr_note}."
+        f"{file_note}"
     )
 
 
@@ -439,6 +467,7 @@ async def enrich_with_llm(
     api_key: str,
     model: str,
     timeout: float = 20.0,
+    base_url: str = "",
 ) -> Hypothesis:
     """Ask the model for a better narrative. Returns a NEW Hypothesis.
 
@@ -446,6 +475,11 @@ async def enrich_with_llm(
     unchanged: no key, import failure, network error, non-JSON response,
     disagreement on the action, disagreement on the root cause. The LLM is
     strictly additive.
+
+    `base_url` empty (default) talks to real OpenAI. Set it to point the
+    same client at any OpenAI-API-compatible provider (Groq, OpenRouter,
+    etc.) — see Settings.openai_base_url for the constraint that matters
+    (JSON mode support on the chosen model).
     """
     if not api_key:
         sentinel_llm_calls_total.labels(result="skipped").inc()
@@ -471,7 +505,9 @@ async def enrich_with_llm(
         return hypothesis
 
     try:
-        client = AsyncOpenAI(api_key=api_key, timeout=timeout)
+        client = AsyncOpenAI(
+            api_key=api_key, timeout=timeout, base_url=(base_url or None)
+        )
         response = await client.chat.completions.create(
             model=model,
             messages=[

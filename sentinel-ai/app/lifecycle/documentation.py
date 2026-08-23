@@ -232,6 +232,23 @@ def _rca_section(incident: Incident) -> str:
         parts += ["", "### Supporting evidence"]
         parts += [f"- {s}" for s in h.supporting[:25]]
     evidence = incident.evidence
+    commit = evidence.deploy_commit if evidence else None
+    if commit:
+        parts += ["", "### Deployment / commit evidence"]
+        parts += [f"- **Commit:** `{commit.get('sha')}`"]
+        parts += [f"- **Message:** {commit.get('message')}"]
+        if commit.get("author"):
+            parts += [f"- **Author:** {commit['author']}"]
+        pr = commit.get("pull_request")
+        if pr:
+            parts += [f"- **Pull request:** #{pr.get('number')} — {pr.get('title')}"]
+        files = commit.get("changed_files") or []
+        if files:
+            shown = ", ".join(f"`{f}`" for f in files[:15])
+            more = f" (+{len(files) - 15} more)" if len(files) > 15 else ""
+            parts += [f"- **Changed files ({commit.get('changed_file_count', len(files))}):** {shown}{more}"]
+        if commit.get("url"):
+            parts += [f"- **Link:** {commit['url']}"]
     if evidence and evidence.errors:
         parts += [
             "",

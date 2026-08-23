@@ -255,6 +255,28 @@ class FakeChaos:
         )
 
 
+class FakeGitHub:
+    """Mirrors GitHubClient's public surface with no network calls.
+
+    `enabled` defaults True so tests opt IN to the "not configured" case
+    explicitly, matching how FakeChaos/FakeKubernetes read.
+    """
+
+    def __init__(self, enabled=True, commit=None):
+        self.enabled = enabled
+        self._commit = commit
+        self.lookups: list[str] = []
+        self.issues_created: list[dict] = []
+
+    async def get_commit(self, sha):
+        self.lookups.append(sha)
+        return self._commit
+
+    async def create_issue(self, title, body, labels=None):
+        self.issues_created.append({"title": title, "body": body, "labels": labels})
+        return {"created": True, "skipped": False, "number": 1, "url": "https://example/1"}
+
+
 @pytest.fixture
 def fake_k8s():
     return FakeKubernetes()
@@ -263,3 +285,8 @@ def fake_k8s():
 @pytest.fixture
 def fake_chaos():
     return FakeChaos()
+
+
+@pytest.fixture
+def fake_github():
+    return FakeGitHub(enabled=False)  # tests opt in with a real commit payload

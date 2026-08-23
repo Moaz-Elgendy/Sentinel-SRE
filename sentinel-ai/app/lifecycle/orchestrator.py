@@ -250,6 +250,7 @@ class Orchestrator:
                 api_key=self.ctx.settings.openai_api_key,
                 model=self.ctx.settings.openai_model,
                 timeout=self.ctx.settings.openai_timeout_seconds,
+                base_url=self.ctx.settings.openai_base_url,
             )
             incident.hypothesis = hypothesis
             incident.record(
@@ -491,6 +492,7 @@ class Orchestrator:
             loki=self.ctx.loki,
             k8s=self.ctx.k8s,
             health_probe=self._health_probe,
+            github=self.ctx.github,
         )
         incident.record(
             phase,
