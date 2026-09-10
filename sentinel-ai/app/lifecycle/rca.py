@@ -133,6 +133,30 @@ def analyse(
             findings,
         )
 
+    if findings.chaos_cpu_fault:
+        return _hypothesis(
+            RootCause.CHAOS_CPU_FAULT,
+            0.96,
+            "chaos_cpu_burn is active on at least one pod, so the elevated CPU "
+            "usage is a deliberate CPU fault rather than an unexplained "
+            "application workload problem.",
+            RemediationAction.RESET_CHAOS_FAULT,
+            supporting,
+            findings,
+        )
+
+    if findings.chaos_memory_fault:
+        return _hypothesis(
+            RootCause.CHAOS_MEMORY_FAULT,
+            0.96,
+            "chaos_memory_leak_mb is active on at least one pod, so the memory "
+            "growth is a deliberate injected fault rather than an unexplained "
+            "application memory leak.",
+            RemediationAction.RESET_CHAOS_FAULT,
+            supporting,
+            findings,
+        )
+
     # ---- 2. Bad deployment ----------------------------------------------
     # Requires the deployment/onset correlation from CORRELATION, not just
     # "a deploy happened". The Policy Engine re-checks this independently.
@@ -464,68 +488,48 @@ async def enrich_with_llm(
     incident: Incident,
     evidence: Evidence,
     hypothesis: Hypothesis,
-    api_key: str,
-    model: str,
-    timeout: float = 20.0,
-    base_url: str = "",
+    reasoner: Any = None,
 ) -> Hypothesis:
     """Ask the model for a better narrative. Returns a NEW Hypothesis.
 
     Every failure mode ends with the rule-based hypothesis returned
-    unchanged: no key, import failure, network error, non-JSON response,
-    disagreement on the action, disagreement on the root cause. The LLM is
-    strictly additive.
+    unchanged: no reasoner configured, import failure, network error,
+    non-JSON response, disagreement on the action, disagreement on the root
+    cause. The LLM is strictly additive.
 
-    `base_url` empty (default) talks to real OpenAI. Set it to point the
-    same client at any OpenAI-API-compatible provider (Groq, OpenRouter,
-    etc.) — see Settings.openai_base_url for the constraint that matters
-    (JSON mode support on the chosen model).
+    `reasoner` is an `app.reasoning.base.Reasoner` (or None, meaning no
+    provider is configured — the fully-supported rule-based-only mode). This
+    function does not know or care whether that's OpenAI, Gemini, Groq, or
+    eventually a locally hosted Sentinel model — see app/reasoning/ for the
+    provider implementations and app/reasoning/factory.py for how one gets
+    selected. Not type-hinted as `Reasoner | None` directly to avoid this
+    module needing to import a type it only ever calls one method on.
     """
-    if not api_key:
+    if reasoner is None:
         sentinel_llm_calls_total.labels(result="skipped").inc()
         logger.info(
             "llm_disabled_using_rules_only",
             extra={
-                "reason": "OPENAI_API_KEY is not set",
+                "reason": "no LLM provider configured (see Settings.llm_provider)",
                 "root_cause": hypothesis.root_cause.value,
             },
         )
         hypothesis.llm_note = (
-            "OPENAI_API_KEY is not set, so this analysis is entirely rule-based. "
-            "That is a fully supported mode: the LLM only ever enriches the "
-            "narrative and can never choose an action."
+            "No LLM provider is configured, so this analysis is entirely "
+            "rule-based. That is a fully supported mode: the LLM only ever "
+            "enriches the narrative and can never choose an action."
         )
         return hypothesis
 
-    try:
-        from openai import AsyncOpenAI  # noqa: PLC0415
-    except ImportError as exc:
+    raw = await reasoner.complete_json(
+        SYSTEM_PROMPT, build_prompt(incident, evidence, hypothesis)
+    )
+    if raw is None:
         sentinel_llm_calls_total.labels(result="error").inc()
-        hypothesis.llm_note = f"openai package unavailable: {str(exc)[:120]}"
-        return hypothesis
-
-    try:
-        client = AsyncOpenAI(
-            api_key=api_key, timeout=timeout, base_url=(base_url or None)
+        hypothesis.llm_note = (
+            f"LLM call via {reasoner.label} failed or returned nothing; "
+            "using rule-based analysis."
         )
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": build_prompt(incident, evidence, hypothesis)},
-            ],
-            # Deterministic-ish. We are asking for an explanation of fixed
-            # evidence, not creative writing, and a reproducible narrative is
-            # worth more in a post-mortem.
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            max_tokens=600,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-    except Exception as exc:  # noqa: BLE001 - openai raises many types
-        sentinel_llm_calls_total.labels(result="error").inc()
-        logger.warning("llm_call_failed", extra={"error_detail": str(exc)[:200]})
-        hypothesis.llm_note = f"LLM call failed, using rule-based analysis: {str(exc)[:160]}"
         return hypothesis
 
     return apply_llm_response(hypothesis, raw)

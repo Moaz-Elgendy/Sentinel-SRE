@@ -86,7 +86,7 @@ resource "aws_instance" "k3s" {
   # every PersistentVolume on its root disk) with it. To intentionally tear
   # the environment down, set this to false and apply that change first.
   lifecycle {
-    prevent_destroy = true
+    #prevent_destroy = true
 
     ignore_changes = [
       # The AMI id from SSM moves whenever Canonical publishes a new build.

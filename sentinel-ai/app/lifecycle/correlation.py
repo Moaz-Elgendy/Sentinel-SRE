@@ -89,6 +89,8 @@ class CorrelationFindings:
         self.chaos_error_fault: bool = False
         self.chaos_latency_fault: bool = False
         self.chaos_notification_fault: bool = False
+        self.chaos_cpu_fault: bool = False
+        self.chaos_memory_fault: bool = False
         self.chaos_pods_affected: list[str] = []
 
         # Downstream
@@ -250,6 +252,12 @@ def correlate(
             affected = True
         if (metrics.get("chaos_notification_failure_rate") or 0.0) > 0:
             f.chaos_notification_fault = True
+            affected = True
+        if (metrics.get("chaos_cpu_burn") or 0.0) > 0:
+            f.chaos_cpu_fault = True
+            affected = True
+        if (metrics.get("chaos_memory_leak_mb") or 0.0) > 0:
+            f.chaos_memory_fault = True
             affected = True
         if affected:
             f.chaos_pods_affected.append(pod)

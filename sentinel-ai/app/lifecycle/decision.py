@@ -71,6 +71,14 @@ ACTION_LADDER: dict[RootCause, tuple[RemediationAction, ...]] = {
         RemediationAction.RESET_CHAOS_FAULT,
         RemediationAction.RESTART_DEPLOYMENT,
     ),
+    RootCause.CHAOS_CPU_FAULT: (
+        RemediationAction.RESET_CHAOS_FAULT,
+        RemediationAction.RESTART_DEPLOYMENT,
+    ),
+    RootCause.CHAOS_MEMORY_FAULT: (
+        RemediationAction.RESET_CHAOS_FAULT,
+        RemediationAction.RESTART_DEPLOYMENT,
+    ),
     RootCause.BAD_DEPLOYMENT: (
         RemediationAction.ROLLBACK_DEPLOYMENT,
         # If the rollback itself fails to apply, a restart at least re-rolls
