@@ -489,6 +489,9 @@ async def enrich_with_llm(
     evidence: Evidence,
     hypothesis: Hypothesis,
     reasoner: Any = None,
+    api_key: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
 ) -> Hypothesis:
     """Ask the model for a better narrative. Returns a NEW Hypothesis.
 
@@ -505,6 +508,23 @@ async def enrich_with_llm(
     selected. Not type-hinted as `Reasoner | None` directly to avoid this
     module needing to import a type it only ever calls one method on.
     """
+    # Backward compatibility for an older orchestrator image that may still
+    # call this function with api_key/model/base_url. The current lifecycle
+    # passes a Reasoner directly; this fallback prevents a mixed-version
+    # rollout from crashing the entire incident lifecycle.
+    if reasoner is None and api_key:
+        try:
+            from app.reasoning.openai_reasoner import OpenAIReasoner
+
+            reasoner = OpenAIReasoner(
+                api_key=api_key,
+                model=model or "gpt-4o-mini",
+                timeout=30,
+                base_url=base_url,
+            )
+        except Exception:
+            logger.exception("llm_legacy_reasoner_init_failed")
+
     if reasoner is None:
         sentinel_llm_calls_total.labels(result="skipped").inc()
         logger.info(
