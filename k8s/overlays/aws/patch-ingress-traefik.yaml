@@ -23,8 +23,8 @@
 #     hostname and an ACM/cert-manager certificate exist, put the host
 #     back and add a tls block.
 #
-# Path ordering note: /api must win over /. Traefik sorts rules by path
-# length descending, so the more specific /api prefix is matched first
+# Path ordering note: /api/sentinel and /api must win over /. Traefik sorts
+# rules by path length descending, so the more specific API prefixes match
 # regardless of the order they appear here — the same behaviour
 # ingress-nginx gives, so the base's ordering assumption still holds.
 apiVersion: networking.k8s.io/v1
@@ -42,6 +42,13 @@ spec:
     # here.
     - http:
         paths:
+          - path: /api/sentinel
+            pathType: Prefix
+            backend:
+              service:
+                name: sentinel-ai
+                port:
+                  number: 8080
           - path: /api
             pathType: Prefix
             backend:

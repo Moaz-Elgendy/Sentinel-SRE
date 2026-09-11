@@ -599,9 +599,9 @@ Database incidents escalate to a human by design: restarting a Postgres pod unde
 plausible-looking action that risks data loss and fixes almost nothing, and rolling one back is
 meaningless.
 
-**Chaos.** The `CHAOS_ADMIN_TOKEN` that lets Sentinel *reset* a fault is not a general grant to
-*create* them. Sentinel gaining the ability to inject failures into the thing it protects is a
-capability worth adding deliberately later, if ever — not one it should have by default.
+**Chaos.** Autonomous remediation still only resets faults; it does not create them as part of
+incident handling. The separate GUI-driven scenario runner is an operator action guarded by
+`CHAOS_ADMIN_TOKEN` and an allow-list of known `scripts/incident-scenarios.sh` scenario names.
 
 ---
 
@@ -626,6 +626,11 @@ export CHAOS_ADMIN_TOKEN=<the token set in both services' Secrets>
 ./scripts/incident-scenarios.sh http-errors
 ./scripts/incident-scenarios.sh all
 ```
+
+On AWS, the same scenarios can be started from the portal's **Chaos** page instead of opening an
+SSM shell yourself. Enter the chaos admin token, connect to Sentinel, and click a scenario. Sentinel
+uses SSM Run Command to execute `/opt/sentinel-sre/scripts/incident-scenarios.sh` on the K3s node
+and shows the returned command status/output in the page.
 
 Applying the manifests by hand instead:
 

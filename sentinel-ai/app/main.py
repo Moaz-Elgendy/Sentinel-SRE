@@ -60,7 +60,7 @@ from app.core.config import settings
 from app.core.logging_config import configure_logging
 from app.domain.environment import Environment
 from app.lifecycle.orchestrator import Orchestrator, build_context
-from app.routers import alerts, environments, health, incidents
+from app.routers import alerts, chaos_scenarios, environments, health, incidents
 from app.store.sqlite_store import SQLiteStore
 
 configure_logging(service_name=settings.service_name)
@@ -189,6 +189,7 @@ app.include_router(health.router)
 app.include_router(alerts.router)
 app.include_router(incidents.router)
 app.include_router(environments.router)
+app.include_router(chaos_scenarios.router)
 
 
 @app.get("/metrics")

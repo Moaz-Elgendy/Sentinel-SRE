@@ -26,6 +26,7 @@ AWSConnectionConfig's docstring in app/domain/environment.py.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -131,3 +132,77 @@ class AWSClient:
             )
             return []
         return sorted(resp.get("Datapoints", []), key=lambda d: d.get("Timestamp", 0))
+
+    # ---- SSM Run Command -----------------------------------------------
+    async def send_shell_command(
+        self,
+        instance_id: str,
+        commands: list[str],
+        comment: str,
+        timeout_seconds: int = 1800,
+    ) -> str:
+        """Run an allowlisted shell command on the K3s node through SSM."""
+        if not self.enabled:
+            raise RuntimeError("AWS region is not configured")
+
+        def _call() -> str:
+            import boto3  # noqa: PLC0415
+
+            ssm = boto3.client("ssm", **self._session_kwargs())
+            resp = ssm.send_command(
+                InstanceIds=[instance_id],
+                DocumentName="AWS-RunShellScript",
+                Comment=comment[:100],
+                Parameters={
+                    "commands": commands,
+                    "executionTimeout": [str(timeout_seconds)],
+                },
+                TimeoutSeconds=timeout_seconds,
+            )
+            return resp["Command"]["CommandId"]
+
+        return await asyncio.to_thread(_call)
+
+    async def get_command_invocation(
+        self, instance_id: str, command_id: str
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("AWS region is not configured")
+
+        def _call() -> dict[str, Any]:
+            import boto3  # noqa: PLC0415
+
+            ssm = boto3.client("ssm", **self._session_kwargs())
+            try:
+                resp = ssm.get_command_invocation(
+                    CommandId=command_id,
+                    InstanceId=instance_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                error = getattr(exc, "response", {}).get("Error", {})
+                if error.get("Code") == "InvocationDoesNotExist":
+                    return {
+                        "command_id": command_id,
+                        "instance_id": instance_id,
+                        "status": "Pending",
+                        "status_details": "Waiting for SSM invocation",
+                        "response_code": -1,
+                        "stdout": "",
+                        "stderr": "",
+                        "execution_start": "",
+                        "execution_end": "",
+                    }
+                raise
+            return {
+                "command_id": command_id,
+                "instance_id": instance_id,
+                "status": resp.get("Status"),
+                "status_details": resp.get("StatusDetails"),
+                "response_code": resp.get("ResponseCode"),
+                "stdout": resp.get("StandardOutputContent", ""),
+                "stderr": resp.get("StandardErrorContent", ""),
+                "execution_start": str(resp.get("ExecutionStartDateTime") or ""),
+                "execution_end": str(resp.get("ExecutionEndDateTime") or ""),
+            }
+
+        return await asyncio.to_thread(_call)

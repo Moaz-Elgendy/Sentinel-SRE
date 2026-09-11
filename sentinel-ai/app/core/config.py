@@ -140,6 +140,9 @@ class Settings(BaseSettings):
     aws_access_key_id: str = ""
     aws_secret_access_key: str = ""
     aws_ec2_instance_ids: str = ""  # comma-separated; empty = skip EC2 evidence
+    chaos_scenario_runner_instance_id: str = ""
+    chaos_scenario_runner_workdir: str = "/opt/sentinel-sre"
+    chaos_scenario_runner_timeout_seconds: int = 1800
 
     # ---- Policy: allow-lists --------------------------------------------
     # Comma-separated. Anything not on these lists cannot be touched, ever.

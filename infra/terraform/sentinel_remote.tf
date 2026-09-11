@@ -70,12 +70,12 @@ resource "aws_security_group" "sentinel" {
 resource "aws_vpc_security_group_ingress_rule" "sentinel_webhook_from_k3s" {
   count = var.enable_remote_sentinel ? 1 : 0
 
-  security_group_id           = aws_security_group.sentinel[0].id
-  description                 = "Alertmanager webhook + environment-registration API, from the K3s node only"
+  security_group_id            = aws_security_group.sentinel[0].id
+  description                  = "Alertmanager webhook + environment-registration API, from the K3s node only"
   referenced_security_group_id = aws_security_group.k3s_node.id
-  from_port                   = var.sentinel_webhook_port
-  to_port                     = var.sentinel_webhook_port
-  ip_protocol                 = "tcp"
+  from_port                    = var.sentinel_webhook_port
+  to_port                      = var.sentinel_webhook_port
+  ip_protocol                  = "tcp"
 
   tags = {
     Name = "${var.project_name}-sentinel-ingress-webhook"
@@ -90,9 +90,9 @@ resource "aws_vpc_security_group_egress_rule" "sentinel_egress_all" {
   count = var.enable_remote_sentinel ? 1 : 0
 
   security_group_id = aws_security_group.sentinel[0].id
-  description        = "Outbound to K3s node (API/Prometheus/Loki), SSM, ECR, LLM/GitHub APIs"
-  cidr_ipv4          = "0.0.0.0/0"
-  ip_protocol        = "-1"
+  description       = "Outbound to K3s node (API/Prometheus/Loki), SSM, ECR, LLM/GitHub APIs"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
 
   tags = {
     Name = "${var.project_name}-sentinel-egress-all"
@@ -174,6 +174,39 @@ resource "aws_iam_role_policy" "sentinel_ssm_read" {
   policy = data.aws_iam_policy_document.sentinel_ssm_read[0].json
 }
 
+data "aws_iam_policy_document" "sentinel_run_k3s_commands" {
+  count = var.enable_remote_sentinel ? 1 : 0
+
+  statement {
+    sid    = "RunScenarioScriptOnK3sNode"
+    effect = "Allow"
+    actions = [
+      "ssm:SendCommand",
+    ]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/${aws_instance.k3s.id}",
+      "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}::document/AWS-RunShellScript",
+    ]
+  }
+
+  statement {
+    sid    = "ReadScenarioCommandStatus"
+    effect = "Allow"
+    actions = [
+      "ssm:GetCommandInvocation",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "sentinel_run_k3s_commands" {
+  count = var.enable_remote_sentinel ? 1 : 0
+
+  name   = "${var.project_name}-sentinel-run-k3s-commands"
+  role   = aws_iam_role.sentinel[0].id
+  policy = data.aws_iam_policy_document.sentinel_run_k3s_commands[0].json
+}
+
 resource "aws_iam_instance_profile" "sentinel" {
   count = var.enable_remote_sentinel ? 1 : 0
 
@@ -249,16 +282,17 @@ resource "aws_ssm_parameter" "sentinel_extra_env" {
 
 locals {
   sentinel_user_data = var.enable_remote_sentinel ? templatefile("${path.module}/sentinel_user_data.sh.tftpl", {
-    aws_region       = var.aws_region
-    ecr_registry     = local.ecr_registry
-    ecr_repo_prefix  = var.project_name
-    image_tag        = var.sentinel_image_tag
-    k3s_private_ip   = aws_instance.k3s.private_ip
-    webhook_port     = var.sentinel_webhook_port
-    prometheus_port  = var.prometheus_nodeport
-    loki_port        = var.loki_nodeport
-    token_param_name = "/${var.project_name}/sentinel/k8s-token"
-    ca_param_name    = "/${var.project_name}/sentinel/k8s-ca-cert-b64"
+    aws_region           = var.aws_region
+    ecr_registry         = local.ecr_registry
+    ecr_repo_prefix      = var.project_name
+    image_tag            = var.sentinel_image_tag
+    k3s_instance_id      = aws_instance.k3s.id
+    k3s_private_ip       = aws_instance.k3s.private_ip
+    webhook_port         = var.sentinel_webhook_port
+    prometheus_port      = var.prometheus_nodeport
+    loki_port            = var.loki_nodeport
+    token_param_name     = "/${var.project_name}/sentinel/k8s-token"
+    ca_param_name        = "/${var.project_name}/sentinel/k8s-ca-cert-b64"
     extra_env_param_name = "/${var.project_name}/sentinel/extra-env"
   }) : ""
 }
@@ -279,8 +313,8 @@ resource "aws_instance" "sentinel" {
 
   root_block_device {
     volume_type           = "gp3"
-    volume_size            = 12
-    encrypted              = true
+    volume_size           = 12
+    encrypted             = true
     delete_on_termination = true
 
     tags = {
@@ -289,10 +323,10 @@ resource "aws_instance" "sentinel" {
   }
 
   metadata_options {
-    http_endpoint                = "enabled"
-    http_tokens                  = "required"
-    http_put_response_hop_limit  = 1
-    instance_metadata_tags       = "enabled"
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+    instance_metadata_tags      = "enabled"
   }
 
   user_data                   = local.sentinel_user_data
@@ -305,6 +339,7 @@ resource "aws_instance" "sentinel" {
 
   depends_on = [
     aws_iam_role_policy.sentinel_ecr_pull,
+    aws_iam_role_policy.sentinel_run_k3s_commands,
     aws_iam_role_policy.sentinel_ssm_read,
     aws_iam_role_policy_attachment.sentinel_ssm_core,
     aws_instance.k3s,
