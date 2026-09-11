@@ -68,6 +68,11 @@ spec:
       imagePullSecrets:
         - name: ecr-credentials
       containers:
+        - name: frontend
+          env:
+            - name: SENTINEL_API_UPSTREAM
+              value: SENTINEL_API_UPSTREAM_PLACEHOLDER
+      containers:
         - name: notification-service
           startupProbe:
             httpGet:
