@@ -25,6 +25,7 @@
 #   ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com  - depends on the AWS account
 #   :PLACEHOLDER                             - depends on the commit deployed
 #   PUBLIC_IP_PLACEHOLDER                    - depends on the instance's IP
+#   SENTINEL_API_UPSTREAM_PLACEHOLDER        - optional remote Sentinel URL
 #
 # All three are deliberately invalid rather than plausible defaults, so a
 # substitution that silently fails to happen produces an immediate,
@@ -86,6 +87,8 @@ echo "  account    : ${AWS_ACCOUNT_ID}"
 echo "  public IP  : ${PUBLIC_IP}"
 echo "  registry   : ${ECR_REGISTRY}"
 echo "  image tag  : ${IMAGE_TAG}"
+SENTINEL_API_UPSTREAM="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
+echo "  sentinel   : ${SENTINEL_API_UPSTREAM}"
 
 # ---------------------------------------------------------------------------
 # Preflight: the secret env files must exist
@@ -127,6 +130,7 @@ kubectl kustomize "${OVERLAY}" \
   | sed -e "s|ACCOUNT_ID\.dkr\.ecr\.REGION\.amazonaws\.com|${ECR_REGISTRY}|g" \
         -e "s|:PLACEHOLDER|:${IMAGE_TAG}|g" \
         -e "s|PUBLIC_IP_PLACEHOLDER|${PUBLIC_IP}|g" \
+        -e "s|SENTINEL_API_UPSTREAM_PLACEHOLDER|${SENTINEL_API_UPSTREAM}|g" \
   > "${RENDERED}"
 
 # Fail loudly if any placeholder survived. Without this check a typo in the

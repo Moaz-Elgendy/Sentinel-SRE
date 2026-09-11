@@ -628,9 +628,17 @@ export CHAOS_ADMIN_TOKEN=<the token set in both services' Secrets>
 ```
 
 On AWS, the same scenarios can be started from the portal's **Chaos** page instead of opening an
-SSM shell yourself. Enter the chaos admin token, connect to Sentinel, and click a scenario. Sentinel
-uses SSM Run Command to execute `/opt/sentinel-sre/scripts/incident-scenarios.sh` on the K3s node
-and shows the returned command status/output in the page.
+SSM shell yourself. In the external-control-plane topology, deploy the K3s stack with the frontend
+proxy pointed at the standalone Sentinel EC2 private IP:
+
+```bash
+sudo SENTINEL_API_UPSTREAM=http://<sentinel-private-ip>:8080 \
+  /opt/sentinel-sre/scripts/deploy-aws.sh <image-tag>
+```
+
+Then enter the chaos admin token, connect to Sentinel, and click a scenario. Sentinel uses SSM Run
+Command to execute `/opt/sentinel-sre/scripts/incident-scenarios.sh` on the K3s node and shows the
+returned command status/output in the page.
 
 Applying the manifests by hand instead:
 
