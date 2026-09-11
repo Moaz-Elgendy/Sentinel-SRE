@@ -92,6 +92,18 @@ async def alertmanager_webhook(
         incident = detection.build_incident(normalised)
         fingerprint = incident.fingerprint
 
+        # Stamp which Environment this incident belongs to (spec section 6).
+        # Phase 1: exactly one environment is registered, so this is simply
+        # "the" environment for this Sentinel process — see
+        # main.py:lifespan for where app.state.environment is set. See
+        # Environment's docstring for why routing an inbound webhook to ONE
+        # of several environments is deliberately not built yet.
+        environment = getattr(request.app.state, "environment", None)
+        if environment is not None:
+            incident.customer_id = environment.customer_id
+            incident.environment_id = environment.id
+            incident.application_id = environment.application.id
+
         if fingerprint in _in_flight:
             skipped.append(
                 {

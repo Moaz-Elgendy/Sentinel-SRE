@@ -1,4 +1,15 @@
-# Sentinel's ServiceAccount and RBAC.
+# Sentinel's ServiceAccount and RBAC — for the `KUBERNETES_MODE=in_cluster`
+# deployment topology specifically (Sentinel running as a pod inside this
+# same cluster). Since the external-control-plane refactor
+# (sentinel-ai/app/domain/environment.py), this is one of three supported
+# connection modes, not the only one — see
+# sentinel-ai/k8s/overlays/aws/secrets/sentinel.env.example for
+# `kubeconfig`/`remote` mode, which is how Sentinel authenticates when
+# deployed OUTSIDE this cluster. Whichever mode is used, the credential it
+# authenticates with should be scoped to exactly this Role — the
+# `REQUIRED_RBAC` tuple in sentinel-ai/app/clients/kubernetes_client.py is
+# kept in sync with the rules below by hand; if you add a verb there, add it
+# here too.
 #
 # ===========================================================================
 # The security argument, in full

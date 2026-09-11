@@ -19,4 +19,10 @@ kubernetes==31.0.0
 
 # Optional. Sentinel is fully functional (rule-based) without an API key; the
 # LLM only enriches narrative and nudges confidence within a hard bound.
+# GeminiReasoner (app/reasoning/gemini_reasoner.py) needs no extra package —
+# it talks to the plain Gemini REST API over httpx above.
 openai==1.54.3
+
+# Optional. Only imported when AWS_REGION is configured (app/clients/aws_client.py).
+# Not required for the primary bad-deployment demo.
+boto3==1.35.36

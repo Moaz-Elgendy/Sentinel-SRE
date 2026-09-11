@@ -70,3 +70,33 @@ output "next_steps" {
     remediation test, is in docs/aws-deployment.md.
   EOT
 }
+
+# ---------------------------------------------------------------------------
+# External control plane (var.enable_remote_sentinel) — see
+# sentinel_remote.tf and docs/sentinel-remote-validation-runbook.md.
+# ---------------------------------------------------------------------------
+
+output "sentinel_instance_id" {
+  description = "Instance id of the standalone external Sentinel, or null when var.enable_remote_sentinel is false."
+  value       = var.enable_remote_sentinel ? aws_instance.sentinel[0].id : null
+}
+
+output "sentinel_private_ip" {
+  description = "Private IP of the standalone Sentinel instance — this is the address the K3s node's Alertmanager should send webhooks to."
+  value       = var.enable_remote_sentinel ? aws_instance.sentinel[0].private_ip : null
+}
+
+output "sentinel_ssm_session_command" {
+  description = "Copy-paste command to open an administrative shell on the Sentinel instance."
+  value       = var.enable_remote_sentinel ? "aws ssm start-session --target ${aws_instance.sentinel[0].id} --region ${var.aws_region}" : null
+}
+
+output "sentinel_webhook_url" {
+  description = "URL the remote K3s cluster's Alertmanager should be configured with — reachable only from the K3s node's security group, not the public internet."
+  value       = var.enable_remote_sentinel ? "http://${aws_instance.sentinel[0].private_ip}:${var.sentinel_webhook_port}/api/alerts/webhook" : null
+}
+
+output "k3s_private_ip" {
+  description = "Private IP of the K3s node. Needed to construct the remote Kubernetes API server URL (https://<this>:6443) and confirm it matches what sentinel_remote.tf baked into the Sentinel instance's user_data."
+  value       = aws_instance.k3s.private_ip
+}

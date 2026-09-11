@@ -48,9 +48,13 @@ def escape_label_value(value: str) -> str:
 
 
 class LokiClient:
-    def __init__(self, base_url: str, timeout: float = 10.0) -> None:
+    def __init__(
+        self, base_url: str, timeout: float = 10.0, bearer_token: str | None = None
+    ) -> None:
+        # See PrometheusClient.__init__ for why this is optional.
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
 
     async def query_range(
         self,
@@ -79,7 +83,9 @@ class LokiClient:
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.get(
-                    f"{self.base_url}/loki/api/v1/query_range", params=params
+                    f"{self.base_url}/loki/api/v1/query_range",
+                    params=params,
+                    headers=self._headers,
                 )
             if resp.status_code != 200:
                 logger.warning(

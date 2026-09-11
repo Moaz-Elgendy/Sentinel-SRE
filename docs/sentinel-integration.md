@@ -16,18 +16,145 @@ something real to detect, diagnose and act on, rather than a metric fabricated f
 with its Kubernetes and Prometheus clients stubbed; it has never observed a real incident. Read
 this as a description of implemented behaviour, not verified behaviour.
 
+## Phase 1: external control plane (this refactor)
+
+Everything below this section describes the deployment topology as it existed before this
+refactor — Sentinel as a pod inside the same cluster as the workload, with no AWS access and one
+hardcoded set of connection strings. That is now one of three supported ways to run Sentinel, not
+the only one, and two specific claims further down are now qualified rather than universally true:
+"no AWS permissions of any kind" (see `app/clients/aws_client.py`, connector present but not yet
+wired into evidence collection) and the implicit assumption that connection info is process-global
+(it is now per-`Environment`; see below). Everything else on this page — the safety boundary, the
+policy engine, the RBAC reasoning, the loop diagram, the chaos-awareness logic — is unchanged and
+still accurate.
+
+**What changed, and why.** Before this refactor, `sentinel-ai/app/core/config.py` *was* the
+environment: one Prometheus URL, one Kubernetes ServiceAccount, hardcoded in-cluster Service DNS.
+Every lifecycle module reached process-global settings for connection info. That is fine for "one
+demo, one cluster, Sentinel deployed alongside it" but does not describe an external control plane
+that is meant to watch a *remote* cluster it is not deployed inside.
+
+The fix is `app/domain/environment.py`'s `Environment` model — customer id, connection config for
+Kubernetes/Prometheus/Loki/GitHub/AWS, and a lightweight application profile — plus wiring
+`lifecycle/orchestrator.py:build_context()` to construct its `SentinelContext` **from an
+`Environment`**, not from raw settings. Settings still supply policy thresholds, validation bounds
+and execution mode (`dry_run` etc.) — none of which are customer-specific in this phase — but every
+connector now gets its connection info from the registered `Environment`.
+
+```text
+BEFORE                              AFTER
+                                     Environment (Customer, connection config)
+Settings ──> SentinelContext              │
+                                           v
+                                     SentinelContext (built FROM the Environment)
+```
+
+**Kubernetes connectivity — the most important externalisation.** `KubernetesClient.initialise()`
+(`sentinel-ai/app/clients/kubernetes_client.py`) now supports three modes, selected by
+`KUBERNETES_MODE`:
+
+| Mode | What it does | When to use it |
+|---|---|---|
+| `in_cluster` (default) | The original behaviour: an in-cluster ServiceAccount. | Sentinel deployed inside the same cluster as the workload — unchanged from before this refactor. |
+| `kubeconfig` | Decodes a base64 kubeconfig YAML (`KUBERNETES_KUBECONFIG_B64`) via `load_kube_config_from_dict`. | Sentinel running as an external control plane against a remote K3s/K8s API server. **This is the mode that makes the architecture in the spec real.** |
+| `remote` | Explicit `KUBERNETES_API_SERVER` + `KUBERNETES_TOKEN` + `KUBERNETES_CA_CERT_B64`, built into a `Configuration` object. | Same as `kubeconfig`, for environments where handing over a full kubeconfig is undesirable — hand over a single scoped token instead. |
+
+Whichever mode is used, the credential should be scoped to exactly the Role in
+[`namespace-rbac.yaml`](../k8s/overlays/aws/sentinel/namespace-rbac.yaml) — see
+`REQUIRED_RBAC` at the bottom of `kubernetes_client.py`, kept in sync with that manifest by hand.
+`kubeconfig`/`remote` mode need no Kubernetes-side change at all: the *credential* changes (a token
+handed to Sentinel instead of a mounted ServiceAccount), not the RBAC Role it is scoped to.
+
+Prometheus and Loki gained an optional bearer-token header (`PrometheusClient`/`LokiClient`
+constructors) for the same reason: reached through an Ingress instead of an in-cluster `ClusterIP`
+Service, they may need auth Sentinel didn't previously send.
+
+**Multi-tenancy identifiers.** `Incident` now carries `customer_id` / `environment_id` /
+`application_id`, stamped by `routers/alerts.py` from `request.app.state.environment` right after
+`detection.build_incident()` creates the incident. Phase 1 registers and uses exactly one
+environment — see "Known limitations" below for what routing an inbound webhook to *one of several*
+environments would need, which is deliberately not built yet.
+
+**AI provider abstraction.** `rca.py`'s direct `openai.AsyncOpenAI` call moved to
+`app/reasoning/` — a `Reasoner` ABC (`base.py`) with `OpenAIReasoner` (unchanged behaviour, also
+serves Groq/OpenRouter via `OPENAI_BASE_URL`) and `GeminiReasoner` (plain REST over `httpx`, no new
+SDK dependency) implementations, selected by `LLM_PROVIDER` via `app/reasoning/factory.py`. The
+trust boundary this refactor deliberately did NOT touch: `rca.apply_llm_response()` still validates
+whatever a Reasoner returns against the rule engine's own conclusion before any of it is used, and
+a `Reasoner` still returns a raw string — never an action, never a capability.
+
+**Environment registration API** (`app/routers/environments.py`):
+
+```text
+POST /environments                       register (and, in Phase 1, activate) an environment
+GET  /environments                       list registered environments (redacted)
+GET  /environments/{id}                  get one (redacted)
+POST /environments/{id}/test-connection  probe each configured connector
+POST /environments/{id}/discover         list deployments/services/pod count in its namespace
+```
+
+Every response is redacted through `Environment.to_public_dict()` — no kubeconfig, token, or
+bearer/access key ever appears in an API response.
+
+### How to run Sentinel outside the cluster
+
+1. Get a scoped credential for the remote cluster: either a kubeconfig whose only permissions are
+   the `namespace-rbac.yaml` Role (`kubectl create token sentinel-ai -n citizen-portal
+   --duration=8760h` plus a kubeconfig pointing at it, or equivalent), or just that token plus the
+   cluster's CA cert.
+2. Set `KUBERNETES_MODE=kubeconfig` and `KUBERNETES_KUBECONFIG_B64=$(base64 -w0 kubeconfig.yaml)`
+   (or `KUBERNETES_MODE=remote` with `KUBERNETES_API_SERVER`/`KUBERNETES_TOKEN`/
+   `KUBERNETES_CA_CERT_B64`).
+3. Set `PROMETHEUS_URL`/`LOKI_URL` to however Sentinel reaches them from outside the cluster — an
+   Ingress hostname, a VPN address, an SSM-tunnelled port-forward — not the in-cluster DNS name.
+4. Run `sentinel-ai` anywhere with network access to that API server and those URLs (a laptop, a
+   separate EC2 instance, a different cluster entirely). `docker run` or `python -m uvicorn
+   app.main:app` both work — nothing in the image assumes it is inside the cluster it watches.
+5. Point the remote cluster's Alertmanager at Sentinel's `/api/alerts/webhook`, reachable however
+   step 4's network path allows.
+6. Confirm connectivity: `curl -X POST http://<sentinel-host>:8080/environments/demo-env/test-connection`
+   (or the id returned by `GET /environments` if you registered one explicitly via `POST
+   /environments` instead of relying on the env-var bootstrap).
+
+### How to register a remote environment via the API
+
+Rather than the env-var bootstrap (which seeds exactly one `Environment` from `CUSTOMER_ID`/
+`KUBERNETES_MODE`/etc. at startup if the store is empty), register one directly:
+
+```bash
+curl -X POST http://localhost:8080/environments -H 'Content-Type: application/json' -d '{
+  "name": "acme-prod",
+  "customer_id": "acme-corp",
+  "kubernetes": {"mode": "kubeconfig", "namespace": "citizen-portal", "kubeconfig_b64": "'"$(base64 -w0 kubeconfig.yaml)"'"},
+  "prometheus": {"url": "https://prometheus.acme.example.com"},
+  "loki": {"url": "https://loki.acme.example.com"},
+  "github": {"token": "ghp_...", "repository": "acme/citizen-portal"},
+  "application": {"id": "citizen-portal", "name": "Citizen Portal", "deployments": ["citizen-service", "notification-service", "frontend"]}
+}'
+```
+
+This immediately rebuilds Sentinel's active `SentinelContext` from the new environment — see the
+Phase 1 simplification noted in `routers/environments.py`'s module docstring: registering a second
+environment *replaces* the active one rather than running alongside it.
+
 ## Where Sentinel runs
 
-A single-replica FastAPI deployment on the K3s node, listening on `:8080`, receiving Alertmanager
-webhooks at `/api/alerts/webhook`. It is `ClusterIP`-only — not exposed publicly, reachable from a
-laptop only by port-forwarding through AWS Systems Manager Session Manager.
+A single-replica FastAPI deployment on the K3s node when deployed in-cluster (`KUBERNETES_MODE=
+in_cluster`, the AWS overlay's default), listening on `:8080`, receiving Alertmanager webhooks at
+`/api/alerts/webhook`. It is `ClusterIP`-only in that topology — not exposed publicly, reachable
+from a laptop only by port-forwarding through AWS Systems Manager Session Manager. Run externally
+instead (`kubeconfig`/`remote` mode — see "Phase 1: external control plane" above) and Sentinel can
+be anywhere with network access to the remote cluster's API server and observability stack; how it
+is exposed to that cluster's Alertmanager becomes a deployment-specific choice rather than this
+fixed shape.
 
 Its Kubernetes access is a dedicated ServiceAccount bound to a **namespaced `Role`** in
 [`k8s/overlays/aws/sentinel/namespace-rbac.yaml`](../k8s/overlays/aws/sentinel/namespace-rbac.yaml)
-— not a `ClusterRole`, and not `cluster-admin`. It has **no AWS permissions of any kind**: it runs
-as a pod with no IAM role, so it cannot reach ECR, EC2, or anything else in the account. There is
-no CloudWatch, no Amazon Managed Prometheus, and no IRSA anywhere in this design — the cluster is
-K3s on one EC2 instance, and every signal Sentinel reads comes from an in-cluster service.
+— not a `ClusterRole`, and not `cluster-admin`. When deployed this way (in-cluster), it has **no
+AWS permissions of any kind**: it runs as a pod with no IAM role, so it cannot reach ECR, EC2, or
+anything else in the account, and there is no CloudWatch, no Amazon Managed Prometheus, and no IRSA
+anywhere in this topology — see "Phase 1: external control plane" above for the AWS connector that
+exists for other deployment modes (not yet wired into evidence collection either way).
 
 Incident history is SQLite on a node-local volume, which is also why there is exactly one replica:
 deduplication is in-process, so a second replica would open its own incident for the same alert and
@@ -214,7 +341,10 @@ which is up but degraded.
 - **No Secrets access, specifically.** Sentinel has no reason to read application credentials, and
   not being able to means a confused or compromised agent cannot leak them into an incident report,
   a GitHub issue, or an LLM prompt. That last one is the real risk.
-- **No AWS credentials.** Sentinel is a pod with no IAM role.
+- **AWS credentials, when used at all, are least-privilege and read-only.** In-cluster deployment
+  mode uses none (pod with no IAM role). The optional `AWSClient` connector (EC2 + CloudWatch,
+  read-only, not yet wired into evidence collection) needs at most `ec2:DescribeInstances` +
+  `cloudwatch:GetMetricStatistics` — never write access to anything in the account.
 - **Actions are auditable in the cluster's own surface.** Every action emits a Kubernetes Event, so
   it appears in `kubectl get events` alongside everything else that happened. An autonomous agent
   that acts without leaving a trace where operators already look would be much harder to trust or
@@ -250,3 +380,106 @@ ever pointing it at a real, unplanned failure.
 
 That sequence has not been run. It is the single most important open item in the project; see
 [`../Phases.md`](../Phases.md)'s Phase 13 "What's missing" and `## What's next`.
+
+## This refactor's diff, in full
+
+**New files:**
+
+| File | Purpose |
+|---|---|
+| `sentinel-ai/app/domain/environment.py` | `Environment`/`Customer` model, connector configs, redaction |
+| `sentinel-ai/app/routers/environments.py` | `POST/GET /environments`, `test-connection`, `discover` |
+| `sentinel-ai/app/reasoning/base.py` | `Reasoner` ABC |
+| `sentinel-ai/app/reasoning/openai_reasoner.py` | Extracted, unchanged OpenAI-compatible implementation |
+| `sentinel-ai/app/reasoning/gemini_reasoner.py` | Gemini via plain REST (`httpx`), no new SDK |
+| `sentinel-ai/app/reasoning/factory.py` | Selects a `Reasoner` from `LLM_PROVIDER` |
+| `sentinel-ai/app/clients/aws_client.py` | EC2 + CloudWatch, read-only — **not yet wired into evidence collection**, see below |
+
+**Modified files:**
+
+| File | Change |
+|---|---|
+| `sentinel-ai/app/core/config.py` | `KUBERNETES_MODE`/kubeconfig/remote fields, `CUSTOMER_ID`/`ENVIRONMENT_ID`/`APPLICATION_ID`, `LLM_PROVIDER`+Gemini fields, Prometheus/Loki bearer tokens, AWS region/keys/instance-ids |
+| `sentinel-ai/app/clients/kubernetes_client.py` | `initialise()` supports `in_cluster`/`kubeconfig`/`remote`; added `list_deployments`/`list_services` for discovery; `services: get/list` added to `REQUIRED_RBAC` |
+| `sentinel-ai/app/clients/prometheus.py`, `loki.py` | Optional `bearer_token` constructor arg |
+| `sentinel-ai/app/lifecycle/rca.py` | `enrich_with_llm()` takes a `reasoner: Reasoner \| None` instead of `api_key`/`model`/`base_url` — `apply_llm_response()` (the trust boundary) is byte-for-byte unchanged |
+| `sentinel-ai/app/lifecycle/orchestrator.py` | `SentinelContext` gains `environment`/`reasoner` fields; `build_context()` takes an `Environment` and constructs every connector from it instead of raw settings |
+| `sentinel-ai/app/models/incident.py` | `customer_id`/`environment_id`/`application_id` fields + `to_dict()` |
+| `sentinel-ai/app/store/sqlite_store.py` | `environments` table + `upsert_environment`/`get_environment`/`list_environments` |
+| `sentinel-ai/app/routers/alerts.py` | Stamps `customer_id`/`environment_id`/`application_id` onto each new incident from `app.state.environment` |
+| `sentinel-ai/app/main.py` | Bootstraps the Phase-1 demo `Environment` from settings if the store is empty; registers `environments.router` |
+| `sentinel-ai/requirements.txt` | `boto3` (optional, only imported when `AWS_REGION` is set) |
+| `k8s/overlays/aws/secrets/sentinel.env.example` | Documents every new variable |
+| `k8s/overlays/aws/sentinel/namespace-rbac.yaml` | Clarifying comment: this Role is for `KUBERNETES_MODE=in_cluster` specifically, one of three supported modes now |
+
+**No database/schema migration was needed.** `incidents.body` and the new `environments.body` are
+both JSON blobs (see `sqlite_store.py`'s `CREATE TABLE` statements) — new fields on `Incident`/
+`Environment` just appear in newly-written rows; nothing had to be backfilled or altered.
+
+**Test status:** all 144 existing tests pass unmodified (`pytest -q` from `sentinel-ai/`). The
+refactor was additionally exercised by hand: booting the app end-to-end via `TestClient` (confirms
+the environment bootstrap, `build_context` wiring, and router registration all work together, not
+just in isolation), registering environments and confirming credential redaction in every response,
+and constructing `KubernetesClient` in both `kubeconfig` and `remote` mode against a synthetic
+kubeconfig/token — both build a client successfully and fail gracefully (returns `None`, logs a
+warning) against an unreachable server, matching the pre-refactor fail-soft contract. **None of
+this was run against a real remote K3s cluster** — no cluster was available in the environment this
+refactor was written in. That is the load-bearing gap before calling this demo-ready; see below.
+
+## Required credentials / access, by integration
+
+| Integration | What Sentinel needs | Where it's scoped |
+|---|---|---|
+| Kubernetes (remote) | A kubeconfig or bearer token bound to the `sentinel-ai` Role — pods/services/endpoints/configmaps/events (read), deployments/replicasets/statefulsets/daemonsets (read), pods/log (read), deployments + deployments/scale (patch/update), events (create) | `namespace-rbac.yaml`, namespaced `Role`, not `ClusterRole` |
+| Prometheus / Loki | Network reachability + optional bearer token if fronted by auth | Read-only HTTP; no write path exists in either client |
+| GitHub | Fine-grained token: `contents: read` + `issues: write` on exactly `GITHUB_REPOSITORY`, or classic `repo` scope | `GitHubClient` never calls a write endpoint other than `POST .../issues` |
+| AWS (optional, connector present, not yet wired) | If used: an IAM principal with `ec2:DescribeInstances` + `cloudwatch:GetMetricStatistics` only, or leave `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` empty and let boto3's default credential chain (env, shared config, instance/IRSA role) resolve it | `AWSClient` makes no other API calls |
+
+## Known limitations
+
+1. **Not run against a real remote cluster.** Every claim above about `kubeconfig`/`remote` mode is
+   verified structurally (the client builds successfully, fails gracefully against an unreachable
+   server) but not against a real K3s API server reached over a network. This is the next thing to
+   do before calling the external-control-plane demo credible.
+2. **Single active environment.** `POST /environments` replaces the active `SentinelContext`
+   rather than running several concurrently, and there is no logic to route an inbound Alertmanager
+   webhook to the *correct* one of several registered environments. Both are natural next steps —
+   the `Environment`/`Incident` identifiers already exist specifically so adding them later does not
+   require touching the `customer_id`/`environment_id`/`application_id` plumbing again — but neither
+   is built.
+3. **Policy Engine is still process-global, not environment-scoped.** `PolicyConfig` (allow-lists,
+   confidence thresholds, denied deployments) comes from `Settings`, the same for every environment.
+   Fine when there is one; wrong the moment two environments need different allow-lists. Deferred
+   until a second real environment exists to design the scoping against, rather than guessing at a
+   shape now.
+4. **AWS connector exists but is not wired into evidence collection.** `AWSClient` genuinely calls
+   EC2/CloudWatch and returns real data given credentials, but `lifecycle/investigation.py` does not
+   call it yet and the Evidence Package has no AWS field. Wiring it in is one new field + one guarded
+   call, matching every other collector's shape — deliberately deferred per the explicit
+   prioritisation ("do not let a full AWS integration delay the primary demo").
+5. **GitHub commit correlation is unchanged, not newly built.** It already existed before this
+   refactor (`GitHubClient.get_commit`, used in `correlation.py`) and continues to work exactly as
+   before — this refactor only changed *how the client is constructed* (from `environment.github`
+   instead of raw settings), not what it does.
+6. **Discovery is shallow, deliberately** (spec section 20's explicit instruction): namespace-scoped
+   deployments/services/pod-count only. No dependency graph, no traffic-pattern modelling, no
+   service-mesh topology.
+
+## Next steps toward replacing the external LLM with a standalone Sentinel model
+
+The seam is already in place: `Reasoner` is the only interface `rca.py` talks to, and every
+incident's evidence, diagnosis, action, policy decision, remediation result and validation result
+is already recorded in full (`IncidentMemory`/`sqlite_store.py`, unchanged by this refactor). The
+concrete next steps, in order:
+
+1. Let the incident dataset accumulate across real (or at minimum realistic chaos-scenario)
+   incidents — the JSON blob per incident is already close to a training example; `lifecycle/
+   learning.py` is the natural place to add an export that reshapes it into
+   `(evidence_package, diagnosis, action, outcome)` tuples.
+2. Add a `LocalSentinelReasoner(Reasoner)` in `app/reasoning/` once there is a model to call — same
+   `complete_json(system_prompt, user_prompt) -> str | None` contract as `OpenAIReasoner`/
+   `GeminiReasoner`, so `factory.py` gains one more branch and nothing else in the codebase changes.
+3. Fine-tune against the accumulated dataset once there is enough of it to be worth doing — the spec
+   is explicit that this was out of scope for the two-week prototype, and nothing in this refactor
+   tried to start it early.
+

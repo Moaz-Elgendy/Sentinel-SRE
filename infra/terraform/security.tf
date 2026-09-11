@@ -111,3 +111,61 @@ resource "aws_vpc_security_group_egress_rule" "all" {
     Name = "${var.project_name}-egress-all"
   }
 }
+
+# ---------------------------------------------------------------------------
+# External control plane: let ONLY the Sentinel instance reach the
+# Kubernetes API and the observability NodePorts. See sentinel_remote.tf.
+#
+# Both rules are sourced from the Sentinel security group specifically
+# (`referenced_security_group_id`), never a CIDR — so even though these
+# ports are now open at the security-group layer, nothing on the public
+# internet, and nothing else in the VPC, can reach them. Only traffic that
+# is actually coming from the Sentinel instance's own ENI is allowed.
+# Created only when var.enable_remote_sentinel is true; the K3s node's
+# exposure is completely unchanged otherwise.
+# ---------------------------------------------------------------------------
+
+resource "aws_vpc_security_group_ingress_rule" "k8s_api_from_sentinel" {
+  count = var.enable_remote_sentinel ? 1 : 0
+
+  security_group_id           = aws_security_group.k3s_node.id
+  description                 = "Kubernetes API, from the external Sentinel instance only"
+  referenced_security_group_id = aws_security_group.sentinel[0].id
+  from_port                   = 6443
+  to_port                     = 6443
+  ip_protocol                 = "tcp"
+
+  tags = {
+    Name = "${var.project_name}-ingress-k8s-api-from-sentinel"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "prometheus_from_sentinel" {
+  count = var.enable_remote_sentinel ? 1 : 0
+
+  security_group_id           = aws_security_group.k3s_node.id
+  description                 = "Prometheus NodePort, from the external Sentinel instance only"
+  referenced_security_group_id = aws_security_group.sentinel[0].id
+  from_port                   = var.prometheus_nodeport
+  to_port                     = var.prometheus_nodeport
+  ip_protocol                 = "tcp"
+
+  tags = {
+    Name = "${var.project_name}-ingress-prometheus-from-sentinel"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "loki_from_sentinel" {
+  count = var.enable_remote_sentinel ? 1 : 0
+
+  security_group_id           = aws_security_group.k3s_node.id
+  description                 = "Loki NodePort, from the external Sentinel instance only"
+  referenced_security_group_id = aws_security_group.sentinel[0].id
+  from_port                   = var.loki_nodeport
+  to_port                     = var.loki_nodeport
+  ip_protocol                 = "tcp"
+
+  tags = {
+    Name = "${var.project_name}-ingress-loki-from-sentinel"
+  }
+}

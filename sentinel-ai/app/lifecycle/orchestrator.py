@@ -42,6 +42,7 @@ from app.core.metrics import (
     sentinel_open_incidents,
     sentinel_validation_result_total,
 )
+from app.domain.environment import Environment
 from app.lifecycle import correlation, documentation, investigation, learning, rca
 from app.lifecycle.decision import DecisionEngine
 from app.lifecycle.policy import PolicyConfig, PolicyContext, PolicyEngine
@@ -72,13 +73,15 @@ MAX_LIFECYCLE_CYCLES = 5
 class SentinelContext:
     """Everything the orchestrator needs, injected.
 
-    Constructed once at app startup (main.py) and reused. Held as a dataclass
-    of interfaces rather than reaching for module-level singletons so that a
-    test can substitute a fake Prometheus, a fake Kubernetes client and a
-    no-op sleeper and drive the entire lifecycle offline.
+    Constructed once per registered Environment (main.py, Phase 1: exactly
+    one) and reused. Held as a dataclass of interfaces rather than reaching
+    for module-level singletons so that a test can substitute a fake
+    Prometheus, a fake Kubernetes client and a no-op sleeper and drive the
+    entire lifecycle offline.
     """
 
     settings: Any
+    environment: Environment
     store: SQLiteStore
     prom: PrometheusClient
     loki: LokiClient
@@ -86,25 +89,45 @@ class SentinelContext:
     chaos: ChaosClient
     github: GitHubClient
     slack: SlackClient
+    reasoner: Any  # app.reasoning.base.Reasoner | None
     policy: PolicyEngine
     remediation: RemediationEngine
     validator: RecoveryValidator
     decision: DecisionEngine
 
 
-def build_context(settings_obj: Any, store: SQLiteStore) -> SentinelContext:
-    """Wire the object graph. The layering is visible here on purpose.
+def build_context(
+    settings_obj: Any, store: SQLiteStore, environment: Environment
+) -> SentinelContext:
+    """Wire the object graph for ONE environment. The layering is visible
+    here on purpose.
 
     Read the constructor arguments top to bottom and you can see that the
     RemediationEngine gets the Kubernetes client and the allow-lists, the
     PolicyEngine gets only configuration, and neither of them is handed
     anything LLM-shaped. The LLM is reached from exactly one place —
     rca.enrich_with_llm — and it receives evidence, not capabilities.
+
+    Connection info (Kubernetes, Prometheus, Loki, GitHub) comes from
+    `environment`, not from `settings_obj` directly — that is the entire
+    "external control plane" refactor in one function. `settings_obj` still
+    supplies policy thresholds, validation bounds and execution mode
+    (dry_run etc), none of which are customer-specific in this phase. If
+    Sentinel is ever run against several environments concurrently, this
+    function is called once per environment and the resulting contexts are
+    kept in a dict keyed by environment id — nothing here assumes it is the
+    only one.
     """
     s = settings_obj
-    prom = PrometheusClient(s.prometheus_url)
-    loki = LokiClient(s.loki_url)
-    k8s = KubernetesClient()
+    prom = PrometheusClient(
+        environment.prometheus.url,
+        bearer_token=environment.prometheus.bearer_token,
+    )
+    loki = LokiClient(
+        environment.loki.url,
+        bearer_token=environment.loki.bearer_token,
+    )
+    k8s = KubernetesClient(connection=environment.kubernetes)
     k8s.initialise()
     chaos = ChaosClient(s.chaos_admin_token)
 
@@ -141,15 +164,21 @@ def build_context(settings_obj: Any, store: SQLiteStore) -> SentinelContext:
 
     decision = DecisionEngine(min_replicas=s.min_replicas, max_replicas=s.max_replicas)
 
+    from app.reasoning.factory import build_reasoner  # noqa: PLC0415 - avoid import cycle at module load
+
     return SentinelContext(
         settings=s,
+        environment=environment,
         store=store,
         prom=prom,
         loki=loki,
         k8s=k8s,
         chaos=chaos,
-        github=GitHubClient(s.github_token, s.github_repository),
+        github=GitHubClient(
+            environment.github.token or "", environment.github.repository or ""
+        ),
         slack=SlackClient(s.slack_webhook_url),
+        reasoner=build_reasoner(s),
         policy=policy,
         remediation=remediation_engine,
         validator=validator,
@@ -247,10 +276,7 @@ class Orchestrator:
                 incident,
                 evidence,
                 hypothesis,
-                api_key=self.ctx.settings.openai_api_key,
-                model=self.ctx.settings.openai_model,
-                timeout=self.ctx.settings.openai_timeout_seconds,
-                base_url=self.ctx.settings.openai_base_url,
+                reasoner=self.ctx.reasoner,
             )
             incident.hypothesis = hypothesis
             incident.record(
