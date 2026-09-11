@@ -73,6 +73,7 @@ class CorrelationFindings:
         self.current_revision: int | None = None
         self.revision_count: int = 0
         self.image_changed: bool = False
+        self.new_replicaset_unhealthy: bool = False
 
         # Symptom shape
         self.error_spike: bool = False
@@ -138,15 +139,51 @@ def correlate(
             f.recent_deployment_age_seconds = age
             f.recent_deployment = age <= correlation_window_minutes * 60
         if len(history) > 1:
-            f.previous_revision = history[1].get("revision")
+            previous = history[1]
+            f.previous_revision = previous.get("revision")
             newest_images = set(newest.get("images") or [])
-            previous_images = set(history[1].get("images") or [])
+            previous_images = set(previous.get("images") or [])
             # An image change is the strongest signal that a rollback would
             # actually change what is running. A revision bump with identical
             # images is usually a `rollout restart` (annotation-only change)
             # — possibly one Sentinel itself performed a minute ago, which is
             # exactly the case where rolling "back" achieves nothing.
             f.image_changed = bool(newest_images != previous_images)
+
+            # Deployment-level available/desired counts are the wrong signal
+            # for a stuck rollout: with the default RollingUpdate strategy
+            # (maxSurge/maxUnavailable both >=1), Kubernetes creates the new
+            # (surge) pod *before* removing the old one, so a single-replica
+            # Deployment can sit at "1 desired / 1 available" forever even
+            # though the new ReplicaSet it just created never becomes ready —
+            # the old ReplicaSet's still-healthy pod is quietly covering for
+            # it. `replicas_unavailable` cannot see this; it only compares
+            # the Deployment's aggregate counts.
+            #
+            # The ReplicaSet-level counts do not have this blind spot: the
+            # newest ReplicaSet's own ready_replicas vs its own desired
+            # replicas tells us directly whether *this* rollout is
+            # progressing, independent of whatever the previous ReplicaSet is
+            # doing. Requiring the previous ReplicaSet to still have a ready
+            # pod is what distinguishes "this rollout has stalled" from the
+            # ordinary few-second window every rollout passes through on the
+            # way to a healthy new ReplicaSet.
+            newest_desired = newest.get("replicas") or 0
+            newest_ready = newest.get("ready_replicas") or 0
+            previous_ready = previous.get("ready_replicas") or 0
+            f.new_replicaset_unhealthy = bool(
+                newest_desired > 0 and newest_ready < newest_desired and previous_ready > 0
+            )
+            if f.new_replicaset_unhealthy:
+                evidence.correlations.append(
+                    f"the newest ReplicaSet (revision {f.current_revision}) has "
+                    f"{newest_ready}/{newest_desired} ready pod(s) while the "
+                    f"previous ReplicaSet (revision {f.previous_revision}) still "
+                    f"has {previous_ready} ready pod(s) serving traffic — the "
+                    "rollout has stalled without the Deployment's aggregate "
+                    "available/desired counts ever showing it, because the old "
+                    "ReplicaSet is covering for the new one"
+                )
 
     # ---- symptom shape --------------------------------------------------
     if evidence.error_rate is not None and evidence.error_rate > error_rate_threshold:
@@ -317,7 +354,11 @@ def correlate(
     # follow a deploy, and rolling back would neither clear the fault nor be
     # honest about the cause.
     symptom_present = (
-        f.error_spike or f.latency_spike or f.crash_looping or f.replicas_unavailable
+        f.error_spike
+        or f.latency_spike
+        or f.crash_looping
+        or f.replicas_unavailable
+        or f.new_replicaset_unhealthy
     )
     chaos_present = (
         f.chaos_db_fault
@@ -357,6 +398,7 @@ def correlate(
             "error_spike": f.error_spike,
             "recent_deployment": f.recent_deployment,
             "deploy_correlates": f.deploy_correlates_with_onset,
+            "new_replicaset_unhealthy": f.new_replicaset_unhealthy,
             "chaos_active": bool(f.chaos_pods_affected),
         },
     )
