@@ -312,3 +312,74 @@ variable "create_github_oidc_provider" {
   type        = bool
   default     = true
 }
+
+# ---------------------------------------------------------------------------
+# External control plane: a second EC2 instance for Sentinel
+# ---------------------------------------------------------------------------
+# See infra/terraform/sentinel_remote.tf and
+# docs/sentinel-remote-validation-runbook.md. Off by default — the
+# single-instance topology (Sentinel deployed in-cluster via
+# k8s/overlays/aws/sentinel/) remains the default and is unaffected by any
+# of these variables when enable_remote_sentinel is false. This is
+# deliberately a second, separate instance rather than a change to the
+# existing one: it is the minimum addition that proves the external-control-
+# plane architecture without touching the working K3s node at all.
+
+variable "enable_remote_sentinel" {
+  description = <<-EOT
+    Whether to create a second EC2 instance running Sentinel OUTSIDE the K3s
+    cluster, plus the security-group rules that let it reach the K3s node's
+    Kubernetes API (6443) and the Prometheus/Loki NodePorts (30090/30100).
+    False by default: this is strictly additive infrastructure for
+    validating the external-control-plane architecture, not a replacement
+    for the in-cluster Sentinel Deployment, which keeps working either way.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "sentinel_instance_type" {
+  description = <<-EOT
+    Instance type for the standalone Sentinel EC2. Sentinel is a single
+    FastAPI process with no local database beyond SQLite and no in-process
+    LLM — it needs far less than the K3s node. t3.micro (or t3a.micro,
+    matching the K3s node's family choice) is enough; the same
+    region-availability caveat as var.instance_type applies.
+  EOT
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "sentinel_webhook_port" {
+  description = "Port Sentinel's FastAPI app listens on for the Alertmanager webhook and its own API (POST /environments etc)."
+  type        = number
+  default     = 8080
+}
+
+variable "sentinel_image_tag" {
+  description = <<-EOT
+    Tag of the sentinel-ai image in ECR to run on the standalone Sentinel
+    instance. Unlike the in-cluster Deployment (which CI updates via
+    `sentinel-deploy.sh images <sha>`), this instance is not managed by
+    kubectl, so there is no equivalent automatic mechanism yet — push the
+    image with this tag before applying, or override this variable to an
+    existing tag (`docker images` / `aws ecr list-images` on the registry
+    to see what is available). "latest" requires CI or a manual `docker
+    tag ... :latest && docker push` to exist as an actual tag; ECR does not
+    create it implicitly.
+  EOT
+  type        = string
+  default     = "latest"
+}
+
+variable "prometheus_nodeport" {
+  description = "NodePort Prometheus is exposed on for a remote Sentinel — must match k8s/overlays/aws/observability-nodeport.yaml's prometheus-nodeport Service."
+  type        = number
+  default     = 30090
+}
+
+variable "loki_nodeport" {
+  description = "NodePort Loki is exposed on for a remote Sentinel — must match k8s/overlays/aws/observability-nodeport.yaml's loki-nodeport Service."
+  type        = number
+  default     = 30100
+}

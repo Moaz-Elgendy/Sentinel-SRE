@@ -58,8 +58,9 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.core.config import settings
 from app.core.logging_config import configure_logging
+from app.domain.environment import Environment
 from app.lifecycle.orchestrator import Orchestrator, build_context
-from app.routers import alerts, health, incidents
+from app.routers import alerts, environments, health, incidents
 from app.store.sqlite_store import SQLiteStore
 
 configure_logging(service_name=settings.service_name)
@@ -78,11 +79,34 @@ async def lifespan(app: FastAPI):
     store = SQLiteStore(settings.sentinel_db_path)
     store.connect()
 
-    ctx = build_context(settings, store)
+    # Bootstrap the Phase-1 demo Environment if nothing has been registered
+    # yet (e.g. via POST /environments). This is what lets Sentinel keep
+    # booting with zero extra configuration straight from env vars, while
+    # everything downstream (SentinelContext, connectors) is built from an
+    # Environment record rather than global settings — see
+    # app/domain/environment.py's module docstring.
+    existing = store.list_environments()
+    if existing:
+        environment = Environment(**existing[0])
+        logger.info(
+            "environment_loaded_from_store",
+            extra={"environment_id": environment.id, "customer_id": environment.customer_id},
+        )
+    else:
+        environment = Environment.bootstrap_from_settings(settings)
+        store.upsert_environment(environment.to_dict())
+        logger.info(
+            "environment_bootstrapped_from_settings",
+            extra={"environment_id": environment.id, "customer_id": environment.customer_id,
+                   "kubernetes_mode": environment.kubernetes.mode},
+        )
+
+    ctx = build_context(settings, store, environment)
     orchestrator = Orchestrator(ctx)
 
     app.state.settings = settings
     app.state.store = store
+    app.state.environment = environment
     app.state.context = ctx
     app.state.orchestrator = orchestrator
     health.register_runtime(store=store, k8s=ctx.k8s)
@@ -92,24 +116,28 @@ async def lifespan(app: FastAPI):
         extra={
             "version": settings.version,
             "mode": "dry_run" if settings.dry_run else "autonomous",
+            "customer_id": environment.customer_id,
+            "environment_id": environment.id,
+            "kubernetes_mode": environment.kubernetes.mode,
             "kubernetes_available": ctx.k8s.available,
             "llm": "enabled" if settings.llm_enabled else "rule_based_only",
-            "openai_model": settings.openai_model if settings.llm_enabled else None,
+            "llm_provider": settings.llm_provider if settings.llm_enabled else None,
             "allowed_namespaces": settings.allowed_namespaces_list,
             "allowed_deployments": settings.allowed_deployments_list,
             "denied_deployments": list(settings.denied_deployments_frozen),
-            "github_issues": settings.github_enabled,
+            "github_issues": environment.github.is_enabled(),
             "slack_notifications": settings.slack_enabled,
             "chaos_control_plane": bool(settings.chaos_admin_token),
-            "prometheus_url": settings.prometheus_url,
-            "loki_url": settings.loki_url,
+            "prometheus_url": environment.prometheus.url,
+            "loki_url": environment.loki.url,
         },
     )
     if not settings.llm_enabled:
         logger.info(
             "llm_disabled",
             extra={
-                "detail": "OPENAI_API_KEY is not set. Root cause analysis will be "
+                "detail": "No LLM provider is configured (see LLM_PROVIDER / "
+                "OPENAI_API_KEY / GEMINI_API_KEY). Root cause analysis will be "
                 "entirely rule-based. This is a fully supported mode — the LLM only "
                 "ever enriches the narrative and adjusts confidence within a small "
                 "clamped range; it can never choose an action."
@@ -121,8 +149,9 @@ async def lifespan(app: FastAPI):
             extra={
                 "detail": "Sentinel cannot read Deployments or execute restart / "
                 "rollback / scale actions. Chaos-fault resets still work (plain "
-                "HTTP). Every other incident will escalate. Check the "
-                "ServiceAccount and RBAC Role.",
+                "HTTP). Every other incident will escalate. Check "
+                "KUBERNETES_MODE and the corresponding credentials, or the "
+                "ServiceAccount/RBAC Role if running in_cluster.",
                 "error_detail": ctx.k8s.init_error,
             },
         )
@@ -159,6 +188,7 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(alerts.router)
 app.include_router(incidents.router)
+app.include_router(environments.router)
 
 
 @app.get("/metrics")

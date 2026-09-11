@@ -19,6 +19,34 @@ Two deliberate design notes:
    Policy Engine (allow-lists + confidence thresholds + action caps +
    cooldowns) in app/lifecycle/policy.py. If you want a human in the loop, set
    DRY_RUN=true and read the incident record.
+
+### External control plane (Phase 1)
+
+Sentinel is designed to run OUTSIDE the Kubernetes cluster it watches. These
+settings are the bootstrap path only: at startup, if no environment has been
+registered yet (via ``POST /environments``), Sentinel constructs exactly one
+``Environment`` record from the fields below and registers it as the default
+demo environment — see ``app/domain/environment.py`` and
+``app/routers/environments.py``. Everything downstream of that (the
+Kubernetes/Prometheus/Loki/GitHub connectors, the evidence collector, the
+Decision/Policy/Remediation/Validation engines) is environment-scoped, not
+settings-scoped, so registering additional environments later does not
+require touching this file or any lifecycle module.
+
+``KUBERNETES_MODE`` selects how Sentinel reaches the cluster:
+
+* ``in_cluster`` (default) — the original behaviour: an in-cluster
+  ServiceAccount. Only valid when Sentinel is deployed inside the same
+  cluster as the workload. Kept as the default so existing deployments are
+  unaffected by this change.
+* ``kubeconfig`` — a base64-encoded kubeconfig YAML in
+  ``KUBERNETES_KUBECONFIG_B64``. This is the normal way to run Sentinel as an
+  external control plane against a remote K3s/K8s API server.
+* ``remote`` — explicit ``KUBERNETES_API_SERVER`` + ``KUBERNETES_TOKEN`` (a
+  long-lived ServiceAccount token, ideally scoped to the same minimal Role
+  documented in ``clients/kubernetes_client.py:REQUIRED_RBAC``) +
+  ``KUBERNETES_CA_CERT_B64``. Useful when a full kubeconfig is more than the
+  remote environment wants to hand over.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,10 +58,31 @@ class Settings(BaseSettings):
     service_name: str = "sentinel-ai"
     version: str = "0.1.0"
 
+    # ---- Multi-tenancy identity (Phase 1: exactly one customer/environment)
+    # These seed the single bootstrap Environment record. Not hardcoded as
+    # magic strings elsewhere — see app/domain/environment.py.
+    customer_id: str = "demo-customer"
+    environment_id: str = "demo-env"
+    environment_name: str = "citizen-portal-demo"
+    application_id: str = "citizen-portal"
+
+    # ---- Kubernetes remote connection (see module docstring) -------------
+    kubernetes_mode: str = "in_cluster"  # in_cluster | kubeconfig | remote
+    kubernetes_kubeconfig_b64: str = ""
+    kubernetes_api_server: str = ""
+    kubernetes_token: str = ""
+    kubernetes_ca_cert_b64: str = ""
+    kubernetes_verify_ssl: bool = True
+
     # ---- Observability backends -----------------------------------------
-    # In-cluster Service DNS. Sentinel only ever *reads* from these.
+    # Reachable remotely. Sentinel only ever *reads* from these. When
+    # Sentinel runs outside the cluster, these must resolve from wherever
+    # Sentinel is deployed (e.g. the K3s node's public/VPN IP with Traefik
+    # routing to the Service), not the in-cluster DNS name.
     prometheus_url: str = "http://prometheus:9090"
+    prometheus_bearer_token: str = ""
     loki_url: str = "http://loki:3100"
+    loki_bearer_token: str = ""
     alertmanager_url: str = "http://alertmanager:9093"
 
     # ---- Target services ------------------------------------------------
@@ -49,7 +98,17 @@ class Settings(BaseSettings):
     # means "bad token or chaos disabled", never "endpoint missing".
     chaos_admin_token: str = ""
 
-    # ---- LLM (optional) --------------------------------------------------
+    # ---- LLM / AI reasoning (optional) ------------------------------------
+    # `llm_provider` selects the Reasoner implementation (app/reasoning/) —
+    # business logic (rca.py) only ever talks to the `Reasoner` interface, so
+    # switching provider never touches lifecycle code, and a future
+    # `LocalSentinelReasoner` slots in the same way.
+    llm_provider: str = "openai"  # openai | gemini
+
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
+    gemini_timeout_seconds: float = 20.0
+
     # Empty key => rule-based RCA only. Everything still works; we log it and
     # record `llm_used=false` on the incident so post-hoc analysis is honest.
     openai_api_key: str = ""
@@ -70,6 +129,17 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_repository: str = ""  # "owner/repo"
     slack_webhook_url: str = ""
+
+    # ---- AWS (optional, EC2 + CloudWatch evidence only) -------------------
+    # Never hardcode keys. Empty values fall through to boto3's normal
+    # credential chain (env vars, shared config file, instance/IRSA role),
+    # which is the recommended path — these fields exist for the case where
+    # Sentinel runs somewhere that chain does not reach, e.g. a laptop
+    # pointed at a customer's AWS account via a scoped IAM user for the demo.
+    aws_region: str = ""
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_ec2_instance_ids: str = ""  # comma-separated; empty = skip EC2 evidence
 
     # ---- Policy: allow-lists --------------------------------------------
     # Comma-separated. Anything not on these lists cannot be touched, ever.
@@ -142,7 +212,20 @@ class Settings(BaseSettings):
         return [d.strip() for d in self.allowed_deployments.split(",") if d.strip()]
 
     @property
+    def aws_ec2_instance_ids_list(self) -> list[str]:
+        return [i.strip() for i in self.aws_ec2_instance_ids.split(",") if i.strip()]
+
+    @property
     def llm_enabled(self) -> bool:
+        """Whether the *configured* provider has what it needs to run.
+
+        Kept as one property (rather than provider-specific ones scattered
+        through the codebase) because everything outside app/reasoning/ only
+        needs the yes/no answer — see app/reasoning/factory.py for the
+        provider-specific check this delegates to.
+        """
+        if self.llm_provider == "gemini":
+            return bool(self.gemini_api_key.strip())
         return bool(self.openai_api_key.strip())
 
     @property
@@ -152,6 +235,12 @@ class Settings(BaseSettings):
     @property
     def slack_enabled(self) -> bool:
         return bool(self.slack_webhook_url.strip())
+
+    @property
+    def aws_enabled(self) -> bool:
+        # Region is the one thing boto3 cannot always infer; treat it as the
+        # signal that AWS evidence collection was deliberately configured.
+        return bool(self.aws_region.strip())
 
     def base_url_for(self, target: str) -> str | None:
         """Map a deployment name to its in-cluster base URL.

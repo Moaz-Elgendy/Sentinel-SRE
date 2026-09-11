@@ -95,9 +95,18 @@ def selector(
 
 
 class PrometheusClient:
-    def __init__(self, base_url: str, timeout: float = 10.0) -> None:
+    def __init__(
+        self, base_url: str, timeout: float = 10.0, bearer_token: str | None = None
+    ) -> None:
+        """`bearer_token` is optional and only needed when Sentinel reaches
+        this Prometheus through something that requires auth (e.g. an
+        ingress in front of a remote environment's Prometheus, rather than
+        an in-cluster ClusterIP Service). None/empty means no Authorization
+        header, matching the original in-cluster behaviour exactly.
+        """
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
 
     # ---- raw API --------------------------------------------------------
     async def query(self, promql: str) -> list[dict[str, Any]]:
@@ -122,7 +131,7 @@ class PrometheusClient:
         url = f"{self.base_url}{path}"
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(url, params=params)
+                resp = await client.get(url, params=params, headers=self._headers)
             if resp.status_code != 200:
                 logger.warning(
                     "prometheus_query_http_error",

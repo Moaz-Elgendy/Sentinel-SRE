@@ -549,6 +549,21 @@ class Incident:
     labels: dict[str, str] = field(default_factory=dict)
     annotations: dict[str, str] = field(default_factory=dict)
 
+    # Multi-tenancy identifiers (spec section 6). Stamped onto the incident
+    # by routers/alerts.py right after detection.build_incident() creates it
+    # — the webhook handler knows which Environment it is running against
+    # (Phase 1: the single registered one; see main.py). Optional here, not
+    # on the detection constructor itself, because build_incident() has no
+    # Environment to reach for and every existing detection test constructs
+    # an Incident without one. None means "pre-multi-tenancy incident" or
+    # "environment unknown". Note: policy.py's allow-lists are still
+    # process-global settings, NOT yet scoped per environment_id — that is a
+    # known limitation until a second environment exists to design/test the
+    # scoping against (see the integration doc's "Known limitations").
+    customer_id: str | None = None
+    environment_id: str | None = None
+    application_id: str | None = None
+
     status: IncidentStatus = IncidentStatus.OPEN
     phase: LifecyclePhase = LifecyclePhase.DETECTION
     created_at: float = field(default_factory=time.time)
@@ -617,6 +632,9 @@ class Incident:
             "description": self.description,
             "labels": self.labels,
             "annotations": self.annotations,
+            "customer_id": self.customer_id,
+            "environment_id": self.environment_id,
+            "application_id": self.application_id,
             "status": self.status.value,
             "phase": self.phase.value,
             "created_at": self.created_at,

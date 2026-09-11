@@ -42,6 +42,14 @@ resources:
   - sentinel/configmap.yaml
   - sentinel/deployment.yaml
   - sentinel/service.yaml
+  # Additive NodePort Services for Prometheus/Loki, so a remote/external
+  # Sentinel (see infra/terraform/sentinel_remote.tf) can reach them without
+  # exposing either publicly — the security group is what actually
+  # restricts access, this just makes the port reachable on the node at
+  # all. Deploying this does not remove or change the in-cluster Sentinel
+  # Deployment above; the two topologies can coexist, and only one is
+  # normally active (KUBERNETES_MODE on whichever Sentinel is running).
+  - observability-nodeport.yaml
 
 # ---------------------------------------------------------------------------
 # Images

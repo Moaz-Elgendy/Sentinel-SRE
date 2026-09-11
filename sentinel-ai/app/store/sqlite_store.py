@@ -67,6 +67,20 @@ CREATE TABLE IF NOT EXISTS action_outcomes (
     at            REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_lookup ON action_outcomes(root_cause, action);
+
+-- Registered remote environments (Phase 1: usually exactly one row). The
+-- full record — including connector secrets — is stored as JSON, same
+-- schema-lite reasoning as `incidents.body`. Secrets never leave this table
+-- via the API: app/domain/environment.py:Environment.to_public_dict() is the
+-- only thing routers/environments.py is allowed to return.
+CREATE TABLE IF NOT EXISTS environments (
+    id            TEXT PRIMARY KEY,
+    customer_id   TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    body          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_environments_customer ON environments(customer_id);
 """
 
 
@@ -277,3 +291,51 @@ class SQLiteStore:
             }
             for r in rows
         }
+
+    # ---- environments -----------------------------------------------------
+    def upsert_environment(self, record: dict[str, Any]) -> None:
+        """Insert or replace an environment by id.
+
+        `record` is the FULL environment dict (secrets included) from
+        `Environment.to_dict()` — never `to_public_dict()`. This is the one
+        place those secrets are allowed to be written to disk; guard the
+        caller, not this method.
+        """
+        conn = self._require()
+        row = (
+            record["id"],
+            record["customer_id"],
+            record["name"],
+            record.get("created_at", time.time()),
+            json.dumps(record, default=str),
+        )
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO environments (id, customer_id, name, created_at, body)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                    customer_id=excluded.customer_id,
+                    name=excluded.name,
+                    body=excluded.body
+                """,
+                row,
+            )
+            conn.commit()
+
+    def get_environment(self, environment_id: str) -> dict[str, Any] | None:
+        conn = self._require()
+        with self._lock:
+            cur = conn.execute(
+                "SELECT body FROM environments WHERE id = ?", (environment_id,)
+            )
+            row = cur.fetchone()
+        return json.loads(row["body"]) if row else None
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT body FROM environments ORDER BY created_at ASC"
+            ).fetchall()
+        return [json.loads(r["body"]) for r in rows]

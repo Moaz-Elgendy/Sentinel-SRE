@@ -1,0 +1,55 @@
+# AWS-overlay-only, additive NodePort Services alongside the existing
+# ClusterIP ones in k8s/base/monitoring/{prometheus,loki}/service.yaml.
+#
+# Why these exist at all: a remote/external Sentinel (KUBERNETES_MODE=
+# kubeconfig or remote — see docs/sentinel-integration.md) is not part of
+# the cluster's pod network, so a ClusterIP Service is unreachable to it no
+# matter what security group rule exists. NodePort is the smallest change
+# that makes Prometheus/Loki reachable from outside the cluster's pod
+# network while keeping them off the public internet — see
+# infra/terraform/sentinel_remote.tf's security group rules, which allow
+# these ports ONLY from the Sentinel EC2 instance's security group, never
+# from 0.0.0.0/0. This is exactly the "use security groups, do not expose
+# Prometheus/Loki publicly" instruction: NodePort opens a port on the node,
+# and the security group (not Kubernetes) is what decides who can reach it.
+#
+# Fixed nodePort values (not auto-assigned) so infra/terraform/sentinel_remote.tf
+# and this file cannot silently disagree about which port to open in the
+# security group.
+#
+# This changes nothing for the in-cluster (KUBERNETES_MODE=in_cluster)
+# topology — the original ClusterIP Services are untouched, this only adds
+# a second way to reach the same two Services.
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-nodeport
+  namespace: citizen-portal
+  labels:
+    app: prometheus
+    exposure: remote-sentinel
+spec:
+  type: NodePort
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+      nodePort: 30090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki-nodeport
+  namespace: citizen-portal
+  labels:
+    app: loki
+    exposure: remote-sentinel
+spec:
+  type: NodePort
+  selector:
+    app: loki
+  ports:
+    - port: 3100
+      targetPort: 3100
+      nodePort: 30100

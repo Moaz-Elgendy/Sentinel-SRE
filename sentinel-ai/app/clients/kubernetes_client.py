@@ -67,7 +67,18 @@ class KubernetesUnavailable(RuntimeError):
 
 
 class KubernetesClient:
-    def __init__(self) -> None:
+    def __init__(self, connection: Any = None) -> None:
+        """`connection` is an
+        `app.domain.environment.KubernetesConnectionConfig` (or None, which
+        means "in-cluster", preserving the original behaviour for any caller
+        that has not been migrated to the Environment model yet).
+
+        Not type-hinted directly against that class to avoid a
+        clients -> domain import for what is a one-field duck-typed read
+        (`connection.mode`); keeps this module's only hard dependency the
+        `kubernetes` package itself.
+        """
+        self._connection = connection
         self._apps: Any = None
         self._core: Any = None
         self._available = False
@@ -75,22 +86,46 @@ class KubernetesClient:
 
     # ---- lifecycle ------------------------------------------------------
     def initialise(self) -> bool:
-        """Load in-cluster config and build the API stubs.
+        """Load cluster config and build the API stubs.
+
+        Three modes, selected by `connection.mode` (default: in-cluster,
+        unchanged from the original implementation):
+
+        * ``in_cluster`` — the original behaviour. Only correct when Sentinel
+          runs inside the same cluster as the workload.
+        * ``kubeconfig`` — a base64-encoded kubeconfig YAML. This is how
+          Sentinel reaches a REMOTE K3s/K8s API server as an external
+          control plane; the token embedded in the kubeconfig should be
+          scoped to the minimal Role in REQUIRED_RBAC below, not
+          cluster-admin.
+        * ``remote`` — explicit API server URL + bearer token + CA cert,
+          for environments where handing over a full kubeconfig is
+          undesirable.
 
         Imports are inside the method so that the unit tests (and anyone
         running Sentinel on a laptop) can import this module without the
         `kubernetes` package or a ServiceAccount present. The lifecycle code
         injects a fake client in tests; nothing here is import-time coupled.
         """
+        conn = self._connection
+        mode = getattr(conn, "mode", "in_cluster")
         try:
             from kubernetes import client as k8s_client  # noqa: PLC0415
             from kubernetes import config as k8s_config  # noqa: PLC0415
 
-            k8s_config.load_incluster_config()
+            if conn is None or mode == "in_cluster":
+                k8s_config.load_incluster_config()
+            elif mode == "kubeconfig":
+                self._load_from_kubeconfig_b64(k8s_config, conn.kubeconfig_b64)
+            elif mode == "remote":
+                self._load_from_remote(k8s_client, conn)
+            else:
+                raise ValueError(f"unknown kubernetes connection mode {mode!r}")
+
             self._apps = k8s_client.AppsV1Api()
             self._core = k8s_client.CoreV1Api()
             self._available = True
-            logger.info("kubernetes_client_ready")
+            logger.info("kubernetes_client_ready", extra={"mode": mode})
         except Exception as exc:  # noqa: BLE001 - any failure means unavailable
             # Broad except on purpose: ImportError, ConfigException, and the
             # FileNotFoundError from a missing ServiceAccount token all mean
@@ -100,9 +135,57 @@ class KubernetesClient:
             self._init_error = str(exc)[:300]
             logger.warning(
                 "kubernetes_client_unavailable",
-                extra={"error_detail": self._init_error},
+                extra={"mode": mode, "error_detail": self._init_error},
             )
         return self._available
+
+    @staticmethod
+    def _load_from_kubeconfig_b64(k8s_config: Any, kubeconfig_b64: str | None) -> None:
+        import base64  # noqa: PLC0415
+
+        import yaml  # noqa: PLC0415 - transitive dep of `kubernetes`, no new package
+
+        if not kubeconfig_b64:
+            raise ValueError(
+                "kubernetes_mode=kubeconfig but no kubeconfig was configured "
+                "for this environment"
+            )
+        raw = base64.b64decode(kubeconfig_b64)
+        config_dict = yaml.safe_load(raw)
+        k8s_config.load_kube_config_from_dict(config_dict)
+
+    @staticmethod
+    def _load_from_remote(k8s_client: Any, conn: Any) -> None:
+        import base64  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        if not conn.api_server or not conn.token:
+            raise ValueError(
+                "kubernetes_mode=remote requires both an API server URL and a "
+                "bearer token"
+            )
+        configuration = k8s_client.Configuration()
+        configuration.host = conn.api_server
+        configuration.api_key = {"authorization": f"Bearer {conn.token}"}
+        if conn.ca_cert_b64:
+            ca_file = tempfile.NamedTemporaryFile(
+                mode="wb", suffix=".crt", delete=False
+            )
+            ca_file.write(base64.b64decode(conn.ca_cert_b64))
+            ca_file.close()
+            configuration.ssl_ca_cert = ca_file.name
+            configuration.verify_ssl = True
+        else:
+            # No CA supplied: only ever acceptable for a throwaway demo
+            # environment reached over a trusted network (e.g. a VPN-only
+            # K3s API server). Documented, not silently swallowed.
+            configuration.verify_ssl = conn.verify_ssl
+            if not conn.verify_ssl:
+                logger.warning(
+                    "kubernetes_tls_verification_disabled",
+                    extra={"api_server": conn.api_server},
+                )
+        k8s_client.Configuration.set_default(configuration)
 
     @property
     def available(self) -> bool:
@@ -356,6 +439,63 @@ class KubernetesClient:
         out.sort(key=lambda r: (r["revision"] is None, -(r["revision"] or 0)))
         return out
 
+    # ---- discovery (POST /environments/{id}/discover) -------------------
+    # Deliberately namespace-scoped, not cluster-scoped: discovery only lists
+    # within the namespace the environment was registered with, so it needs
+    # no RBAC beyond what REQUIRED_RBAC already grants plus services:list.
+    # See spec section 20 — "do not over-engineer it" is honoured by keeping
+    # this to names + replica counts, no dependency graph.
+    # RBAC: apps/deployments: list
+    async def list_deployments(self, namespace: str) -> list[dict[str, Any]]:
+        self._require()
+
+        def _call() -> Any:
+            return self._apps.list_namespaced_deployment(namespace=namespace)
+
+        try:
+            deployments = await asyncio.to_thread(_call)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "k8s_list_deployments_failed",
+                extra={"namespace": namespace, "error_detail": str(exc)[:300]},
+            )
+            return []
+        return [
+            {
+                "name": d.metadata.name,
+                "desired_replicas": d.spec.replicas,
+                "available_replicas": d.status.available_replicas or 0,
+                "images": [
+                    c.image for c in (d.spec.template.spec.containers or []) if c.image
+                ],
+            }
+            for d in deployments.items
+        ]
+
+    # RBAC: core/services: list
+    async def list_services(self, namespace: str) -> list[dict[str, Any]]:
+        self._require()
+
+        def _call() -> Any:
+            return self._core.list_namespaced_service(namespace=namespace)
+
+        try:
+            services = await asyncio.to_thread(_call)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "k8s_list_services_failed",
+                extra={"namespace": namespace, "error_detail": str(exc)[:300]},
+            )
+            return []
+        return [
+            {
+                "name": svc.metadata.name,
+                "cluster_ip": svc.spec.cluster_ip,
+                "ports": [p.port for p in (svc.spec.ports or [])],
+            }
+            for svc in services.items
+        ]
+
     # ---- writes (exactly three) -----------------------------------------
     # RBAC: apps/deployments: patch
     async def restart_deployment(self, namespace: str, name: str) -> dict[str, Any]:
@@ -550,6 +690,7 @@ def find_previous_revision(
 REQUIRED_RBAC: tuple[dict[str, Any], ...] = (
     {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]},
     {"apiGroups": [""], "resources": ["events"], "verbs": ["get", "list"]},
+    {"apiGroups": [""], "resources": ["services"], "verbs": ["get", "list"]},
     {"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get", "list", "patch"]},
     {"apiGroups": ["apps"], "resources": ["replicasets"], "verbs": ["get", "list"]},
 )
