@@ -690,3 +690,67 @@ jobs:
       # Phases.md Phase 11 for what to evaluate before adding scanning
       # back (pinning by commit SHA rather than tag, GitHub's own
       # Dependabot/code-scanning, Docker Scout, or Anchore Grype).
+
+  deploy-to-sentinel:
+    name: Deploy Sentinel to external EC2
+    needs: build-and-push-images
+    runs-on: ubuntu-latest
+    environment: aws-demo
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy Sentinel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "set -e",
+              "aws ecr get-login-password --region ${{ vars.AWS_REGION }} | docker login --username AWS --password-stdin 890608336467.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com",
+              "docker pull 890608336467.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/sentinel-sre-demo/sentinel-ai:latest",
+              "systemctl restart sentinel-ai",
+              "systemctl is-active --quiet sentinel-ai"
+            ]' \
+            --comment "Deploy Sentinel latest image" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          for i in {1..30}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
+              --query "Status" \
+              --output text)
+
+            echo "Status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                echo "Sentinel deployment succeeded."
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "Sentinel deployment failed."
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for Sentinel deployment."
+          exit 1

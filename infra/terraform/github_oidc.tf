@@ -167,6 +167,7 @@ data "aws_iam_policy_document" "github_actions" {
     ]
     resources = [
       aws_instance.k3s.arn,
+      aws_instance.sentinel[0].arn,
       "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}::document/AWS-RunShellScript",
     ]
   }
