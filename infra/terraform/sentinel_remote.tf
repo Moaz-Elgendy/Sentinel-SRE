@@ -330,7 +330,7 @@ resource "aws_instance" "sentinel" {
   }
 
   user_data                   = local.sentinel_user_data
-  user_data_replace_on_change = true
+  user_data_replace_on_change = false
 
   tags = {
     Name = "${var.project_name}-sentinel"
