@@ -278,3 +278,30 @@ def test_incidents_list_omits_heavy_fields_but_detail_includes_them(gui_client):
 
     detail = client.get(f"/api/incidents/{incident_id}", headers=headers).json()
     assert "evidence" in detail
+
+
+# ---------------------------------------------------------------------------
+# Real-time events (Phase B) — auth is via ?token=, not the Authorization
+# header, since the browser's native EventSource cannot set custom headers.
+# See routers/events.py's module docstring.
+# ---------------------------------------------------------------------------
+def test_events_stream_requires_a_token(gui_client):
+    client, _login = gui_client
+    resp = client.get("/api/events")
+    assert resp.status_code == 401
+
+
+def test_events_stream_rejects_a_garbage_token(gui_client):
+    client, _login = gui_client
+    resp = client.get("/api/events", params={"token": "not-a-real-jwt"})
+    assert resp.status_code == 401
+
+
+def test_events_stream_rejects_a_bearer_header_alone(gui_client):
+    """The Authorization header is not read by this endpoint at all — only
+    the ?token= query param is. This pins that down explicitly so a future
+    edit can't quietly make the two auth paths inconsistent."""
+    client, login = gui_client
+    headers = login(client)
+    resp = client.get("/api/events", headers=headers)
+    assert resp.status_code == 401

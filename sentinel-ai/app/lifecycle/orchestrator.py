@@ -94,10 +94,11 @@ class SentinelContext:
     remediation: RemediationEngine
     validator: RecoveryValidator
     decision: DecisionEngine
+    event_bus: Any = None  # app.core.events.EventBus, optional (see main.py)
 
 
 def build_context(
-    settings_obj: Any, store: SQLiteStore, environment: Environment
+    settings_obj: Any, store: SQLiteStore, environment: Environment, event_bus: Any = None
 ) -> SentinelContext:
     """Wire the object graph for ONE environment. The layering is visible
     here on purpose.
@@ -183,6 +184,7 @@ def build_context(
         remediation=remediation_engine,
         validator=validator,
         decision=decision,
+        event_bus=event_bus,
     )
 
 
@@ -203,6 +205,29 @@ class Orchestrator:
             sentinel_open_incidents.set(self.ctx.store.count_open())
         except Exception as exc:  # noqa: BLE001
             logger.error("incident_persist_failed", extra={"error_detail": str(exc)[:200]})
+            return
+
+        # GUI real-time hook (Phase B of the approved Sentinel GUI plan).
+        # This is a SIGNAL to re-fetch, not the state itself — see
+        # app/core/events.py and routers/events.py. It is deliberately the
+        # only orchestrator change Phase B makes: one publish call, right
+        # after the same persist that was already the lifecycle's real,
+        # audited checkpoint, so a dropped/never-opened GUI connection can
+        # never cause a different outcome than a connected one.
+        if self.ctx.event_bus is not None:
+            try:
+                self.ctx.event_bus.publish(
+                    {
+                        "type": "incident_updated",
+                        "incident_id": incident.id,
+                        "phase": incident.phase.value,
+                        "status": incident.status.value,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A GUI notification problem must never affect incident
+                # processing, which has already been safely persisted above.
+                logger.error("incident_event_publish_failed", extra={"error_detail": str(exc)[:200]})
 
     # -- the lifecycle ----------------------------------------------------
     async def run(self, incident: Incident) -> Incident:

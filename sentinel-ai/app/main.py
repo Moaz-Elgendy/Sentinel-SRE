@@ -71,6 +71,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.core.config import settings
+from app.core.events import EventBus
 from app.core.logging_config import configure_logging
 from app.core.security import hash_password
 from app.domain.environment import Environment
@@ -82,6 +83,7 @@ from app.routers import (
     chaos_scenarios,
     dashboard,
     environments,
+    events,
     health,
     incidents,
     meta,
@@ -127,7 +129,8 @@ async def lifespan(app: FastAPI):
                    "kubernetes_mode": environment.kubernetes.mode},
         )
 
-    ctx = build_context(settings, store, environment)
+    event_bus = EventBus()
+    ctx = build_context(settings, store, environment, event_bus=event_bus)
     orchestrator = Orchestrator(ctx)
 
     # ---- Sentinel SRE Control Center (GUI) admin auth bootstrap ----------
@@ -178,6 +181,7 @@ async def lifespan(app: FastAPI):
     app.state.environment = environment
     app.state.context = ctx
     app.state.orchestrator = orchestrator
+    app.state.event_bus = event_bus
     health.register_runtime(store=store, k8s=ctx.k8s)
 
     logger.info(
@@ -278,6 +282,7 @@ app.include_router(dashboard.router)
 app.include_router(actions.router)
 app.include_router(performance.router)
 app.include_router(meta.router)
+app.include_router(events.router)
 
 
 @app.get("/metrics")

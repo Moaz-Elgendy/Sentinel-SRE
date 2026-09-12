@@ -8,9 +8,9 @@ import EvidencePanel from '../components/incident/EvidencePanel.jsx'
 import LiveFlowDiagram from '../components/incident/LiveFlowDiagram.jsx'
 import ReasoningPanel from '../components/incident/ReasoningPanel.jsx'
 import { extractErrorMessage } from '../api/client.js'
-import { getIncident, openIncidentDocument } from '../api/incidents.js'
+import { openIncidentDocument } from '../api/incidents.js'
 import { getLifecyclePhases } from '../api/meta.js'
-import { usePolling } from '../hooks/usePolling.js'
+import { useLiveIncident } from '../hooks/useLiveIncident.js'
 import { formatTimestamp, titleCase } from '../utils/format.js'
 
 const TERMINAL_STATUSES = new Set(['resolved', 'escalated', 'auto_resolved'])
@@ -23,13 +23,9 @@ export default function IncidentDetailPage() {
     getLifecyclePhases().then(setPhaseMeta).catch(() => setPhaseMeta(null))
   }, [])
 
-  // Poll faster while the incident is still in progress — this is Phase A's
-  // "real-time" (see the approved GUI plan's Phase B for the SSE upgrade):
-  // every poll re-fetches the same real, already-persisted record, so a
-  // manual refresh always shows exactly what the next poll would have.
-  const { data: incident, error, loading } = usePolling(() => getIncident(incidentId), {
-    intervalMs: 2500,
-  })
+  // useLiveIncident (Phase B): instant re-fetch on a real SSE event for
+  // this incident, plus a slow fallback poll — see hooks/useLiveIncident.js.
+  const { incident, error, loading } = useLiveIncident(incidentId)
 
   if (loading) return <Spinner label="Loading incident…" />
   if (error) return <AlertBanner>{extractErrorMessage(error, 'Could not load this incident.')}</AlertBanner>
