@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: citizen-service
+  namespace: citizen-portal
+spec:
+  type: ClusterIP
+  selector:
+    app: citizen-service
+  ports:
+    - port: 8000
+      targetPort: 8000

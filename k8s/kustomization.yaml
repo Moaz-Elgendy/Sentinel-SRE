@@ -1,0 +1,30 @@
+# Local-development entrypoint.
+#
+# `kubectl apply -k k8s/` behaves exactly as it always has — this file
+# exists so that command, and the three scripts/deploy-*.sh that call it,
+# keep working unchanged now that the manifests live in k8s/base/.
+#
+# Why the manifests moved: the AWS overlay (k8s/overlays/aws/) needs to
+# reference them as a Kustomize base, and Kustomize refuses to let an
+# overlay point at a parent directory that contains it — it reports a cycle.
+# So a real base/ directory is required; there is no way to keep the
+# manifests at the k8s/ root and still have an overlay.
+#
+# What this means in practice:
+#
+#   local dev  ->  kubectl apply -k k8s/                (unchanged)
+#   AWS        ->  kubectl apply -k k8s/overlays/aws
+#
+# The base holds everything both environments share, configured for local
+# development: ingress-nginx, images tagged :latest from a local image
+# store. The two overlays differ in what they add on top —
+# overlays/local adds the committed demo Secrets; overlays/aws swaps in
+# Traefik, ECR images pinned by git SHA, Secrets injected at deploy time,
+# and Sentinel.
+#
+# Anything that should be true in BOTH environments belongs in base/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - overlays/local

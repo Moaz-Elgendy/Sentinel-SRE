@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: citizen-postgres
+  namespace: citizen-portal
+  labels:
+    app: citizen-postgres
+spec:
+  # Postgres is stateful and this Deployment is backed by a single
+  # ReadWriteOnce PVC — never scale this beyond 1 replica. (A StatefulSet
+  # would be the more correct primitive for multi-replica Postgres, but a
+  # single-replica Deployment + PVC is the simplest thing that works for
+  # this demo cluster and matches what docker-compose already runs.)
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: citizen-postgres
+  template:
+    metadata:
+      labels:
+        app: citizen-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: citizen-postgres-secret
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              # postgres refuses to initdb into a non-empty mount point
+              # that already has lost+found etc from some CSI drivers —
+              # subPath sidesteps that entirely.
+              subPath: pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "app_user", "-d", "citizen_portal"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "app_user", "-d", "citizen_portal"]
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: citizen-postgres-pvc

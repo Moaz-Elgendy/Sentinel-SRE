@@ -1,0 +1,152 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sentinel-data-pvc
+  namespace: citizen-portal
+  labels:
+    app: sentinel-ai
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      # Incident history is a SQLite file holding text: timelines, RCA
+      # narratives, evidence summaries. 1Gi is generous for it.
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-ai
+  namespace: citizen-portal
+  labels:
+    app: sentinel-ai
+spec:
+  # Exactly one replica, and this is a correctness requirement rather than a
+  # cost decision. Two Sentinels would both receive every Alertmanager
+  # webhook and could both decide to remediate the same incident —
+  # two concurrent rollbacks of the same Deployment, or one rolling back
+  # while the other restarts. Incident deduplication is in-process, and the
+  # incident store is a node-local SQLite file, so neither would coordinate.
+  #
+  # Making this safely horizontally scalable needs a shared store and a
+  # distributed lock on the remediation path. Out of scope, and noted as
+  # such in docs/sentinel-integration.md rather than left as a trap.
+  replicas: 1
+
+  # Sentinel is itself deployed from CI and is itself rollback-able.
+  revisionHistoryLimit: 5
+
+  strategy:
+    # Recreate, not RollingUpdate: the SQLite incident store is on a
+    # ReadWriteOnce PVC, and a rolling update would try to start the new pod
+    # while the old one still holds the volume. On a single node that
+    # actually succeeds in mounting, which is worse — two processes writing
+    # one SQLite file. Recreate accepts a few seconds of downtime instead.
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: sentinel-ai
+
+  template:
+    metadata:
+      labels:
+        app: sentinel-ai
+      annotations:
+        # Same annotation-based discovery every other scraped pod in this
+        # namespace uses (see k8s/base/monitoring/prometheus/configmap.yaml), so
+        # Sentinel's own metrics are collected with no extra config.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: sentinel-ai
+
+      imagePullSecrets:
+        - name: ecr-credentials
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+      containers:
+        - name: sentinel-ai
+          # Substituted by the overlay's `images:` transformer to the ECR
+          # repository and git SHA. The bare name here is what Kustomize
+          # matches on.
+          image: sentinel-ai
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+
+          envFrom:
+            - configMapRef:
+                name: sentinel-config
+            - secretRef:
+                name: sentinel-secret
+
+          volumeMounts:
+            - name: data
+              mountPath: /data
+
+          # /healthz is process-liveness only and never touches Prometheus,
+          # Loki or the Kubernetes API. That separation matters here more
+          # than usual: if Sentinel's liveness probe depended on Prometheus
+          # being reachable, then a Prometheus outage would restart Sentinel
+          # in a loop — taking out the thing that is supposed to be
+          # diagnosing the outage.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+
+          # /readyz does check the dependencies, because a Sentinel that
+          # cannot read metrics cannot do its job and should not be
+          # considered ready. It reports degraded-but-200 when the optional
+          # integrations (OpenAI, GitHub, Slack) are unconfigured, and
+          # non-200 only when Prometheus or the Kubernetes API are
+          # unreachable.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              # Deliberately more headroom than the app services get. An
+              # incident investigation fans out several concurrent PromQL
+              # and LogQL queries and holds the results in memory to
+              # correlate them, so Sentinel's peak usage is bursty and lands
+              # exactly when the node is already under stress from whatever
+              # caused the incident. Being OOMKilled at that moment is the
+              # worst possible time.
+              cpu: 500m
+              memory: 512Mi
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: sentinel-data-pvc

@@ -1,0 +1,756 @@
+# Phase 11 — CI/CD.
+#
+# What this does, on every push/PR:
+#   - Runs both backend test suites (SQLite-backed, no live Postgres needed —
+#     see citizen-service/tests/conftest.py and notification-service/tests/conftest.py)
+#   - Lints and builds the frontend
+#   - Validates every k8s manifest: YAML parses, all kustomization.yaml
+#     resource paths exist, AND (unlike the validation done in earlier
+#     phases, which had no cluster or kubectl available) a real
+#     `kubeconform` schema check against the actual Kubernetes API schemas —
+#     GitHub's runners have the network access this project's own sandbox
+#     never did, so this is the first real schema validation these
+#     manifests get.
+#
+# What this does, only on a push to main (not on PRs), and only after every
+# job above has passed:
+#   - Builds and pushes all four images to Amazon ECR, tagged with both
+#     `latest` and the commit SHA
+#   - Deploys to the K3s cluster on EC2
+#
+# What this does on a manual run (workflow_dispatch) — see "Phase 14" below.
+#
+# ---------------------------------------------------------------------------
+# Phase 13 — what changed and why
+# ---------------------------------------------------------------------------
+# This pipeline used to push to GHCR and deploy nowhere, because there was no
+# standing cluster. There is one now (one EC2 instance running K3s — see
+# infra/terraform/), so two things changed:
+#
+# REGISTRY: GHCR -> ECR.
+#   The node pulls images using its EC2 instance profile, which means no
+#   registry credential has to be stored in the cluster at all. Pulling from
+#   GHCR would need a long-lived personal access token living in a
+#   Kubernetes Secret, which is strictly worse.
+#
+# AUTHENTICATION: OIDC, no access keys.
+#   This workflow assumes an IAM role via GitHub's OIDC provider. There is no
+#   AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY anywhere — not in secrets, not
+#   in the repo. The role's trust policy is pinned to this repository and to
+#   the main branch (see infra/terraform/github_oidc.tf), and credentials
+#   expire with the job.
+#
+# DEPLOYMENT: via SSM, not kubectl.
+#   The Kubernetes API (:6443) is deliberately NOT reachable from the
+#   internet — there is no security-group rule for it. So CI does not connect
+#   to the cluster. It asks SSM to run a fixed script on the node, and the
+#   node talks to its own local API server. The IAM policy scopes
+#   ssm:SendCommand to that one instance and that one document.
+#
+#   The consequence worth naming: CI has no kubeconfig and cannot run
+#   arbitrary kubectl. It can only invoke /usr/local/bin/sentinel-deploy.sh,
+#   which is baked into the node at provisioning time and only knows how to
+#   set image tags or apply the AWS overlay. That is a deliberate reduction
+#   in what a compromised workflow could do.
+#
+# What this deliberately still does NOT do: gate on the deployment becoming
+# healthy. A bad deployment that fails its health checks is a scenario this
+# project exists to demonstrate — Sentinel is supposed to detect and roll it
+# back autonomously. Blocking CI until the rollout succeeds would mask
+# exactly the failure mode under test.
+#
+# ---------------------------------------------------------------------------
+# Phase 14 — manual smoke test (workflow_dispatch)
+# ---------------------------------------------------------------------------
+# Added a way to verify the OIDC role, ECR access, and the SSM path to the
+# node all still work, WITHOUT pushing to main and WITHOUT touching the
+# cluster or the real deploy tags. Trigger from the Actions tab.
+#
+# test_mode = connectivity-only (default): assumes the role, reads ECR,
+#   sends one harmless echo command to the node over SSM. No image is built,
+#   nothing is deployed. This is the one to run when you just want to know
+#   "is the pipeline's AWS wiring still good."
+#
+# test_mode = full-dry-run: also builds and pushes all four images, but
+#   tagged :manual-test-<run_id> — never :latest, never :<sha> — so it can
+#   never be picked up by a real deploy and never collides with a tag
+#   Sentinel might need to correlate or roll back to. Still does not deploy.
+#
+# This job is intentionally isolated from build-and-push-images and
+# deploy-to-k3s: it does not share their tags, does not run on push/PR, and
+# cannot trigger either of them. A manual run can never cause a real deploy.
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "connectivity-only = verify OIDC/ECR/SSM only. full-dry-run = also build+push images tagged manual-test-<run_id> (still no deploy)."
+        type: choice
+        options:
+          - connectivity-only
+          - full-dry-run
+        default: connectivity-only
+
+env:
+  # Non-secret. The account id is not sensitive, but it is also not needed
+  # here — the ECR registry hostname is derived at runtime from the STS
+  # identity the OIDC role gives us, so nothing hardcodes an account id.
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY_PREFIX: ${{ vars.ECR_REPOSITORY_PREFIX }}
+
+jobs:
+  test-citizen-service:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: citizen-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: citizen-service/requirements.txt
+      - run: pip install --break-system-packages -r requirements.txt
+      - run: python -m pytest -v
+        env:
+          # Tests run against an in-memory SQLite DB (see tests/conftest.py)
+          # — these values just need to be non-empty for Settings() to
+          # construct; they're never used to reach a real database.
+          DATABASE_PASSWORD: test
+          JWT_SECRET: test
+          CHAOS_ADMIN_TOKEN: test
+
+  test-notification-service:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: notification-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: notification-service/requirements.txt
+      - run: pip install --break-system-packages -r requirements.txt
+      - run: python -m pytest -v
+        env:
+          DATABASE_PASSWORD: test
+          CHAOS_ADMIN_TOKEN: test
+
+  # Sentinel's tests cover the policy engine, the remediation allow-list,
+  # the decision logic and recovery validation. Those are the parts that
+  # decide whether an autonomous agent is permitted to change a running
+  # cluster, so a regression there is the most consequential kind this
+  # repository can have — worth its own gating job.
+  #
+  # They run with no cluster and no network: the Kubernetes and Prometheus
+  # clients are injected as fakes.
+  test-sentinel-ai:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sentinel-ai
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: sentinel-ai/requirements.txt
+      - run: pip install --break-system-packages -r requirements.txt
+      - run: python -m pytest -v
+
+  lint-and-build-frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+        env:
+          # Matches k8s/README.md's "Image naming" note: the k8s-targeted
+          # frontend build uses a relative API base so the browser calls
+          # same-origin "/api/..." paths through the Ingress. This is NOT
+          # the same value docker-compose's frontend build uses locally
+          # (http://localhost:8000) — see that file for why.
+          VITE_API_BASE_URL: ""
+
+  validate-k8s-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Parse all YAML and check kustomization.yaml resource paths
+        run: |
+          python3 -c "
+          import yaml, glob, os, sys
+          files = sorted(glob.glob('k8s/**/*.yaml', recursive=True))
+          for f in files:
+              list(yaml.safe_load_all(open(f)))
+          print(f'{len(files)} k8s YAML files parse OK')
+
+          k = yaml.safe_load(open('k8s/kustomization.yaml'))
+          missing = [r for r in k['resources'] if not os.path.exists(f'k8s/{r}')]
+          if missing:
+              print('MISSING kustomization resources:', missing)
+              sys.exit(1)
+          print(f'All {len(k[\"resources\"])} kustomization resource paths exist')
+          "
+
+      - name: Cross-check ConfigMap/Secret/PVC/ServiceAccount references and Service selectors
+        run: |
+          python3 -c "
+          import yaml, glob, sys
+          from collections import defaultdict
+
+          all_names = defaultdict(dict)
+          refs = []
+
+          # Kustomize generators (secretGenerator/configMapGenerator) create
+          # Secrets/ConfigMaps that never appear as a literal kind: Secret /
+          # kind: ConfigMap document anywhere in the tree, so the scan below
+          # would never see them. Register their names up front from every
+          # kustomization.yaml instead of trying to render the generators
+          # themselves (that needs the gitignored secrets/*.env files, which
+          # deliberately do not exist in a fresh checkout).
+          for f in sorted(glob.glob('k8s/**/kustomization.yaml', recursive=True)):
+              kdoc = yaml.safe_load(open(f)) or {}
+              for gen_key, kind in (('secretGenerator', 'Secret'), ('configMapGenerator', 'ConfigMap')):
+                  for gen in kdoc.get(gen_key, []) or []:
+                      name = gen.get('name')
+                      if name:
+                          all_names[kind][name] = f
+
+          for f in sorted(glob.glob('k8s/**/*.yaml', recursive=True)):
+              for d in yaml.safe_load_all(open(f)):
+                  if not d: continue
+                  kind = d.get('kind')
+                  name = d.get('metadata', {}).get('name')
+                  all_names[kind][name] = f
+                  spec = d.get('spec', {})
+                  tmpl = spec.get('template', {}).get('spec', {}) if kind in ('Deployment', 'DaemonSet') else {}
+                  for c in tmpl.get('containers', []) + tmpl.get('initContainers', []):
+                      for ref in c.get('envFrom', []):
+                          if 'configMapRef' in ref: refs.append(('ConfigMap', ref['configMapRef']['name'], f))
+                          if 'secretRef' in ref: refs.append(('Secret', ref['secretRef']['name'], f))
+                  for v in tmpl.get('volumes', []):
+                      if 'persistentVolumeClaim' in v: refs.append(('PersistentVolumeClaim', v['persistentVolumeClaim']['claimName'], f))
+                      if 'configMap' in v: refs.append(('ConfigMap', v['configMap']['name'], f))
+                  sa = tmpl.get('serviceAccountName')
+                  if sa: refs.append(('ServiceAccount', sa, f))
+                  if kind == 'RoleBinding':
+                      for s in d.get('subjects', []):
+                          if s.get('kind') == 'ServiceAccount': refs.append(('ServiceAccount', s['name'], f))
+
+          ok = True
+          for kind, name, f in refs:
+              if name and name not in all_names.get(kind, {}):
+                  print(f'MISSING: {f} references {kind}/{name}')
+                  ok = False
+          if not ok: sys.exit(1)
+          print('All ConfigMap/Secret/PVC/ServiceAccount references resolve')
+
+          services = {}
+          for f in glob.glob('k8s/**/*.yaml', recursive=True):
+              for d in yaml.safe_load_all(open(f)):
+                  if not d or d.get('kind') != 'Service': continue
+                  name = d.get('metadata', {}).get('name')
+                  # Skip fragments with no name to key on (e.g. Kustomize
+                  # patches that target by label/kind selector rather than
+                  # by metadata.name, and so legitimately omit metadata).
+                  if not name: continue
+                  services[name] = d.get('spec', {}).get('selector', {})
+
+          pods = {}
+          for f in glob.glob('k8s/**/*.yaml', recursive=True):
+              for d in yaml.safe_load_all(open(f)):
+                  if not d or d.get('kind') not in ('Deployment', 'DaemonSet'): continue
+                  name = d.get('metadata', {}).get('name')
+                  if not name: continue
+                  labels = d.get('spec', {}).get('template', {}).get('metadata', {}).get('labels')
+                  # Same reasoning: a patch fragment may only touch
+                  # spec.replicas or similar and never mention pod labels
+                  # at all, which is not itself a mismatch to report.
+                  if labels: pods[name] = labels
+
+          for svc, sel in services.items():
+              labels = pods.get(svc)
+              if labels and not all(labels.get(k) == v for k, v in sel.items()):
+                  print(f'MISMATCH: Service/{svc} selector {sel} vs pod labels {labels}')
+                  sys.exit(1)
+          print('All Service selectors match their Deployment/DaemonSet pod labels')
+          "
+
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Render with Kustomize and validate against real Kubernetes schemas
+        run: |
+          # This is the first real schema validation these manifests get —
+          # every prior phase's "validation" was YAML-parses-and-references-
+          # resolve only, since no kubectl/cluster/internet access was
+          # available in the environment they were built in. kubeconform
+          # checks the rendered output against the actual Kubernetes API
+          # schemas (structure, required fields, types).
+          kubectl_version=$(curl -sL https://dl.k8s.io/release/stable.txt)
+
+          # Both environments are validated, not just local. The AWS overlay
+          # is the one that actually runs on a public IP, so it is the one
+          # where a schema error matters most — and it exercises code paths
+          # (patches, generators, the images transformer) the local build
+          # does not.
+          echo "--- local (k8s/) ---"
+          kubectl kustomize k8s/ | kubeconform -strict -summary \
+            -kubernetes-version "${kubectl_version#v}" \
+            -ignore-missing-schemas
+
+          # The AWS overlay's secretGenerator reads gitignored .env files
+          # that deliberately do not exist in a checkout. Materialise the
+          # committed .example templates so the overlay can be rendered.
+          # These are placeholder values used only to validate structure and
+          # are thrown away with the runner.
+          echo "--- aws overlay (k8s/overlays/aws) ---"
+          for f in k8s/overlays/aws/secrets/*.env.example; do
+            cp "$f" "${f%.example}"
+          done
+          kubectl kustomize k8s/overlays/aws | kubeconform -strict -summary \
+            -kubernetes-version "${kubectl_version#v}" \
+            -ignore-missing-schemas
+          rm -f k8s/overlays/aws/secrets/*.env
+
+      - name: Check no real secrets are committed
+        run: |
+          # The AWS overlay's secret files are gitignored, but gitignore only
+          # helps if nobody force-adds them. This fails the build if one ever
+          # gets tracked — a cheap check for an expensive mistake.
+          if git ls-files --error-unmatch 'k8s/overlays/aws/secrets/*.env' 2>/dev/null | grep -v '\.example$'; then
+            echo "ERROR: a real secret env file is tracked in git." >&2
+            exit 1
+          fi
+          echo "OK: no tracked secret env files."
+
+  # -------------------------------------------------------------------------
+  # Manual smoke test — see "Phase 14" note at the top of this file.
+  #
+  # Deliberately does NOT `need:` any of the test/lint/validate jobs above:
+  # it only exists to check AWS wiring, so there is no reason to wait on or
+  # be blocked by unrelated test failures. Only ever runs on a manual
+  # workflow_dispatch — push/PR events never touch this job.
+  #
+  # Bound to the same aws-demo Environment as deploy-to-k3s, so it picks up
+  # whatever protection rules (required reviewers, etc.) that Environment
+  # has — even though this job is read-only plus one harmless SSM echo.
+  # -------------------------------------------------------------------------
+  test-aws-connectivity:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: aws-demo
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-smoketest-${{ github.run_id }}
+
+      - name: Confirm the OIDC role assumption actually worked
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Confirm ECR read access
+        run: |
+          for svc in citizen-service notification-service frontend sentinel-ai; do
+            echo "--- ${ECR_REPOSITORY_PREFIX}/${svc} ---"
+            aws ecr describe-repositories \
+              --repository-names "${ECR_REPOSITORY_PREFIX}/${svc}" \
+              --query 'repositories[0].{Name:repositoryName,URI:repositoryUri}' \
+              --output table
+          done
+
+      - name: Confirm the SSM path to the node works (no kubectl, no deploy)
+        run: |
+          set -euo pipefail
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "CI connectivity smoke test (run ${GITHUB_RUN_ID})" \
+            --parameters commands="echo SSM connectivity OK: \$(date -Is)" \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM command: ${command_id}"
+
+          for _ in $(seq 1 20); do
+            status=$(aws ssm get-command-invocation \
+              --command-id "${command_id}" \
+              --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "${status}" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 3
+          done
+
+          echo "--- status: ${status} ---"
+          aws ssm get-command-invocation \
+            --command-id "${command_id}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query StandardOutputContent --output text
+
+          if [ "${status}" != "Success" ]; then
+            echo "SSM smoke test did not succeed (status: ${status})." >&2
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          echo "OIDC role assumption: OK"
+          echo "ECR read access: OK"
+          echo "SSM path to node: OK"
+          echo "Nothing was built, pushed, or deployed by this job."
+
+  # -------------------------------------------------------------------------
+  # Optional second half of the manual smoke test — only runs if the person
+  # triggering workflow_dispatch chose full-dry-run. Builds and pushes all
+  # four images, same as build-and-push-images below, but under a tag that
+  # can never be confused with a real deploy tag and is never deployed.
+  # -------------------------------------------------------------------------
+  test-build-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.test_mode == 'full-dry-run'
+    needs: test-aws-connectivity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - service: citizen-service
+            context: citizen-service
+            build_args: ""
+          - service: notification-service
+            context: notification-service
+            build_args: ""
+          - service: frontend
+            context: frontend
+            build_args: |
+              VITE_API_BASE_URL=
+          - service: sentinel-ai
+            context: sentinel-ai
+            build_args: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-dryrun-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push ${{ matrix.service }} (manual-test tag only)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          build-args: ${{ matrix.build_args }}
+          push: true
+          # manual-test-<run_id> only — never :latest, never :${{ github.sha }}.
+          # This can never be picked up by sentinel-deploy.sh, never
+          # overwrites a real tag, and never becomes something Sentinel has
+          # to correlate a rollback against.
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.service }}:manual-test-${{ github.run_id }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  build-and-push-images:
+    needs:
+      - test-citizen-service
+      - test-notification-service
+      - lint-and-build-frontend
+      - validate-k8s-manifests
+      - test-sentinel-ai
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # id-token: write is what lets the job request an OIDC token to trade
+      # for AWS credentials. Without it the configure-aws-credentials step
+      # fails. `packages: write` is gone — nothing is pushed to GHCR any more.
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - service: citizen-service
+            context: citizen-service
+            build_args: ""
+          - service: notification-service
+            context: notification-service
+            build_args: ""
+          - service: frontend
+            context: frontend
+            # See lint-and-build-frontend's comment on why this differs
+            # from docker-compose's local frontend build.
+            build_args: |
+              VITE_API_BASE_URL=
+          - service: sentinel-ai
+            context: sentinel-ai
+            build_args: ""
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          # An IAM role ARN is not a credential — it is an identifier, and
+          # useless without a valid OIDC token from this specific repository
+          # and branch. It is stored as a secret anyway, purely to avoid
+          # publishing the account id.
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-build-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          build-args: ${{ matrix.build_args }}
+          push: true
+          # Two tags, with different jobs:
+          #
+          #   :${{ github.sha }} is the one Kubernetes actually deploys. It
+          #   is immutable in practice, which is what makes a rollback to a
+          #   specific previous image meaningful and lets Sentinel trace a
+          #   running ReplicaSet back to a commit.
+          #
+          #   :latest is a human convenience for `docker pull` and is never
+          #   deployed. If ECR is switched to IMMUTABLE tags (see
+          #   infra/terraform/variables.tf) this line must be removed, or the
+          #   second push of `latest` will fail the build.
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.service }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/${{ matrix.service }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # -------------------------------------------------------------------------
+  # Deploy to the K3s node on EC2
+  #
+  # This is the job that keeps the Kubernetes API off the public internet.
+  # It never connects to :6443. It asks SSM to run a fixed script that
+  # already exists on the node, and the node talks to its own local API
+  # server over loopback.
+  #
+  # What the node runs is /usr/local/bin/sentinel-deploy.sh, baked in at
+  # provisioning time by infra/terraform/user_data.sh.tftpl. It accepts a
+  # mode and a git SHA and nothing else — so even a fully compromised
+  # workflow cannot run arbitrary commands on the node or arbitrary kubectl
+  # against the cluster. The IAM policy narrows it further:
+  # ssm:SendCommand is scoped to this one instance and the
+  # AWS-RunShellScript document only.
+  #
+  # `images` mode (kubectl set image) rather than `apply`:
+  #   A normal code deploy only changes image tags. Setting images produces a
+  #   clean new ReplicaSet, which is precisely what gives Sentinel rollout
+  #   history to correlate an incident against and a previous revision to
+  #   roll back to. A full `apply` is only needed when manifests changed, and
+  #   is left as a deliberate operator action over SSM — see
+  #   docs/aws-deployment.md.
+  # -------------------------------------------------------------------------
+  deploy-to-k3s:
+    needs: build-and-push-images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Bind this job to a GitHub Environment so a required reviewer can be
+    # added later without touching the workflow. Note this gates the
+    # *deployment*, not Sentinel — Sentinel's own remediation, including
+    # rollback, is autonomous and has no approval step anywhere.
+    environment: aws-demo
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Assume AWS role via OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: Trigger deploy on the node via SSM
+        id: send
+        run: |
+          set -euo pipefail
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}" \
+            --parameters commands="/usr/local/bin/sentinel-deploy.sh images ${GITHUB_SHA}" \
+            --query "Command.CommandId" --output text)
+
+          echo "command_id=${command_id}" >> "$GITHUB_OUTPUT"
+          echo "SSM command: ${command_id}"
+
+      - name: Wait for the command to finish and report output
+        run: |
+          set -euo pipefail
+          command_id="${{ steps.send.outputs.command_id }}"
+          instance="${{ secrets.EC2_INSTANCE_ID }}"
+
+          # Poll rather than `aws ssm wait`, so the node's stdout can be
+          # echoed into the workflow log. A deploy that "succeeded" with no
+          # visible output is not something to trust.
+          for _ in $(seq 1 60); do
+            status=$(aws ssm get-command-invocation \
+              --command-id "${command_id}" --instance-id "${instance}" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "${status}" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+
+          echo "--- status: ${status} ---"
+          echo "--- stdout ---"
+          aws ssm get-command-invocation --command-id "${command_id}" \
+            --instance-id "${instance}" \
+            --query StandardOutputContent --output text || true
+          echo "--- stderr ---"
+          aws ssm get-command-invocation --command-id "${command_id}" \
+            --instance-id "${instance}" \
+            --query StandardErrorContent --output text || true
+
+          if [ "${status}" != "Success" ]; then
+            echo "Deploy command did not succeed (status: ${status})." >&2
+            exit 1
+          fi
+
+      - name: Note what this job does and does not prove
+        run: |
+          cat <<'EOF'
+          The new image tags have been applied to the Deployments.
+
+          This does NOT assert the rollout became healthy, and that is
+          deliberate: a bad deployment is a scenario this project exists to
+          demonstrate. If this release is broken, Sentinel should detect it,
+          correlate it to this deployment, roll it back autonomously, and
+          validate the recovery — with no human approval.
+
+          Watch it happen:
+            aws ssm start-session --target <instance-id>
+            sudo kubectl -n citizen-portal logs -f deploy/sentinel-ai
+            sudo kubectl -n citizen-portal rollout history deploy/citizen-service
+          EOF
+
+      # NOTE: image vulnerability scanning was deliberately left out of
+      # this pipeline. The obvious choice, aquasecurity/trivy-action, was
+      # compromised twice in 2026: a full repository takeover in late
+      # February, and a credential-stealing supply-chain attack in March
+      # that affected every published tag from 0.0.1 through 0.34.2 —
+      # exfiltrating CI secrets (including this workflow's GITHUB_TOKEN)
+      # to an attacker-controlled domain. Newer tags exist post-incident,
+      # but wiring a secret-bearing CI job to a third-party Action with
+      # that specific history, on the strength of "the new tags are
+      # probably fine now," isn't a call worth making silently. See
+      # Phases.md Phase 11 for what to evaluate before adding scanning
+      # back (pinning by commit SHA rather than tag, GitHub's own
+      # Dependabot/code-scanning, Docker Scout, or Anchore Grype).
+
+  deploy-to-sentinel:
+    name: Deploy Sentinel to external EC2
+    needs: build-and-push-images
+    runs-on: ubuntu-latest
+    environment: aws-demo
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy Sentinel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "set -e",
+              "aws ecr get-login-password --region ${{ vars.AWS_REGION }} | docker login --username AWS --password-stdin 890608336467.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com",
+              "docker pull 890608336467.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/sentinel-sre-demo/sentinel-ai:latest",
+              "systemctl restart sentinel-ai",
+              "systemctl is-active --quiet sentinel-ai"
+            ]' \
+            --comment "Deploy Sentinel latest image" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          for i in {1..30}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
+              --query "Status" \
+              --output text)
+
+            echo "Status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                echo "Sentinel deployment succeeded."
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                echo "Sentinel deployment failed."
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          echo "Timed out waiting for Sentinel deployment."
+          exit 1

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Bootstrap for the STANDALONE external Sentinel instance. Installs Docker,
+# fetches this instance's two credential parameters (never Terraform-managed
+# — see sentinel_remote.tf's docstring), and runs the sentinel-ai container
+# with KUBERNETES_MODE=remote pointed at the K3s node's private IP.
+#
+# Progress logged to /var/log/sentinel-remote-bootstrap.log; success marker
+# at /var/lib/sentinel/remote-bootstrap-complete, mirroring the K3s node's
+# own bootstrap script so the operational pattern (SSM in, cat the marker,
+# tail the log) is identical for both instances.
+set -euo pipefail
+exec > >(tee -a /var/log/sentinel-remote-bootstrap.log) 2>&1
+echo "=== sentinel-remote bootstrap starting: $(date -Is) ==="
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y docker.io jq unzip curl
+systemctl enable --now docker
+
+echo "--- installing AWS CLI v2 ---"
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/aws /tmp/awscliv2.zip
+systemctl enable --now docker
+
+AWS_REGION="${aws_region}"
+ECR_REGISTRY="${ecr_registry}"
+IMAGE="$ECR_REGISTRY/${ecr_repo_prefix}/sentinel-ai:${image_tag}"
+
+echo "--- ECR login ---"
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+echo "--- pulling $IMAGE ---"
+docker pull "$IMAGE"
+
+echo "--- fetching credential parameters from SSM ---"
+K8S_TOKEN="$(aws ssm get-parameter --region "$AWS_REGION" \
+  --name '${token_param_name}' --with-decryption \
+  --query 'Parameter.Value' --output text)"
+
+K8S_CA_B64="$(aws ssm get-parameter --region "$AWS_REGION" \
+  --name '${ca_param_name}' --with-decryption \
+  --query 'Parameter.Value' --output text || echo "unset")"
+
+EXTRA_ENV="$(aws ssm get-parameter --region "$AWS_REGION" \
+  --name '${extra_env_param_name}' --with-decryption \
+  --query 'Parameter.Value' --output text || echo "")"
+
+if [ "$K8S_TOKEN" = "unset" ]; then
+  echo "WARNING: ${token_param_name} has not been populated yet."
+  echo "Sentinel will start but KUBERNETES_MODE=remote will fail to authenticate."
+  echo "See docs/sentinel-remote-validation-runbook.md to generate and set it, then:"
+  echo "  aws ssm start-session --target <this-instance-id> --region $AWS_REGION"
+  echo "  sudo systemctl restart sentinel-ai"
+fi
+
+VERIFY_SSL="true"
+if [ "$K8S_CA_B64" = "unset" ] || [ -z "$K8S_CA_B64" ]; then
+  echo "WARNING: no CA cert configured (${ca_param_name}); connecting with KUBERNETES_VERIFY_SSL=false."
+  echo "Acceptable only because this connection stays inside the VPC behind security groups (see sentinel_remote.tf)."
+  VERIFY_SSL="false"
+  K8S_CA_B64=""
+fi
+
+mkdir -p /var/lib/sentinel
+cat >/etc/sentinel-ai.env <<EOF
+# Generated at boot by sentinel_user_data.sh.tftpl — do not edit by hand,
+# edit the SSM parameters and re-run: sudo systemctl restart sentinel-ai
+KUBERNETES_MODE=remote
+KUBERNETES_API_SERVER=https://${k3s_private_ip}:6443
+KUBERNETES_TOKEN=$K8S_TOKEN
+KUBERNETES_CA_CERT_B64=$K8S_CA_B64
+KUBERNETES_VERIFY_SSL=$VERIFY_SSL
+
+PROMETHEUS_URL=http://${k3s_private_ip}:${prometheus_port}
+LOKI_URL=http://${k3s_private_ip}:${loki_port}
+
+CUSTOMER_ID=demo-customer
+ENVIRONMENT_ID=demo-env-remote
+ENVIRONMENT_NAME=citizen-portal-remote-demo
+APPLICATION_ID=citizen-portal
+AWS_REGION=$AWS_REGION
+CHAOS_SCENARIO_RUNNER_INSTANCE_ID=${k3s_instance_id}
+CHAOS_SCENARIO_RUNNER_WORKDIR=/opt/sentinel-sre
+
+SENTINEL_DB_PATH=/var/lib/sentinel/sentinel.db
+EOF
+# Extra optional vars (OPENAI_API_KEY etc), appended verbatim, comment
+# lines and blanks passed through harmlessly.
+echo "$EXTRA_ENV" >>/etc/sentinel-ai.env
+chmod 0600 /etc/sentinel-ai.env
+
+cat >/etc/systemd/system/sentinel-ai.service <<UNIT
+[Unit]
+Description=Sentinel AI — external control plane
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f sentinel-ai
+ExecStart=/usr/bin/docker run --rm --name sentinel-ai \\
+  --env-file /etc/sentinel-ai.env \\
+  -p ${webhook_port}:8080 \\
+  -v /var/lib/sentinel:/var/lib/sentinel \\
+  $IMAGE
+ExecStop=/usr/bin/docker stop sentinel-ai
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now sentinel-ai
+
+cat >/var/lib/sentinel/remote-bootstrap-complete <<EOF
+bootstrapped_at=$(date -Is)
+image=$IMAGE
+k3s_private_ip=${k3s_private_ip}
+EOF
+echo "=== sentinel-remote bootstrap complete: $(date -Is) ==="
+echo "Check status: sudo systemctl status sentinel-ai"
+echo "Check logs:   sudo journalctl -u sentinel-ai -f"
+echo "Test API:     curl -s http://localhost:${webhook_port}/readyz"

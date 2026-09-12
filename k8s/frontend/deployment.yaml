@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: citizen-portal
+  labels:
+    app: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          # IMPORTANT: Vite bakes VITE_API_BASE_URL into the JS bundle at
+          # *build* time (see frontend/Dockerfile), it can't be changed by
+          # a Kubernetes env var at runtime. Build this image with
+          # `--build-arg VITE_API_BASE_URL=""` so the bundle calls
+          # relative paths like `/api/auth/login` against whatever host
+          # served the page — which is exactly what k8s/ingress/ingress.yaml
+          # routes to citizen-service. See k8s/README.md for the full
+          # build command.
+          image: frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi

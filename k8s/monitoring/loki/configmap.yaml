@@ -1,0 +1,48 @@
+# Single-binary Loki (all components in one process), filesystem storage
+# on an emptyDir — logs don't survive a pod restart. Fine for a local demo
+# cluster; move to object storage (or at minimum a PVC) before relying on
+# this for real retention. This mirrors the same ephemeral-storage
+# trade-off already made for Prometheus (see monitoring/prometheus/
+# deployment.yaml) and is standard for a first observability pass.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: citizen-portal
+data:
+  loki-config.yaml: |
+    auth_enabled: false
+
+    server:
+      http_listen_port: 3100
+
+    common:
+      path_prefix: /loki
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+
+    ruler:
+      alertmanager_url: http://alertmanager:9093
+
+    limits_config:
+      # Demo-scale limits, deliberately generous — this is a small project
+      # with a handful of pods, not a real multi-tenant deployment.
+      retention_period: 168h
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h

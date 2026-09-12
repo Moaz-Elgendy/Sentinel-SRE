@@ -1,0 +1,39 @@
+# Requires an nginx-ingress controller in the cluster (Phase 8 setup, e.g.
+# `minikube addons enable ingress` or the ingress-nginx Helm chart on kind).
+#
+# Routes both the frontend and citizen-service's API under one host, so
+# the browser can call relative "/api/..." paths (see frontend/Dockerfile
+# and k8s/frontend/deployment.yaml) without hitting cross-origin/CORS
+# issues at all — same-origin request, one hostname, one port.
+#
+# notification-service is intentionally NOT exposed here — it's only
+# ever called server-to-server by citizen-service (see
+# citizen-service/app/core/notifications.py), never directly by the
+# browser, so it stays ClusterIP-only with no Ingress rule.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: citizen-portal-ingress
+  namespace: citizen-portal
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: citizen-portal.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: citizen-service
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000

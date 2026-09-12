@@ -1,0 +1,82 @@
+# Grafana Alloy config (River syntax), NOT Promtail — Promtail is
+# deprecated (its functionality merged into Alloy), so this project uses
+# Alloy from the start rather than building on a dead-end tool. See
+# Phases.md Phase 9 for the full note.
+#
+# Uses loki.source.kubernetes (Kubernetes API-based tailing), not
+# loki.source.file + hostPath log mounts — simpler and avoids needing
+# privileged host access, at the cost of slightly more API server load
+# than file-based tailing. Fine at this project's scale.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: citizen-portal
+data:
+  config.alloy: |
+    logging {
+      level  = "info"
+      format = "logfmt"
+    }
+
+    discovery.kubernetes "pods" {
+      role = "pod"
+      namespaces {
+        names = ["citizen-portal"]
+      }
+    }
+
+    discovery.relabel "pods" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      // citizen-service / notification-service / frontend / *-postgres
+      // matches the "app" label every Deployment in k8s/ already sets.
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app"]
+        target_label  = "app"
+      }
+    }
+
+    loki.source.kubernetes "pods" {
+      targets    = discovery.relabel.pods.output
+      forward_to = [loki.process.pods.receiver]
+    }
+
+    loki.process "pods" {
+      forward_to = [loki.write.default.receiver]
+
+      // citizen-service and notification-service emit structured JSON logs.
+      // Parse them so level and request_id become queryable Loki labels.
+      // Postgres/frontend logs are not JSON; a failed parse is a no-op.
+      stage.json {
+        expressions = {
+          level      = "level",
+          request_id = "request_id",
+          service    = "service",
+        }
+      }
+      stage.labels {
+        values = {
+          level      = "level",
+          request_id = "request_id",
+        }
+      }
+    }
+
+    loki.write "default" {
+      endpoint {
+        url = "http://loki:3100/loki/api/v1/push"
+      }
+    }
