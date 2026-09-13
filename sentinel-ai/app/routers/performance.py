@@ -4,17 +4,15 @@ Sentinel performance/learning stats for the Sentinel SRE Control Center GUI.
   GET /api/performance/summary
 
 Every number here is computed from `incidents.body` (already the audited
-record — see orchestrator.py's `_persist`) at request time. Nothing is
-fabricated or hard-coded, and where Phase A genuinely cannot derive a
-requested metric honestly, the field is returned as `null` with an
-`unavailable_reason` rather than a made-up value. Two fields fall in that
-category right now:
+record — see orchestrator.py's `_persist`) and, since Phase C, from the
+`incident_feedback` table (see routers/feedback.py) at request time. Nothing
+is fabricated or hard-coded, and where a requested metric genuinely cannot
+be derived honestly, the field is returned as `null` with an
+`unavailable_reason` rather than a made-up value. Two fields still fall in
+that category:
 
-* `diagnosis_accuracy` / `incorrect_diagnoses` need the SRE feedback loop
-  (`POST /api/incidents/{id}/feedback/diagnosis`), which is Phase C of the
-  approved GUI plan and does not exist yet.
 * `temporary_overrides` needs the temporary-authorization mechanism, which
-  is Phase D and touches app/lifecycle/policy.py — also not built yet.
+  is Phase D and touches app/lifecycle/policy.py — not built yet.
 * `avg_time_to_detection_seconds` is left `null` with an explanation rather
   than a misleading number: Sentinel is alerted by Alertmanager (push, not
   poll), so its own DETECTION timeline event fires essentially the instant
@@ -22,6 +20,14 @@ category right now:
   Sentinel to measure. What Alertmanager took to notice and fire the alert
   is a property of the alerting rules, not of Sentinel, and is not in this
   service's data at all.
+
+`diagnosis_accuracy`/`incorrect_diagnoses` use, per incident, only the MOST
+RECENT diagnosis feedback row — feedback is append-only (an SRE can submit
+more than once as an incident is re-investigated or a judgment is revised),
+and counting every historical round would let one incident's back-and-forth
+outweigh a single clean judgment on another. This is purely a reporting
+aggregate: nothing here feeds back into Sentinel's own diagnosis behavior —
+see feedback.py's module docstring.
 
 `remediation_success_rate` and `avg_time_to_remediation_seconds` are
 computed across executed attempts (`AttemptRecord.result is not None`), not
@@ -45,10 +51,23 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _latest_feedback_per_incident(feedback_rows: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for row in feedback_rows:
+        if row.get("kind") != kind:
+            continue
+        incident_id = row["incident_id"]
+        existing = latest.get(incident_id)
+        if existing is None or row["created_at"] > existing["created_at"]:
+            latest[incident_id] = row
+    return list(latest.values())
+
+
 @router.get("/summary")
 def performance_summary(request: Request) -> dict[str, Any]:
     store = request.app.state.store
     incidents = store.list_all_incidents_for_analytics()
+    feedback_rows = store.list_all_feedback_for_analytics()
 
     terminal = {
         IncidentStatus.RESOLVED.value,
@@ -90,18 +109,36 @@ def performance_summary(request: Request) -> dict[str, Any]:
         len(validated) / len(executed_attempts) if executed_attempts else None
     )
 
-    return {
+    diagnosis_judgments = _latest_feedback_per_incident(feedback_rows, "diagnosis")
+    diagnosis_accuracy = (
+        sum(1 for row in diagnosis_judgments if row["correct_or_useful"]) / len(diagnosis_judgments)
+        if diagnosis_judgments
+        else None
+    )
+    incorrect_diagnoses = (
+        sum(1 for row in diagnosis_judgments if not row["correct_or_useful"])
+        if diagnosis_judgments
+        else None
+    )
+
+    remediation_judgments = _latest_feedback_per_incident(feedback_rows, "remediation")
+    remediation_feedback_useful_rate = (
+        sum(1 for row in remediation_judgments if row["correct_or_useful"]) / len(remediation_judgments)
+        if remediation_judgments
+        else None
+    )
+
+    result: dict[str, Any] = {
         "sample_size": {
             "total_incidents": total,
             "executed_attempts": len(executed_attempts),
+            "diagnosis_feedback_count": len(diagnosis_judgments),
+            "remediation_feedback_count": len(remediation_judgments),
         },
-        "diagnosis_accuracy": None,
-        "incorrect_diagnoses": None,
-        "diagnosis_feedback_unavailable_reason": (
-            "no diagnosis feedback recorded yet (feedback endpoints are a later "
-            "implementation phase)"
-        ),
+        "diagnosis_accuracy": diagnosis_accuracy,
+        "incorrect_diagnoses": incorrect_diagnoses,
         "remediation_success_rate": remediation_success_rate,
+        "remediation_feedback_useful_rate": remediation_feedback_useful_rate,
         "autonomous_resolutions": len(autonomous_resolutions),
         "escalations": len(escalated),
         "temporary_overrides": None,
@@ -116,3 +153,6 @@ def performance_summary(request: Request) -> dict[str, Any]:
         ),
         "avg_time_to_remediation_seconds": _mean(time_to_first_remediation),
     }
+    if diagnosis_accuracy is None:
+        result["diagnosis_feedback_unavailable_reason"] = "no diagnosis feedback recorded yet"
+    return result

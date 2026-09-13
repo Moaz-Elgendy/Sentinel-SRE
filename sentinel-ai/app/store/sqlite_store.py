@@ -95,6 +95,26 @@ CREATE TABLE IF NOT EXISTS admins (
     created_at      REAL NOT NULL,
     last_login_at   REAL
 );
+
+-- SRE feedback on a diagnosis or a remediation (GUI spec sections 5/6).
+-- Append-only on purpose: a re-opened or re-investigated incident can
+-- collect more than one round of feedback over time, and each round is
+-- evidence for the "Sentinel Performance" page (routers/performance.py) —
+-- overwriting would destroy that history. This is data collection for a
+-- FUTURE evaluation/improvement step, not a live retraining signal; nothing
+-- in Sentinel reads this table to change its own behavior.
+CREATE TABLE IF NOT EXISTS incident_feedback (
+    id                  TEXT PRIMARY KEY,
+    incident_id         TEXT NOT NULL,
+    kind                TEXT NOT NULL,   -- 'diagnosis' | 'remediation'
+    correct_or_useful   INTEGER NOT NULL,
+    corrected_value     TEXT,            -- a RootCause or RemediationAction value
+    note                TEXT,
+    admin_id            TEXT NOT NULL,
+    created_at          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_incident ON incident_feedback(incident_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_kind ON incident_feedback(kind);
 """
 
 
@@ -420,3 +440,56 @@ class SQLiteStore:
                 "SELECT body FROM incidents ORDER BY created_at DESC"
             ).fetchall()
         return [json.loads(r["body"]) for r in rows]
+
+    # ---- incident feedback (Sentinel SRE Control Center GUI) --------------
+    def create_feedback(
+        self,
+        feedback_id: str,
+        incident_id: str,
+        kind: str,
+        correct_or_useful: bool,
+        corrected_value: str | None,
+        note: str | None,
+        admin_id: str,
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO incident_feedback
+                    (id, incident_id, kind, correct_or_useful, corrected_value, note, admin_id, created_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    feedback_id,
+                    incident_id,
+                    kind,
+                    1 if correct_or_useful else 0,
+                    corrected_value,
+                    note,
+                    admin_id,
+                    time.time(),
+                ),
+            )
+            conn.commit()
+
+    def list_feedback_for_incident(self, incident_id: str) -> list[dict[str, Any]]:
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM incident_feedback WHERE incident_id = ? ORDER BY created_at ASC",
+                (incident_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_all_feedback_for_analytics(self) -> list[dict[str, Any]]:
+        """Every feedback row, unpaginated — same reasoning as
+        `list_all_incidents_for_analytics`: only read by
+        routers/performance.py to compute an aggregate, never returned
+        directly as an API response."""
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM incident_feedback ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]

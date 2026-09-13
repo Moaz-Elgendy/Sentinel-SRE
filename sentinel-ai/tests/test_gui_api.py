@@ -281,6 +281,147 @@ def test_incidents_list_omits_heavy_fields_but_detail_includes_them(gui_client):
 
 
 # ---------------------------------------------------------------------------
+# Diagnosis / remediation feedback (Phase C)
+# ---------------------------------------------------------------------------
+def test_feedback_endpoints_require_auth(gui_client):
+    client, _login = gui_client
+    assert client.post("/api/incidents/INC-x/feedback/diagnosis", json={"correct": True}).status_code == 403
+    assert client.post("/api/incidents/INC-x/feedback/remediation", json={"useful": True}).status_code == 403
+    assert client.get("/api/incidents/INC-x/feedback").status_code == 403
+
+
+def test_feedback_on_a_nonexistent_incident_is_404(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post(
+        "/api/incidents/does-not-exist/feedback/diagnosis",
+        json={"correct": True},
+        headers=headers,
+    )
+    assert resp.status_code == 404
+
+
+def test_diagnosis_feedback_yes_does_not_require_a_correction(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    incident_id = _fire_alert(client, fingerprint="fb-fp-1")
+    _wait_for_terminal(client, headers, incident_id)
+
+    resp = client.post(
+        f"/api/incidents/{incident_id}/feedback/diagnosis",
+        json={"correct": True, "note": "matches what we saw"},
+        headers=headers,
+    )
+    assert resp.status_code == 201
+
+    listed = client.get(f"/api/incidents/{incident_id}/feedback", headers=headers).json()
+    assert len(listed["feedback"]) == 1
+    row = listed["feedback"][0]
+    assert row["kind"] == "diagnosis"
+    assert row["correct_or_useful"] is True
+    assert row["corrected_value"] is None
+    assert row["note"] == "matches what we saw"
+
+
+def test_diagnosis_feedback_no_requires_a_correction_from_the_real_enum(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    incident_id = _fire_alert(client, fingerprint="fb-fp-2")
+    _wait_for_terminal(client, headers, incident_id)
+
+    # Missing the required correction on a "no" answer.
+    resp = client.post(
+        f"/api/incidents/{incident_id}/feedback/diagnosis",
+        json={"correct": False},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+    # A value Sentinel's own RootCause enum does not contain is rejected by
+    # request validation, before it ever reaches the store.
+    resp = client.post(
+        f"/api/incidents/{incident_id}/feedback/diagnosis",
+        json={"correct": False, "actual_root_cause": "not_a_real_root_cause"},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        f"/api/incidents/{incident_id}/feedback/diagnosis",
+        json={"correct": False, "actual_root_cause": "database_failure"},
+        headers=headers,
+    )
+    assert resp.status_code == 201
+
+    row = client.get(f"/api/incidents/{incident_id}/feedback", headers=headers).json()["feedback"][0]
+    assert row["correct_or_useful"] is False
+    assert row["corrected_value"] == "database_failure"
+
+
+def test_remediation_feedback_no_requires_a_suggested_action(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    incident_id = _fire_alert(client, fingerprint="fb-fp-3")
+    _wait_for_terminal(client, headers, incident_id)
+
+    resp = client.post(
+        f"/api/incidents/{incident_id}/feedback/remediation",
+        json={"useful": False},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        f"/api/incidents/{incident_id}/feedback/remediation",
+        json={"useful": False, "suggested_action": "rollback_deployment", "note": "should have rolled back"},
+        headers=headers,
+    )
+    assert resp.status_code == 201
+
+    row = client.get(f"/api/incidents/{incident_id}/feedback", headers=headers).json()["feedback"][0]
+    assert row["kind"] == "remediation"
+    assert row["corrected_value"] == "rollback_deployment"
+
+
+def test_feedback_is_append_only_and_performance_uses_only_the_latest_per_incident(gui_client):
+    """Two rounds of diagnosis feedback on the same incident (a revised SRE
+    judgment) must both be stored, but performance/summary must only count
+    the most recent one — see performance.py's module docstring."""
+    client, login = gui_client
+    headers = login(client)
+    incident_id = _fire_alert(client, fingerprint="fb-fp-4")
+    _wait_for_terminal(client, headers, incident_id)
+
+    client.post(
+        f"/api/incidents/{incident_id}/feedback/diagnosis",
+        json={"correct": False, "actual_root_cause": "cpu_saturation"},
+        headers=headers,
+    )
+    client.post(
+        f"/api/incidents/{incident_id}/feedback/diagnosis",
+        json={"correct": True, "note": "actually it was right after all"},
+        headers=headers,
+    )
+
+    feedback = client.get(f"/api/incidents/{incident_id}/feedback", headers=headers).json()["feedback"]
+    assert len(feedback) == 2  # both rounds kept — append-only
+
+    perf = client.get("/api/performance/summary", headers=headers).json()
+    # Only the latest ("correct": true) round should count.
+    assert perf["diagnosis_accuracy"] == 1.0
+    assert perf["incorrect_diagnoses"] == 0
+    assert perf["sample_size"]["diagnosis_feedback_count"] == 1
+
+
+def test_performance_diagnosis_accuracy_is_null_with_no_feedback(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    perf = client.get("/api/performance/summary", headers=headers).json()
+    assert perf["diagnosis_accuracy"] is None
+    assert perf["diagnosis_feedback_unavailable_reason"] == "no diagnosis feedback recorded yet"
+
+
+# ---------------------------------------------------------------------------
 # Real-time events (Phase B) — auth is via ?token=, not the Authorization
 # header, since the browser's native EventSource cannot set custom headers.
 # See routers/events.py's module docstring.

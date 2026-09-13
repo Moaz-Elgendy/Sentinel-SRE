@@ -52,10 +52,15 @@ first real incident with DRY_RUN=true and read the logged patch bodies.
 
 ### Sentinel SRE Control Center (GUI)
 
-`app/routers/{auth,dashboard,actions,performance,meta}.py` back the GUI
-described in docs/sentinel-integration.md. They are strictly read-only views
-over the same `store`/`context` this module already builds — none of them
-call the Kubernetes client, the Policy Engine, or the Remediation Engine.
+`app/routers/{auth,dashboard,actions,performance,meta,feedback}.py` back the
+GUI described in docs/sentinel-integration.md. `feedback.py` writes to its
+own `incident_feedback` table only — it never touches an incident's own
+record, the policy engine, or the decision engine, so a diagnosis or
+remediation feedback submission cannot change Sentinel's behavior toward
+this or any future incident (see that router's module docstring). The rest
+are strictly read-only views over the same `store`/`context` this module
+already builds — none of them call the Kubernetes client, the Policy
+Engine, or the Remediation Engine.
 `incidents` and `environments` are now gated behind the same admin JWT
 (see app/core/deps.py) since both expose operationally sensitive detail;
 `alerts` (the Alertmanager webhook) and `chaos_scenarios` (its own
@@ -84,6 +89,7 @@ from app.routers import (
     dashboard,
     environments,
     events,
+    feedback,
     health,
     incidents,
     meta,
@@ -276,6 +282,7 @@ app.include_router(health.router)
 app.include_router(alerts.router)
 app.include_router(auth.router)
 app.include_router(incidents.router)
+app.include_router(feedback.router)
 app.include_router(environments.router)
 app.include_router(chaos_scenarios.router)
 app.include_router(dashboard.router)

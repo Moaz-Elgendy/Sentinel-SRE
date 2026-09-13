@@ -1055,3 +1055,34 @@ input[type='email'] {
 .demo-run-status {
   font-size: 13px;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Feedback forms (Phase C)                                               */
+/* ---------------------------------------------------------------------- */
+.feedback-history {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.feedback-history__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+}
+
+.feedback-form__answer {
+  display: flex;
+  gap: 10px;
+  margin: 10px 0 14px;
+}
+
+.feedback-form__note {
+  width: 100%;
+  font-family: inherit;
+  resize: vertical;
+}
