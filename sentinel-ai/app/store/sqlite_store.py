@@ -81,6 +81,62 @@ CREATE TABLE IF NOT EXISTS environments (
     body          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_environments_customer ON environments(customer_id);
+
+-- Sentinel SRE Control Center admins. Separate identity space from
+-- citizen-service's `citizens` table (different database entirely) and from
+-- CHAOS_ADMIN_TOKEN (a single shared secret, not a per-person account) — see
+-- app/core/config.py's module notes on the GUI auth settings. `password_hash`
+-- is bcrypt via passlib, never plaintext, never logged.
+CREATE TABLE IF NOT EXISTS admins (
+    id              TEXT PRIMARY KEY,
+    username        TEXT NOT NULL UNIQUE,
+    password_hash   TEXT NOT NULL,
+    role            TEXT NOT NULL DEFAULT 'sre_admin',
+    created_at      REAL NOT NULL,
+    last_login_at   REAL
+);
+
+-- SRE feedback on a diagnosis or a remediation (GUI spec sections 5/6).
+-- Append-only on purpose: a re-opened or re-investigated incident can
+-- collect more than one round of feedback over time, and each round is
+-- evidence for the "Sentinel Performance" page (routers/performance.py) —
+-- overwriting would destroy that history. This is data collection for a
+-- FUTURE evaluation/improvement step, not a live retraining signal; nothing
+-- in Sentinel reads this table to change its own behavior.
+CREATE TABLE IF NOT EXISTS incident_feedback (
+    id                  TEXT PRIMARY KEY,
+    incident_id         TEXT NOT NULL,
+    kind                TEXT NOT NULL,   -- 'diagnosis' | 'remediation'
+    correct_or_useful   INTEGER NOT NULL,
+    corrected_value     TEXT,            -- a RootCause or RemediationAction value
+    note                TEXT,
+    admin_id            TEXT NOT NULL,
+    created_at          REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_incident ON incident_feedback(incident_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_kind ON incident_feedback(kind);
+
+-- Temporary SRE authorization (GUI spec section 7 / approved plan Phase D).
+-- Single-use and scoped to exactly one (incident_id, action) pair, with a
+-- short TTL — see routers/authorizations.py for how it is created and
+-- lifecycle/policy.py's `human_override` parameter for the ONE check it is
+-- allowed to satisfy (confidence). `permanent_policy_changed` is always 0
+-- and is stored explicitly (not just implied) so the audit row states the
+-- guarantee in the data itself, not only in code comments: granting this
+-- never edits PolicyConfig's thresholds.
+CREATE TABLE IF NOT EXISTS temporary_authorizations (
+    id                      TEXT PRIMARY KEY,
+    incident_id             TEXT NOT NULL,
+    action                  TEXT NOT NULL,
+    params_json             TEXT NOT NULL,
+    granted_by              TEXT NOT NULL,
+    granted_at              REAL NOT NULL,
+    expires_at              REAL NOT NULL,
+    consumed_at             REAL,
+    consumed_result         TEXT,
+    permanent_policy_changed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_authz_incident ON temporary_authorizations(incident_id);
 """
 
 
@@ -339,3 +395,192 @@ class SQLiteStore:
                 "SELECT body FROM environments ORDER BY created_at ASC"
             ).fetchall()
         return [json.loads(r["body"]) for r in rows]
+
+    # ---- admins (Sentinel SRE Control Center auth) -----------------------
+    def count_admins(self) -> int:
+        """Used at startup to decide whether to bootstrap the first admin."""
+        conn = self._require()
+        with self._lock:
+            row = conn.execute("SELECT COUNT(*) AS n FROM admins").fetchone()
+        return int(row["n"]) if row else 0
+
+    def create_admin(
+        self, admin_id: str, username: str, password_hash: str, role: str = "sre_admin"
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO admins (id, username, password_hash, role, created_at)
+                VALUES (?,?,?,?,?)
+                """,
+                (admin_id, username, password_hash, role, time.time()),
+            )
+            conn.commit()
+
+    def get_admin_by_username(self, username: str) -> dict[str, Any] | None:
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                "SELECT * FROM admins WHERE username = ?", (username,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_admin_by_id(self, admin_id: str) -> dict[str, Any] | None:
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                "SELECT * FROM admins WHERE id = ?", (admin_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def touch_admin_login(self, admin_id: str) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                "UPDATE admins SET last_login_at = ? WHERE id = ?",
+                (time.time(), admin_id),
+            )
+            conn.commit()
+
+    # ---- analytics (Sentinel SRE Control Center GUI) ----------------------
+    def list_all_incidents_for_analytics(self) -> list[dict[str, Any]]:
+        """Every incident, full body, no pagination.
+
+        Used only by read-only aggregate endpoints (dashboard/actions/
+        performance) that need to scan the whole history — never exposed
+        directly as an API response. `GET /api/incidents` (routers/
+        incidents.py) remains the paginated, list-trimmed endpoint for
+        browsing; this exists so the GUI's summary views don't need to page
+        through everything themselves to compute a count or an average.
+        Sentinel's demo/prototype scale (hundreds, not millions, of
+        incidents) makes an unpaginated scan fine; revisit if that changes.
+        """
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT body FROM incidents ORDER BY created_at DESC"
+            ).fetchall()
+        return [json.loads(r["body"]) for r in rows]
+
+    # ---- incident feedback (Sentinel SRE Control Center GUI) --------------
+    def create_feedback(
+        self,
+        feedback_id: str,
+        incident_id: str,
+        kind: str,
+        correct_or_useful: bool,
+        corrected_value: str | None,
+        note: str | None,
+        admin_id: str,
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO incident_feedback
+                    (id, incident_id, kind, correct_or_useful, corrected_value, note, admin_id, created_at)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    feedback_id,
+                    incident_id,
+                    kind,
+                    1 if correct_or_useful else 0,
+                    corrected_value,
+                    note,
+                    admin_id,
+                    time.time(),
+                ),
+            )
+            conn.commit()
+
+    def list_feedback_for_incident(self, incident_id: str) -> list[dict[str, Any]]:
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM incident_feedback WHERE incident_id = ? ORDER BY created_at ASC",
+                (incident_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_all_feedback_for_analytics(self) -> list[dict[str, Any]]:
+        """Every feedback row, unpaginated — same reasoning as
+        `list_all_incidents_for_analytics`: only read by
+        routers/performance.py to compute an aggregate, never returned
+        directly as an API response."""
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM incident_feedback ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- temporary SRE authorization (Sentinel SRE Control Center GUI) ----
+    def create_temporary_authorization(
+        self,
+        authorization_id: str,
+        incident_id: str,
+        action: str,
+        params_json: str,
+        granted_by: str,
+        granted_at: float,
+        expires_at: float,
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO temporary_authorizations
+                    (id, incident_id, action, params_json, granted_by, granted_at,
+                     expires_at, permanent_policy_changed)
+                VALUES (?,?,?,?,?,?,?,0)
+                """,
+                (authorization_id, incident_id, action, params_json, granted_by, granted_at, expires_at),
+            )
+            conn.commit()
+
+    def get_valid_temporary_authorization(
+        self, incident_id: str, action: str, now: float
+    ) -> dict[str, Any] | None:
+        """The one row `routers/authorizations.py` needs to decide whether a
+        request may proceed: unexpired, unconsumed, matching this exact
+        incident and action. Ties are broken by most-recently-granted, in
+        case more than one was ever created for the same pair."""
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                """
+                SELECT * FROM temporary_authorizations
+                WHERE incident_id = ? AND action = ?
+                  AND consumed_at IS NULL AND expires_at > ?
+                ORDER BY granted_at DESC
+                LIMIT 1
+                """,
+                (incident_id, action, now),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def consume_temporary_authorization(
+        self, authorization_id: str, consumed_at: float, consumed_result: str
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                UPDATE temporary_authorizations
+                SET consumed_at = ?, consumed_result = ?
+                WHERE id = ?
+                """,
+                (consumed_at, consumed_result, authorization_id),
+            )
+            conn.commit()
+
+    def list_temporary_authorizations_for_incident(self, incident_id: str) -> list[dict[str, Any]]:
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM temporary_authorizations WHERE incident_id = ? ORDER BY granted_at ASC",
+                (incident_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]

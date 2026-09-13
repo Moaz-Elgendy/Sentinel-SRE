@@ -435,3 +435,136 @@ def test_engine_uses_injected_clock_not_wall_clock(engine, incident, rollback_re
     # A `now` far in the future must expire the cooldown.
     far_future = time.time() + 10_000
     assert engine.evaluate(incident, plan, rollback_ready_context, far_future).allowed is True
+
+
+# ---------------------------------------------------------------------------
+# human_override — temporary SRE authorization (GUI Phase D)
+#
+# This is the one branch these tests scrutinize hardest: `human_override`
+# must change EXACTLY the confidence check and nothing else. Every test here
+# pairs an override attempt with a check that some OTHER denial still fires
+# first when it should — that is what proves the override is scoped, not
+# just that it "works" for the happy path.
+# ---------------------------------------------------------------------------
+def test_human_override_allows_a_below_threshold_action(engine, incident, rollback_ready_context):
+    plan = make_plan(RemediationAction.RESTART_DEPLOYMENT, confidence=0.10)
+    without_override = engine.evaluate(incident, plan, rollback_ready_context, NOW)
+    assert without_override.allowed is False
+    assert without_override.reason is DenialReason.CONFIDENCE_TOO_LOW
+
+    with_override = engine.evaluate(
+        incident, plan, rollback_ready_context, NOW, human_override=True
+    )
+    assert with_override.allowed is True
+    assert with_override.checks["confidence"] is True
+    assert with_override.checks["confidence_human_override"] is True
+
+
+def test_human_override_is_a_no_op_when_confidence_already_clears_the_bar(
+    engine, incident, rollback_ready_context
+):
+    """No override actually happened, so the audit trail must not claim one
+    did — `confidence_human_override` should not appear at all, not appear
+    as False."""
+    plan = make_plan(RemediationAction.RESTART_DEPLOYMENT, confidence=0.99)
+    verdict = engine.evaluate(incident, plan, rollback_ready_context, NOW, human_override=True)
+    assert verdict.allowed is True
+    assert verdict.checks["confidence"] is True
+    assert "confidence_human_override" not in verdict.checks
+
+
+@pytest.mark.parametrize("database", ["citizen-postgres", "notification-postgres"])
+def test_human_override_does_not_unlock_the_frozen_deny_list(
+    engine, incident, rollback_ready_context, database
+):
+    """The whole point of the frozen deny-list is that NOTHING unlocks it —
+    not a misconfigured env var, and not a human's confidence override
+    either. A human can vouch for a diagnosis; they cannot vouch away the
+    fact that citizen-postgres is a stateful database."""
+    plan = make_plan(
+        RemediationAction.RESTART_DEPLOYMENT, confidence=0.01, deployment=database
+    )
+    verdict = engine.evaluate(incident, plan, rollback_ready_context, NOW, human_override=True)
+    assert verdict.allowed is False
+    assert verdict.reason is DenialReason.DEPLOYMENT_FROZEN_DENY
+
+
+def test_human_override_does_not_unlock_a_disallowed_namespace(engine, incident, rollback_ready_context):
+    plan = make_plan(
+        RemediationAction.RESTART_DEPLOYMENT, confidence=0.01, namespace="some-other-namespace"
+    )
+    verdict = engine.evaluate(incident, plan, rollback_ready_context, NOW, human_override=True)
+    assert verdict.allowed is False
+    assert verdict.reason is DenialReason.NAMESPACE_NOT_ALLOWED
+
+
+def test_human_override_does_not_reset_the_action_cap(engine, incident, rollback_ready_context):
+    for _ in range(3):
+        incident.attempts.append(
+            executed_attempt(make_plan(RemediationAction.RESTART_DEPLOYMENT), started_at=NOW - 10_000)
+        )
+    plan = make_plan(RemediationAction.RESTART_DEPLOYMENT, confidence=0.01)
+    verdict = engine.evaluate(incident, plan, rollback_ready_context, NOW, human_override=True)
+    assert verdict.allowed is False
+    assert verdict.reason is DenialReason.ACTION_CAP_REACHED
+
+
+def test_human_override_does_not_reset_the_cooldown(engine, incident, rollback_ready_context):
+    incident.attempts.append(
+        executed_attempt(make_plan(RemediationAction.RESTART_DEPLOYMENT), started_at=time.time())
+    )
+    plan = make_plan(RemediationAction.RESTART_DEPLOYMENT, confidence=0.01)
+    verdict = engine.evaluate(incident, plan, rollback_ready_context, time.time(), human_override=True)
+    assert verdict.allowed is False
+    assert verdict.reason is DenialReason.COOLDOWN_ACTIVE
+
+
+def test_human_override_does_not_waive_rollbacks_per_action_preconditions(engine, incident):
+    """Even fully overridden on confidence, a rollback with no previous
+    revision must still be denied — the seven rollback-specific checks in
+    `_check_rollback` are independent of the confidence gate entirely."""
+    no_previous_revision = PolicyContext(
+        previous_revision_exists=False,
+        deployment_history_count=3,
+        last_deploy_age_seconds=300.0,
+        deploy_correlates_with_onset=True,
+        rollback_reversible=True,
+        recovery_validation_available=True,
+    )
+    plan = make_plan(RemediationAction.ROLLBACK_DEPLOYMENT, confidence=0.01)
+    verdict = engine.evaluate(incident, plan, no_previous_revision, NOW, human_override=True)
+    assert verdict.allowed is False
+    assert verdict.reason is DenialReason.NO_PREVIOUS_REVISION
+
+
+def test_human_override_does_not_bypass_the_chaos_surface_check(engine, incident, rollback_ready_context):
+    context = PolicyContext(
+        previous_revision_exists=True,
+        deployment_history_count=3,
+        rollback_reversible=True,
+        recovery_validation_available=True,
+        chaos_surface_available=False,
+    )
+    plan = make_plan(RemediationAction.RESET_CHAOS_FAULT, confidence=0.01)
+    verdict = engine.evaluate(incident, plan, context, NOW, human_override=True)
+    assert verdict.allowed is False
+    assert verdict.reason is DenialReason.NO_CHAOS_SURFACE
+
+
+def test_human_override_still_clamps_scale_replicas(engine, incident, rollback_ready_context):
+    """Confirms scale's own logic (clamping into the replica band) still
+    runs under an override rather than being short-circuited."""
+    plan = make_plan(RemediationAction.SCALE_DEPLOYMENT, confidence=0.01, replicas=99)
+    verdict = engine.evaluate(incident, plan, rollback_ready_context, NOW, human_override=True)
+    assert verdict.allowed is True
+    assert verdict.adjusted_params.replicas == 3  # policy_config's max_replicas
+
+
+def test_human_override_never_applies_to_escalate(engine, incident):
+    """ESCALATE has no confidence gate to override in the first place — this
+    just pins down that passing human_override=True changes nothing about
+    that early return."""
+    plan = make_plan(RemediationAction.ESCALATE, confidence=0.0, deployment=None)
+    verdict = engine.evaluate(incident, plan, PolicyContext(), NOW, human_override=True)
+    assert verdict.allowed is True
+    assert "confidence_human_override" not in verdict.checks

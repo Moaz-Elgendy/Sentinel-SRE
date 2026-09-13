@@ -290,3 +290,49 @@ def fake_chaos():
 @pytest.fixture
 def fake_github():
     return FakeGitHub(enabled=False)  # tests opt in with a real commit payload
+
+
+# ---------------------------------------------------------------------------
+# Sentinel SRE Control Center (GUI) API test client
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def gui_client(tmp_path):
+    """A fully-wired FastAPI TestClient for the GUI-facing API surface.
+
+    Runs the REAL `app.main` app (real lifespan, real router wiring) against
+    a throwaway SQLite file so each test gets a clean `admins`/`incidents`/
+    `environments` set, and against `KUBERNETES_MODE=in_cluster` with no
+    in-cluster service account present, which reliably makes
+    `ctx.k8s.available is False` without touching a real cluster — the same
+    "Kubernetes unreachable" path production hits when misconfigured, which
+    is exactly the path these tests want to exercise for the dashboard's
+    "healthy: null" behaviour.
+
+    Yields `(client, login)` where `login()` returns a ready-to-use
+    `{"Authorization": "Bearer ..."}` header dict for the bootstrap admin.
+    """
+    from fastapi.testclient import TestClient
+
+    import app.main as main_module
+
+    settings_obj = main_module.settings
+    db_path = tmp_path / "sentinel_test.db"
+
+    # Reset per-test: a fresh db path means count_admins() == 0 again, so
+    # main.py's bootstrap creates exactly one admin with these credentials.
+    settings_obj.sentinel_db_path = str(db_path)
+    settings_obj.sentinel_jwt_secret = ""  # let main.py generate one, fresh
+    settings_obj.sentinel_admin_username = "test-admin"
+    settings_obj.sentinel_admin_password = "test-password-123"
+
+    def login(client) -> dict[str, str]:
+        resp = client.post(
+            "/api/auth/login",
+            json={"username": "test-admin", "password": "test-password-123"},
+        )
+        assert resp.status_code == 200, resp.text
+        token = resp.json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    with TestClient(main_module.app) as client:
+        yield client, login
