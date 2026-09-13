@@ -49,18 +49,53 @@ Honest note: nothing in this service has run against a real Kubernetes API
 server. The Kubernetes write paths (restart annotation, template rollback,
 replica patch) mirror what kubectl does but have not been executed. Run the
 first real incident with DRY_RUN=true and read the logged patch bodies.
+
+### Sentinel SRE Control Center (GUI)
+
+`app/routers/{auth,dashboard,actions,performance,meta,feedback}.py` back the
+GUI described in docs/sentinel-integration.md. `feedback.py` writes to its
+own `incident_feedback` table only — it never touches an incident's own
+record, the policy engine, or the decision engine, so a diagnosis or
+remediation feedback submission cannot change Sentinel's behavior toward
+this or any future incident (see that router's module docstring). The rest
+are strictly read-only views over the same `store`/`context` this module
+already builds — none of them call the Kubernetes client, the Policy
+Engine, or the Remediation Engine.
+`incidents` and `environments` are now gated behind the same admin JWT
+(see app/core/deps.py) since both expose operationally sensitive detail;
+`alerts` (the Alertmanager webhook) and `chaos_scenarios` (its own
+pre-existing shared-secret gate) are unchanged.
 """
 import logging
+import secrets
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.core.config import settings
+from app.core.events import EventBus
 from app.core.logging_config import configure_logging
+from app.core.security import hash_password
 from app.domain.environment import Environment
 from app.lifecycle.orchestrator import Orchestrator, build_context
-from app.routers import alerts, chaos_scenarios, environments, health, incidents
+from app.routers import (
+    actions,
+    alerts,
+    auth,
+    authorizations,
+    chaos_scenarios,
+    dashboard,
+    environments,
+    events,
+    feedback,
+    health,
+    incidents,
+    meta,
+    performance,
+)
 from app.store.sqlite_store import SQLiteStore
 
 configure_logging(service_name=settings.service_name)
@@ -101,14 +136,59 @@ async def lifespan(app: FastAPI):
                    "kubernetes_mode": environment.kubernetes.mode},
         )
 
-    ctx = build_context(settings, store, environment)
+    event_bus = EventBus()
+    ctx = build_context(settings, store, environment, event_bus=event_bus)
     orchestrator = Orchestrator(ctx)
+
+    # ---- Sentinel SRE Control Center (GUI) admin auth bootstrap ----------
+    # No safe hardcoded secret/password (see core/config.py's field docs):
+    # generate one if the operator did not set one, and log it loudly so it
+    # is impossible to miss on first boot but never written to a file.
+    if not settings.sentinel_jwt_secret:
+        settings.sentinel_jwt_secret = secrets.token_urlsafe(48)
+        logger.warning(
+            "sentinel_jwt_secret_generated",
+            extra={
+                "detail": "SENTINEL_JWT_SECRET was not set; generated a random one for "
+                "this process only. Every GUI session will be invalidated on the next "
+                "restart. Set SENTINEL_JWT_SECRET explicitly for anything beyond a "
+                "local demo."
+            },
+        )
+
+    if store.count_admins() == 0:
+        bootstrap_password = settings.sentinel_admin_password or secrets.token_urlsafe(16)
+        admin_id = f"admin-{uuid.uuid4().hex[:12]}"
+        store.create_admin(
+            admin_id=admin_id,
+            username=settings.sentinel_admin_username,
+            password_hash=hash_password(bootstrap_password),
+        )
+        if settings.sentinel_admin_password:
+            logger.info(
+                "sentinel_gui_admin_bootstrapped",
+                extra={"username": settings.sentinel_admin_username},
+            )
+        else:
+            # Only place this ever appears. Anyone who needs it must read it
+            # from the startup log for this one boot.
+            logger.warning(
+                "sentinel_gui_admin_bootstrapped_with_generated_password",
+                extra={
+                    "username": settings.sentinel_admin_username,
+                    "generated_password": bootstrap_password,
+                    "detail": "SENTINEL_ADMIN_PASSWORD was not set; generated a "
+                    "one-time password for the bootstrap admin account, shown here "
+                    "once. Log in and treat this as sensitive.",
+                },
+            )
 
     app.state.settings = settings
     app.state.store = store
     app.state.environment = environment
     app.state.context = ctx
     app.state.orchestrator = orchestrator
+    app.state.event_bus = event_bus
     health.register_runtime(store=store, k8s=ctx.k8s)
 
     logger.info(
@@ -185,11 +265,33 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# CORS for the Sentinel SRE Control Center GUI only — this API now issues
+# bearer tokens, so no wildcard origin (see core/config.py's
+# sentinel_gui_origins docs). The Alertmanager webhook and the
+# chaos-scenarios endpoint are never called from a browser, so they are
+# unaffected by this either way.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.sentinel_gui_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(health.router)
 app.include_router(alerts.router)
+app.include_router(auth.router)
 app.include_router(incidents.router)
+app.include_router(feedback.router)
+app.include_router(authorizations.router)
 app.include_router(environments.router)
 app.include_router(chaos_scenarios.router)
+app.include_router(dashboard.router)
+app.include_router(actions.router)
+app.include_router(performance.router)
+app.include_router(meta.router)
+app.include_router(events.router)
 
 
 @app.get("/metrics")

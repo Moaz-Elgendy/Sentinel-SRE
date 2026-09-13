@@ -19,9 +19,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-router = APIRouter(prefix="/api/incidents", tags=["incidents"])
+from app.core.deps import get_current_admin
+
+router = APIRouter(
+    prefix="/api/incidents",
+    tags=["incidents"],
+    dependencies=[Depends(get_current_admin)],
+)
 
 
 @router.get("")

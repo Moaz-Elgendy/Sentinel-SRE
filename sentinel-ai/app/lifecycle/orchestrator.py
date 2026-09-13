@@ -49,6 +49,8 @@ from app.lifecycle.policy import PolicyConfig, PolicyContext, PolicyEngine
 from app.lifecycle.remediation import RemediationEngine, RemediationRefused
 from app.lifecycle.validation import RecoveryValidator, ValidationThresholds
 from app.models.incident import (
+    ActionParams,
+    ActionPlan,
     AttemptRecord,
     EscalationReason,
     Evidence,
@@ -94,10 +96,11 @@ class SentinelContext:
     remediation: RemediationEngine
     validator: RecoveryValidator
     decision: DecisionEngine
+    event_bus: Any = None  # app.core.events.EventBus, optional (see main.py)
 
 
 def build_context(
-    settings_obj: Any, store: SQLiteStore, environment: Environment
+    settings_obj: Any, store: SQLiteStore, environment: Environment, event_bus: Any = None
 ) -> SentinelContext:
     """Wire the object graph for ONE environment. The layering is visible
     here on purpose.
@@ -183,6 +186,7 @@ def build_context(
         remediation=remediation_engine,
         validator=validator,
         decision=decision,
+        event_bus=event_bus,
     )
 
 
@@ -203,6 +207,29 @@ class Orchestrator:
             sentinel_open_incidents.set(self.ctx.store.count_open())
         except Exception as exc:  # noqa: BLE001
             logger.error("incident_persist_failed", extra={"error_detail": str(exc)[:200]})
+            return
+
+        # GUI real-time hook (Phase B of the approved Sentinel GUI plan).
+        # This is a SIGNAL to re-fetch, not the state itself — see
+        # app/core/events.py and routers/events.py. It is deliberately the
+        # only orchestrator change Phase B makes: one publish call, right
+        # after the same persist that was already the lifecycle's real,
+        # audited checkpoint, so a dropped/never-opened GUI connection can
+        # never cause a different outcome than a connected one.
+        if self.ctx.event_bus is not None:
+            try:
+                self.ctx.event_bus.publish(
+                    {
+                        "type": "incident_updated",
+                        "incident_id": incident.id,
+                        "phase": incident.phase.value,
+                        "status": incident.status.value,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A GUI notification problem must never affect incident
+                # processing, which has already been safely persisted above.
+                logger.error("incident_event_publish_failed", extra={"error_detail": str(exc)[:200]})
 
     # -- the lifecycle ----------------------------------------------------
     async def run(self, incident: Incident) -> Incident:
@@ -226,6 +253,218 @@ class Orchestrator:
                 f"{type(exc).__name__}: {str(exc)[:300]}. A human must take over.",
             )
             await self._finish(incident)
+            return incident
+        finally:
+            set_incident_id(None)
+
+    async def authorize_and_remediate(
+        self,
+        incident: Incident,
+        action: RemediationAction,
+        authorization_id: str,
+        requested_params: ActionParams | None = None,
+    ) -> Incident:
+        """Execute exactly ONE SRE-authorized action against an escalated
+        incident, through the same Policy Engine and Remediation Engine as
+        every autonomous action — never a second path to the cluster.
+
+        This exists for the Sentinel GUI's temporary SRE authorization
+        feature (GUI spec section 7 / approved plan Phase D). Called by
+        routers/authorizations.py ONLY after it has confirmed a real,
+        unexpired, unconsumed `TemporaryAuthorization` row exists for this
+        exact incident and action (see app/store/sqlite_store.py) — this
+        method trusts that check happened and does not repeat it, but it
+        does NOT trust the authorization to mean "skip safety checks": it
+        calls `PolicyEngine.evaluate(..., human_override=True)`, which (see
+        that parameter's docstring in lifecycle/policy.py) substitutes a
+        human's judgement for the model's confidence *number* and nothing
+        else. Every other check — frozen deny-lists, allow-lists, the action
+        cap, the cooldown, and the chosen action's own preconditions — runs
+        exactly as it would for a fully autonomous candidate, and can still
+        deny this request.
+
+        Deliberately bounded to ONE attempt, unlike the autonomous
+        `_run_inner` loop: a temporary authorization is a one-time exception
+        for one action, not a standing invitation for Sentinel to keep
+        trying things on its own initiative with a now-spent grant. Evidence
+        and correlation are re-collected fresh (not reused from whenever the
+        incident originally escalated) because cluster state may have moved
+        on since — a stale "previous revision exists" or "deploy correlates
+        with onset" would be exactly the kind of unverifiable guess
+        policy.py's rollback preconditions exist to prevent.
+
+        Marks the authorization consumed the moment execution actually
+        happens (matching the plan's "single-use" design) — a policy denial
+        never touches the cluster, so it does not consume the grant.
+        """
+        set_incident_id(incident.id)
+        try:
+            incident.status = IncidentStatus.INVESTIGATING
+            evidence = await self._investigate(incident, LifecyclePhase.RE_INVESTIGATION)
+            incident.evidence = evidence
+            self._persist(incident)
+
+            findings = correlation.correlate(
+                incident=incident,
+                evidence=evidence,
+                correlation_window_minutes=(
+                    self.ctx.settings.deployment_correlation_window_minutes
+                ),
+                cpu_threshold_cores=self.ctx.settings.validation_max_cpu_cores,
+                error_rate_threshold=self.ctx.settings.validation_max_error_rate,
+                p95_threshold_seconds=self.ctx.settings.validation_max_p95_latency_seconds,
+            )
+            incident.record(
+                LifecyclePhase.CORRELATION,
+                f"re-correlated evidence for the authorized {action.value} into "
+                f"{len(evidence.correlations)} finding(s)",
+                findings=findings.to_dict(),
+            )
+            self._persist(incident)
+
+            params = requested_params or ActionParams(
+                namespace=incident.namespace,
+                deployment=incident.app,
+                service=incident.app,
+            )
+            confidence = incident.hypothesis.confidence if incident.hypothesis else 0.0
+            plan = ActionPlan(
+                action=action,
+                params=params,
+                confidence=confidence,
+                rationale=(
+                    f"temporary SRE authorization {authorization_id}: an SRE administrator "
+                    f"granted a one-time exception for this incident and action only. "
+                    f"Sentinel's own confidence remains {confidence:.2f}; the permanent "
+                    "policy thresholds are unchanged."
+                ),
+            )
+            context = self._policy_context(incident, findings)
+            verdict = self.ctx.policy.evaluate(
+                incident, plan, context, now=time.time(), human_override=True
+            )
+            incident.record(
+                LifecyclePhase.POLICY_CHECK,
+                f"[temporary authorization {authorization_id}] {action.value}: "
+                + ("ALLOWED" if verdict.allowed else "DENIED")
+                + f" — {verdict.detail}",
+                action=action.value,
+                allowed=verdict.allowed,
+                denial_reason=verdict.reason.value if verdict.reason else None,
+                checks=verdict.checks,
+                authorization_id=authorization_id,
+            )
+
+            if not verdict.allowed:
+                incident.attempts.append(AttemptRecord(plan=plan, verdict=verdict, result=None))
+                incident.status = IncidentStatus.ESCALATED
+                self._persist(incident)
+                # Not consumed: nothing executed against the cluster, so the
+                # grant was not spent — see this method's docstring.
+                return incident
+
+            attempt = AttemptRecord(plan=plan, verdict=verdict)
+            incident.attempts.append(attempt)
+            incident.record(
+                LifecyclePhase.AUTONOMOUS_EXECUTION,
+                f"executing {action.value} under temporary SRE authorization "
+                f"{authorization_id}"
+                + (" (DRY_RUN)" if self.ctx.settings.dry_run else ""),
+                params=(verdict.adjusted_params or plan.params).to_dict(),
+            )
+            self._persist(incident)
+
+            try:
+                result = await self.ctx.remediation.execute(plan, verdict)
+            except RemediationRefused as exc:
+                logger.error(
+                    "remediation_refused_after_temporary_authorization",
+                    extra={
+                        "action": action.value,
+                        "authorization_id": authorization_id,
+                        "error_detail": str(exc)[:200],
+                    },
+                )
+                incident.status = IncidentStatus.ESCALATED
+                incident.record(
+                    LifecyclePhase.ESCALATION,
+                    f"The Remediation Engine refused an action the Policy Engine "
+                    f"authorised under temporary SRE authorization {authorization_id}: "
+                    f"{exc}. This is an internal inconsistency in Sentinel, not a normal "
+                    "denial — it needs investigation before this authorization mechanism "
+                    "is trusted again.",
+                    reason=EscalationReason.REMEDIATION_ERROR.value,
+                )
+                self._persist(incident)
+                return await self._finish(incident)
+
+            attempt.result = result
+            self.ctx.store.consume_temporary_authorization(
+                authorization_id,
+                consumed_at=time.time(),
+                consumed_result="executed_" + ("succeeded" if result.succeeded else "failed"),
+            )
+            incident.record(
+                LifecyclePhase.AUTONOMOUS_EXECUTION,
+                f"{action.value} "
+                + ("succeeded" if result.succeeded else "FAILED")
+                + f": {result.detail}",
+                succeeded=result.succeeded,
+                dry_run=result.dry_run,
+                duration_seconds=result.duration_seconds,
+            )
+            self._persist(incident)
+
+            if not result.succeeded:
+                incident.status = IncidentStatus.ESCALATED
+                self._persist(incident)
+                return await self._finish(incident)
+
+            incident.status = IncidentStatus.VALIDATING
+            incident.record(
+                LifecyclePhase.RECOVERY_VALIDATION,
+                "waiting for the settle period, then polling until recovery or "
+                f"timeout ({self.ctx.settings.validation_timeout_seconds}s)",
+            )
+            report = await self.ctx.validator.validate(
+                incident,
+                verdict.adjusted_params or plan.params,
+                baseline_error_rate=evidence.error_rate,
+            )
+            attempt.validation = report
+            sentinel_validation_result_total.labels(result=report.outcome.value).inc()
+            incident.record(
+                LifecyclePhase.RECOVERY_VALIDATION,
+                f"validation {report.outcome.value}: {report.detail}",
+                outcome=report.outcome.value,
+                failed_checks=report.failed_checks,
+                skipped_checks=report.skipped_checks,
+                elapsed_seconds=report.elapsed_seconds,
+            )
+            self._persist(incident)
+
+            if report.outcome in (ValidationOutcome.PASSED, ValidationOutcome.DEGRADED):
+                incident.status = IncidentStatus.RESOLVED
+                incident.resolved_at = time.time()
+            else:
+                # Validation failed or timed out. This is a single, bounded
+                # attempt (see this method's docstring) — it does not loop
+                # into further autonomous tries with an already-consumed
+                # grant. The incident goes back to the SRE.
+                incident.status = IncidentStatus.ESCALATED
+
+            return await self._finish(incident)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("temporary_authorization_internal_error")
+            incident.status = IncidentStatus.ESCALATED
+            incident.record(
+                LifecyclePhase.ESCALATION,
+                f"Sentinel hit an internal error while executing temporary SRE "
+                f"authorization {authorization_id}: {type(exc).__name__}: "
+                f"{str(exc)[:300]}. A human must take over.",
+                reason=EscalationReason.INTERNAL_ERROR.value,
+            )
+            self._persist(incident)
             return incident
         finally:
             set_incident_id(None)

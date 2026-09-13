@@ -26,10 +26,11 @@ import logging
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.clients.kubernetes_client import KubernetesClient
+from app.core.deps import get_current_admin
 from app.domain.environment import (
     ApplicationProfile,
     AWSConnectionConfig,
@@ -43,7 +44,11 @@ from app.lifecycle.orchestrator import Orchestrator, build_context
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/environments", tags=["environments"])
+router = APIRouter(
+    prefix="/environments",
+    tags=["environments"],
+    dependencies=[Depends(get_current_admin)],
+)
 
 
 class RegisterEnvironmentRequest(BaseModel):

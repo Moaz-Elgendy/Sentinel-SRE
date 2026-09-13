@@ -17,6 +17,13 @@ pytest-asyncio==0.24.0
 # the image, so an LLM cannot be tricked into shelling out.
 kubernetes==31.0.0
 
+# Sentinel SRE Control Center (GUI) admin auth. Same versions as
+# citizen-service's JWT auth so the two services do not resolve different
+# minor versions of jose/passlib/bcrypt in the same cluster.
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+
 # Optional. Sentinel is fully functional (rule-based) without an API key; the
 # LLM only enriches narrative and nudges confidence within a hard bound.
 # GeminiReasoner (app/reasoning/gemini_reasoner.py) needs no extra package —

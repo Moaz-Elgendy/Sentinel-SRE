@@ -162,6 +162,7 @@ class PolicyEngine:
         plan: ActionPlan,
         context: PolicyContext,
         now: float,
+        human_override: bool = False,
     ) -> PolicyVerdict:
         """Authorise or deny one candidate action.
 
@@ -169,6 +170,23 @@ class PolicyEngine:
         a denial for "you may never touch Postgres" is never masked by a
         denial for "confidence too low", which would be a misleading audit
         trail.
+
+        `human_override`: set ONLY by the orchestrator's temporary SRE
+        authorization path (see orchestrator.py's `authorize_and_remediate`),
+        and only after it has confirmed a real, unexpired, unconsumed
+        `TemporaryAuthorization` row exists for this exact incident and
+        action (see app/store/sqlite_store.py). This function does not look
+        that up itself — policy.py stays pure and synchronous, with zero
+        knowledge of the GUI's authorization table, by design (see this
+        module's docstring). `human_override` affects EXACTLY ONE branch
+        below: it lets a human's judgement stand in for the model's
+        confidence *number*. It does not skip, weaken, or reorder any other
+        check — the frozen deny-lists, the allow-lists, the action cap, the
+        cooldown, and every per-action precondition (rollback's seven
+        checks, scale's replica band, chaos's surface check) all still run
+        exactly as they would for a fully autonomous candidate. A human can
+        use this to say "I'm confident enough", never to say "skip the
+        safety checks".
         """
         checks: dict[str, bool] = {}
 
@@ -302,15 +320,26 @@ class PolicyEngine:
         # ---- 3. confidence -------------------------------------------
         threshold = self.config.threshold_for(plan.action)
         if plan.confidence < threshold:
-            checks["confidence"] = False
-            return self._deny(
-                plan,
-                DenialReason.CONFIDENCE_TOO_LOW,
-                f"confidence {plan.confidence:.2f} is below the "
-                f"{threshold:.2f} threshold required for {plan.action.value}",
-                checks,
-            )
-        checks["confidence"] = True
+            if not human_override:
+                checks["confidence"] = False
+                return self._deny(
+                    plan,
+                    DenialReason.CONFIDENCE_TOO_LOW,
+                    f"confidence {plan.confidence:.2f} is below the "
+                    f"{threshold:.2f} threshold required for {plan.action.value}",
+                    checks,
+                )
+            # A human has supplied a scoped, expiring exception for exactly
+            # this incident and action (validated by the caller — see this
+            # method's docstring). This is the ONLY thing human_override
+            # changes: the confidence *number* is substituted for the
+            # model's, not the requirement to have one. Every check below
+            # this point, including every per-action precondition, still
+            # applies in full.
+            checks["confidence"] = True
+            checks["confidence_human_override"] = True
+        else:
+            checks["confidence"] = True
 
         # ---- 4. per-action preconditions ------------------------------
         if plan.action is RemediationAction.ROLLBACK_DEPLOYMENT:

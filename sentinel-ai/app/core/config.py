@@ -198,6 +198,39 @@ class Settings(BaseSettings):
     # ---- Persistence -----------------------------------------------------
     sentinel_db_path: str = "/data/sentinel.db"
 
+    # ---- Sentinel SRE Control Center (GUI) admin auth --------------------
+    # This is a SEPARATE identity system from citizen-service's citizen JWT
+    # auth (different audience: SRE operators, not citizens) and from
+    # CHAOS_ADMIN_TOKEN (a single shared secret for one machine-triggered
+    # demo endpoint, not a login system with per-admin audit trail). See
+    # app/core/security.py and app/routers/auth.py.
+    #
+    # `sentinel_jwt_secret` has NO safe default. An empty value at startup
+    # means main.py generates a random one for this process lifetime only —
+    # every existing GUI session is invalidated on every restart. That is
+    # loud and inconvenient on purpose: a hardcoded fallback secret would be
+    # the kind of thing that quietly ships to a real deployment. Set this
+    # explicitly for anything longer-lived than a local demo.
+    sentinel_jwt_secret: str = ""
+    sentinel_jwt_algorithm: str = "HS256"
+    sentinel_jwt_expire_minutes: int = 8 * 60  # 8h admin session
+
+    # Bootstrap admin, created once at startup if the `admins` table is
+    # empty (mirrors Environment.bootstrap_from_settings' "zero extra
+    # configuration to start" property). Same reasoning as the JWT secret
+    # applies to the password: no safe hardcoded default, so an empty value
+    # means main.py generates a random one and logs it once, loudly, instead
+    # of shipping a guessable "admin/admin".
+    sentinel_admin_username: str = "admin"
+    sentinel_admin_password: str = ""
+
+    # Comma-separated origins the Sentinel GUI is served from. No default
+    # wildcard: this API now issues bearer tokens, and `allow_origins=["*"]`
+    # combined with credentialed requests is exactly the CORS misconfiguration
+    # the citizen-portal frontend's own history (see Phases.md) already
+    # warns about.
+    sentinel_gui_origins: str = "http://localhost:5173,http://localhost:8081"
+
     # ---- Detection -------------------------------------------------------
     # How long an incident stays "open for dedup" after its last update. A
     # repeat firing inside this window joins the existing incident instead of
@@ -213,6 +246,10 @@ class Settings(BaseSettings):
     @property
     def allowed_deployments_list(self) -> list[str]:
         return [d.strip() for d in self.allowed_deployments.split(",") if d.strip()]
+
+    @property
+    def sentinel_gui_origins_list(self) -> list[str]:
+        return [o.strip() for o in self.sentinel_gui_origins.split(",") if o.strip()]
 
     @property
     def aws_ec2_instance_ids_list(self) -> list[str]:
