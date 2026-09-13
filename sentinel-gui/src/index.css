@@ -1086,3 +1086,57 @@ input[type='email'] {
   font-family: inherit;
   resize: vertical;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Temporary human authorization (Phase D)                                */
+/* ---------------------------------------------------------------------- */
+.card--escalation {
+  border-color: var(--warn);
+}
+
+.authorization-panel__why {
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+
+.authorization-history {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.authorization-history__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+}
+
+.authorization-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.authorization-confirm {
+  border: 1px solid var(--warn);
+  background: var(--warn-bg);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+
+.authorization-confirm__title {
+  font-weight: 700;
+  color: var(--warn);
+  margin-bottom: 10px;
+}
+
+.authorization-confirm__actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}

@@ -13,11 +13,11 @@ because that table only tracks root-cause/action aggregates for the
 Decision Engine's learning step (see learning.py) and is missing per-attempt
 detail (rationale, verdict, evidence-adjacent params) this page needs.
 
-`authorization_type` is always "autonomous" today. The one other value this
-field will ever take — "temporary_sre_authorization" — is introduced by the
-Phase D (temporary authorization) work per the approved plan; this endpoint
-already has the field so that frontend work doesn't need a shape change
-later.
+`authorization_type` is "temporary_sre_authorization" when the attempt's
+`PolicyVerdict.checks` carries `confidence_human_override: true` — the exact
+structural signal `lifecycle/policy.py`'s `human_override` parameter sets
+(see its docstring), never a heuristic on free-text like the plan's
+rationale string. Every other executed attempt is "autonomous".
 """
 from __future__ import annotations
 
@@ -30,6 +30,12 @@ from app.core.deps import get_current_admin
 router = APIRouter(
     prefix="/api/actions", tags=["actions"], dependencies=[Depends(get_current_admin)]
 )
+
+
+def _authorization_type(verdict: dict[str, Any]) -> str:
+    if (verdict.get("checks") or {}).get("confidence_human_override"):
+        return "temporary_sre_authorization"
+    return "autonomous"
 
 
 def _flatten(incident: dict[str, Any]) -> list[dict[str, Any]]:
@@ -60,7 +66,7 @@ def _flatten(incident: dict[str, Any]) -> list[dict[str, Any]]:
                 "reason": plan.get("rationale") or verdict.get("detail"),
                 "root_cause": hypothesis.get("root_cause"),
                 "confidence": plan.get("confidence"),
-                "authorization_type": "autonomous",
+                "authorization_type": _authorization_type(verdict),
                 "dry_run": result.get("dry_run", False),
                 "succeeded": result.get("succeeded"),
                 "validation_outcome": validation.get("outcome"),

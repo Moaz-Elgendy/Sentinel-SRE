@@ -115,6 +115,28 @@ CREATE TABLE IF NOT EXISTS incident_feedback (
 );
 CREATE INDEX IF NOT EXISTS idx_feedback_incident ON incident_feedback(incident_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_kind ON incident_feedback(kind);
+
+-- Temporary SRE authorization (GUI spec section 7 / approved plan Phase D).
+-- Single-use and scoped to exactly one (incident_id, action) pair, with a
+-- short TTL — see routers/authorizations.py for how it is created and
+-- lifecycle/policy.py's `human_override` parameter for the ONE check it is
+-- allowed to satisfy (confidence). `permanent_policy_changed` is always 0
+-- and is stored explicitly (not just implied) so the audit row states the
+-- guarantee in the data itself, not only in code comments: granting this
+-- never edits PolicyConfig's thresholds.
+CREATE TABLE IF NOT EXISTS temporary_authorizations (
+    id                      TEXT PRIMARY KEY,
+    incident_id             TEXT NOT NULL,
+    action                  TEXT NOT NULL,
+    params_json             TEXT NOT NULL,
+    granted_by              TEXT NOT NULL,
+    granted_at              REAL NOT NULL,
+    expires_at              REAL NOT NULL,
+    consumed_at             REAL,
+    consumed_result         TEXT,
+    permanent_policy_changed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_authz_incident ON temporary_authorizations(incident_id);
 """
 
 
@@ -491,5 +513,74 @@ class SQLiteStore:
         with self._lock:
             rows = conn.execute(
                 "SELECT * FROM incident_feedback ORDER BY created_at ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- temporary SRE authorization (Sentinel SRE Control Center GUI) ----
+    def create_temporary_authorization(
+        self,
+        authorization_id: str,
+        incident_id: str,
+        action: str,
+        params_json: str,
+        granted_by: str,
+        granted_at: float,
+        expires_at: float,
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO temporary_authorizations
+                    (id, incident_id, action, params_json, granted_by, granted_at,
+                     expires_at, permanent_policy_changed)
+                VALUES (?,?,?,?,?,?,?,0)
+                """,
+                (authorization_id, incident_id, action, params_json, granted_by, granted_at, expires_at),
+            )
+            conn.commit()
+
+    def get_valid_temporary_authorization(
+        self, incident_id: str, action: str, now: float
+    ) -> dict[str, Any] | None:
+        """The one row `routers/authorizations.py` needs to decide whether a
+        request may proceed: unexpired, unconsumed, matching this exact
+        incident and action. Ties are broken by most-recently-granted, in
+        case more than one was ever created for the same pair."""
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                """
+                SELECT * FROM temporary_authorizations
+                WHERE incident_id = ? AND action = ?
+                  AND consumed_at IS NULL AND expires_at > ?
+                ORDER BY granted_at DESC
+                LIMIT 1
+                """,
+                (incident_id, action, now),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def consume_temporary_authorization(
+        self, authorization_id: str, consumed_at: float, consumed_result: str
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                UPDATE temporary_authorizations
+                SET consumed_at = ?, consumed_result = ?
+                WHERE id = ?
+                """,
+                (consumed_at, consumed_result, authorization_id),
+            )
+            conn.commit()
+
+    def list_temporary_authorizations_for_incident(self, incident_id: str) -> list[dict[str, Any]]:
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT * FROM temporary_authorizations WHERE incident_id = ? ORDER BY granted_at ASC",
+                (incident_id,),
             ).fetchall()
         return [dict(r) for r in rows]

@@ -85,6 +85,7 @@ from app.routers import (
     actions,
     alerts,
     auth,
+    authorizations,
     chaos_scenarios,
     dashboard,
     environments,
@@ -283,6 +284,7 @@ app.include_router(alerts.router)
 app.include_router(auth.router)
 app.include_router(incidents.router)
 app.include_router(feedback.router)
+app.include_router(authorizations.router)
 app.include_router(environments.router)
 app.include_router(chaos_scenarios.router)
 app.include_router(dashboard.router)

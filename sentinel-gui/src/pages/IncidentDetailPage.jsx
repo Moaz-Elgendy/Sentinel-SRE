@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom'
 import AlertBanner from '../components/AlertBanner.jsx'
 import Spinner from '../components/Spinner.jsx'
 import AuditTimeline from '../components/incident/AuditTimeline.jsx'
+import AuthorizationPanel from '../components/incident/AuthorizationPanel.jsx'
 import DecisionActionPanel from '../components/incident/DecisionActionPanel.jsx'
 import EvidencePanel from '../components/incident/EvidencePanel.jsx'
 import FeedbackForm from '../components/incident/FeedbackForm.jsx'
@@ -87,6 +88,13 @@ export default function IncidentDetailPage() {
         <h2 className="card__title">Decision &amp; Remediation</h2>
         <DecisionActionPanel attempts={incident.attempts} />
       </section>
+
+      {incident.status === 'escalated' && (
+        <section className="card card--escalation">
+          <h2 className="card__title">Temporary Human Authorization</h2>
+          <AuthorizationPanel incident={incident} actionTypes={actionTypes} />
+        </section>
+      )}
 
       {incident.hypothesis && (
         <section className="card">

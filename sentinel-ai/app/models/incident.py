@@ -261,6 +261,15 @@ class TimelineEvent:
             "detail": self.detail,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TimelineEvent":
+        return cls(
+            phase=LifecyclePhase(data["phase"]),
+            message=data["message"],
+            at=data.get("at", time.time()),
+            detail=data.get("detail") or {},
+        )
+
 
 @dataclass
 class ActionParams:
@@ -291,6 +300,16 @@ class ActionParams:
             "service": self.service,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ActionParams":
+        return cls(
+            namespace=data.get("namespace"),
+            deployment=data.get("deployment"),
+            replicas=data.get("replicas"),
+            target_revision=data.get("target_revision"),
+            service=data.get("service"),
+        )
+
 
 @dataclass
 class ActionPlan:
@@ -313,6 +332,15 @@ class ActionPlan:
             "confidence": self.confidence,
             "rationale": self.rationale,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ActionPlan":
+        return cls(
+            action=RemediationAction(data["action"]),
+            params=ActionParams.from_dict(data["params"]),
+            confidence=data["confidence"],
+            rationale=data.get("rationale", ""),
+        )
 
 
 @dataclass
@@ -409,6 +437,45 @@ class Evidence:
             "errors": self.errors,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "Evidence | None":
+        if data is None:
+            return None
+        return cls(
+            collected_at=data.get("collected_at", time.time()),
+            error_rate=data.get("error_rate"),
+            error_rate_5xx_count=data.get("error_rate_5xx_count"),
+            p95_latency_seconds=data.get("p95_latency_seconds"),
+            cpu_cores=data.get("cpu_cores"),
+            memory_bytes=data.get("memory_bytes"),
+            memory_growth_bytes=data.get("memory_growth_bytes"),
+            up=data.get("up"),
+            request_rate=data.get("request_rate"),
+            chaos_state=data.get("chaos_state") or {},
+            chaos_injections=data.get("chaos_injections") or {},
+            notification_deliveries=data.get("notification_deliveries") or {},
+            notification_dispatch_failures=data.get("notification_dispatch_failures"),
+            log_error_count=data.get("log_error_count", 0),
+            log_sample_messages=data.get("log_sample_messages") or [],
+            access_log_line_count=data.get("access_log_line_count", 0),
+            deployment=data.get("deployment"),
+            pods=data.get("pods") or [],
+            k8s_events=data.get("k8s_events") or [],
+            replicaset_history=data.get("replicaset_history") or [],
+            restart_count_total=data.get("restart_count_total", 0),
+            latest_revision_age_seconds=data.get("latest_revision_age_seconds"),
+            deploy_commit=data.get("deploy_commit"),
+            health_status=data.get("health_status"),
+            health_http_code=data.get("health_http_code"),
+            health_checks=data.get("health_checks") or {},
+            correlations=data.get("correlations") or [],
+            errors=data.get("errors") or [],
+            # log_lines is intentionally never in to_dict()'s output (see
+            # its own field comment), so there is nothing to restore it
+            # from — it stays at its dataclass default, same as it would
+            # for a freshly-collected Evidence that had not populated it.
+        )
+
 
 @dataclass
 class Hypothesis:
@@ -439,6 +506,22 @@ class Hypothesis:
             "supporting": self.supporting,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "Hypothesis | None":
+        if data is None:
+            return None
+        return cls(
+            root_cause=RootCause(data["root_cause"]),
+            confidence=data["confidence"],
+            reasoning=data.get("reasoning", ""),
+            recommended_action=RemediationAction(data["recommended_action"]),
+            source=data.get("source", "rules"),
+            llm_used=data.get("llm_used", False),
+            llm_note=data.get("llm_note", ""),
+            rule_confidence=data.get("rule_confidence"),
+            supporting=data.get("supporting") or [],
+        )
+
 
 @dataclass
 class PolicyVerdict:
@@ -459,6 +542,23 @@ class PolicyVerdict:
             "adjusted_params": self.adjusted_params.to_dict() if self.adjusted_params else None,
             "checks": self.checks,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "PolicyVerdict | None":
+        if data is None:
+            return None
+        return cls(
+            allowed=data["allowed"],
+            action=RemediationAction(data["action"]),
+            reason=DenialReason(data["reason"]) if data.get("reason") else None,
+            detail=data.get("detail", ""),
+            adjusted_params=(
+                ActionParams.from_dict(data["adjusted_params"])
+                if data.get("adjusted_params")
+                else None
+            ),
+            checks=data.get("checks") or {},
+        )
 
 
 @dataclass
@@ -487,6 +587,21 @@ class RemediationResult:
             "before": self.before,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "RemediationResult | None":
+        if data is None:
+            return None
+        return cls(
+            action=RemediationAction(data["action"]),
+            params=ActionParams.from_dict(data["params"]),
+            succeeded=data["succeeded"],
+            detail=data.get("detail", ""),
+            dry_run=data.get("dry_run", False),
+            started_at=data.get("started_at", time.time()),
+            duration_seconds=data.get("duration_seconds", 0.0),
+            before=data.get("before") or {},
+        )
+
 
 @dataclass
 class ValidationReport:
@@ -511,6 +626,19 @@ class ValidationReport:
             "detail": self.detail,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ValidationReport | None":
+        if data is None:
+            return None
+        return cls(
+            outcome=ValidationOutcome(data["outcome"]),
+            checks=data.get("checks") or {},
+            failed_checks=data.get("failed_checks") or [],
+            skipped_checks=data.get("skipped_checks") or [],
+            elapsed_seconds=data.get("elapsed_seconds", 0.0),
+            detail=data.get("detail", ""),
+        )
+
 
 @dataclass
 class AttemptRecord:
@@ -531,6 +659,16 @@ class AttemptRecord:
             "at": self.at,
             "at_iso": iso(self.at),
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AttemptRecord":
+        return cls(
+            plan=ActionPlan.from_dict(data["plan"]),
+            verdict=PolicyVerdict.from_dict(data.get("verdict")),
+            result=RemediationResult.from_dict(data.get("result")),
+            validation=ValidationReport.from_dict(data.get("validation")),
+            at=data.get("at", time.time()),
+        )
 
 
 @dataclass
@@ -656,6 +794,68 @@ class Incident:
         if include_evidence:
             data["evidence"] = self.evidence.to_dict() if self.evidence else None
         return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Incident":
+        """Reconstruct a live Incident from a stored record — the same shape
+        `to_dict()` produces and `SQLiteStore.upsert_incident` persists.
+
+        Nothing in Sentinel needed this until the Sentinel GUI's temporary
+        SRE authorization feature: every other code path only ever builds an
+        Incident fresh at alert time (routers/alerts.py) and carries it in
+        memory for the rest of that one lifecycle run. Granting a temporary
+        authorization happens later, against an incident a process may have
+        already finished handling and persisted — re-entering the lifecycle
+        for it means rebuilding the exact object `to_dict()` flattened, not
+        constructing a new one.
+
+        Round-trip fidelity matters concretely, not just tidily: the Policy
+        Engine's cooldown and per-incident action-cap checks (see
+        lifecycle/policy.py) read `incident.attempts`, so a from_dict that
+        silently dropped or mis-typed a field could let a re-entered
+        incident sail past a check it would have honestly failed. See
+        tests/test_incident_roundtrip.py, which checks this against a real
+        incident produced by a real lifecycle run, not a hand-built fixture.
+        """
+        return cls(
+            id=data["id"],
+            fingerprint=data["fingerprint"],
+            alertname=data["alertname"],
+            severity=Severity(data["severity"]),
+            app=data.get("app"),
+            namespace=data.get("namespace", "citizen-portal"),
+            pod=data.get("pod"),
+            summary=data.get("summary", ""),
+            description=data.get("description", ""),
+            labels=data.get("labels") or {},
+            annotations=data.get("annotations") or {},
+            customer_id=data.get("customer_id"),
+            environment_id=data.get("environment_id"),
+            application_id=data.get("application_id"),
+            status=IncidentStatus(data["status"]),
+            phase=LifecyclePhase(data["phase"]),
+            created_at=data["created_at"],
+            updated_at=data["updated_at"],
+            resolved_at=data.get("resolved_at"),
+            firing_count=data.get("firing_count", 1),
+            evidence=Evidence.from_dict(data.get("evidence")),
+            hypothesis=Hypothesis.from_dict(data.get("hypothesis")),
+            attempts=[AttemptRecord.from_dict(a) for a in data.get("attempts") or []],
+            timeline=[TimelineEvent.from_dict(e) for e in data.get("timeline") or []],
+            escalated=data.get("escalated", False),
+            escalation_reason=(
+                EscalationReason(data["escalation_reason"])
+                if data.get("escalation_reason")
+                else None
+            ),
+            escalation_detail=data.get("escalation_detail", ""),
+            documentation=data.get("documentation") or {},
+            notifications=data.get("notifications") or {},
+            # `started_at_raw` is intentionally never in to_dict()'s output
+            # (pre-existing — see its own field), so it stays at its
+            # dataclass default here too; nothing regresses because nothing
+            # was ever being persisted for it in the first place.
+        )
 
 
 # ---------------------------------------------------------------------------
