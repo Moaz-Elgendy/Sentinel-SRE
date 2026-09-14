@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Bootstrap for the STANDALONE external Sentinel instance. Installs Docker,
-# fetches this instance's two credential parameters (never Terraform-managed
-# — see sentinel_remote.tf's docstring), and runs the sentinel-ai container
-# with KUBERNETES_MODE=remote pointed at the K3s node's private IP.
+# Bootstrap for the STANDALONE external Sentinel instance. Installs Docker
+# + the `docker compose` plugin, checks out this repo (for
+# deploy/sentinel/docker-compose.yml), fetches this instance's credential
+# parameters (never Terraform-managed — see sentinel_remote.tf's
+# docstring), and brings up sentinel-ai + sentinel-gui via that compose
+# file with KUBERNETES_MODE=remote pointed at the K3s node's private IP.
+#
+# sentinel-ai's own behaviour, config, and headless operation are
+# unchanged from before this GUI was added — see
+# deploy/sentinel/docker-compose.yml's docstring for why.
 #
 # Progress logged to /var/log/sentinel-remote-bootstrap.log; success marker
 # at /var/lib/sentinel/remote-bootstrap-complete, mirroring the K3s node's
@@ -14,7 +20,9 @@ echo "=== sentinel-remote bootstrap starting: $(date -Is) ==="
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y docker.io jq unzip curl
+# docker-compose-v2 provides the `docker compose` CLI plugin (Docker Compose
+# v2). `docker.io` alone does not ship it.
+apt-get install -y docker.io docker-compose-v2 jq unzip curl git
 systemctl enable --now docker
 
 echo "--- installing AWS CLI v2 ---"
@@ -22,18 +30,20 @@ curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/aw
 unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install
 rm -rf /tmp/aws /tmp/awscliv2.zip
-systemctl enable --now docker
 
 AWS_REGION="${aws_region}"
 ECR_REGISTRY="${ecr_registry}"
-IMAGE="$ECR_REGISTRY/${ecr_repo_prefix}/sentinel-ai:${image_tag}"
+AI_IMAGE="$ECR_REGISTRY/${ecr_repo_prefix}/sentinel-ai:${image_tag}"
+GUI_IMAGE="$ECR_REGISTRY/${ecr_repo_prefix}/sentinel-gui:${gui_image_tag}"
 
 echo "--- ECR login ---"
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-echo "--- pulling $IMAGE ---"
-docker pull "$IMAGE"
+echo "--- pulling $AI_IMAGE ---"
+docker pull "$AI_IMAGE"
+echo "--- pulling $GUI_IMAGE ---"
+docker pull "$GUI_IMAGE"
 
 echo "--- fetching credential parameters from SSM ---"
 K8S_TOKEN="$(aws ssm get-parameter --region "$AWS_REGION" \
@@ -53,7 +63,7 @@ if [ "$K8S_TOKEN" = "unset" ]; then
   echo "Sentinel will start but KUBERNETES_MODE=remote will fail to authenticate."
   echo "See docs/sentinel-remote-validation-runbook.md to generate and set it, then:"
   echo "  aws ssm start-session --target <this-instance-id> --region $AWS_REGION"
-  echo "  sudo systemctl restart sentinel-ai"
+  echo "  sudo systemctl restart sentinel"
 fi
 
 VERIFY_SSL="true"
@@ -64,10 +74,21 @@ if [ "$K8S_CA_B64" = "unset" ] || [ -z "$K8S_CA_B64" ]; then
   K8S_CA_B64=""
 fi
 
+echo "--- discovering this instance's public IP (IMDSv2) ---"
+IMDS_TOKEN="$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")"
+PUBLIC_IP="$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  "http://169.254.169.254/latest/meta-data/public-ipv4" || echo "")"
+if [ -z "$PUBLIC_IP" ]; then
+  echo "WARNING: could not determine public IP; the GUI's baked-in API URL"
+  echo "and sentinel-ai's CORS allow-list may not line up. Check manually."
+fi
+echo "Public IP: $PUBLIC_IP"
+
 mkdir -p /var/lib/sentinel
 cat >/etc/sentinel-ai.env <<EOF
 # Generated at boot by sentinel_user_data.sh.tftpl — do not edit by hand,
-# edit the SSM parameters and re-run: sudo systemctl restart sentinel-ai
+# edit the SSM parameters and re-run: sudo systemctl restart sentinel
 KUBERNETES_MODE=remote
 KUBERNETES_API_SERVER=https://${k3s_private_ip}:6443
 KUBERNETES_TOKEN=$K8S_TOKEN
@@ -86,43 +107,102 @@ CHAOS_SCENARIO_RUNNER_INSTANCE_ID=${k3s_instance_id}
 CHAOS_SCENARIO_RUNNER_WORKDIR=/opt/sentinel-sre
 
 SENTINEL_DB_PATH=/var/lib/sentinel/sentinel.db
+
+# The GUI is reached either directly on the instance's public IP (if
+# var.enable_sentinel_gui_public_access is true) or via an SSM
+# port-forward to localhost (the default, secure path) — allow both so
+# sentinel-ai's CORS middleware accepts requests from either.
+SENTINEL_GUI_ORIGINS=http://$PUBLIC_IP:${gui_port},http://localhost:${gui_port}
 EOF
-# Extra optional vars (OPENAI_API_KEY etc), appended verbatim, comment
-# lines and blanks passed through harmlessly.
+# Extra optional vars (OPENAI_API_KEY, SENTINEL_JWT_SECRET,
+# SENTINEL_ADMIN_PASSWORD, etc), appended verbatim, comment lines and
+# blanks passed through harmlessly.
 echo "$EXTRA_ENV" >>/etc/sentinel-ai.env
 chmod 0600 /etc/sentinel-ai.env
 
-cat >/etc/systemd/system/sentinel-ai.service <<UNIT
+# ---------------------------------------------------------------------------
+# Repository checkout — same mechanism as the K3s node's user_data.sh.tftpl.
+# This is what gives the instance deploy/sentinel/docker-compose.yml
+# without CI having to ship the compose file itself over SSM (which has a
+# payload size limit). Only works unattended for a public repo; for a
+# private one this fails harmlessly and the directory must be populated
+# another way.
+# ---------------------------------------------------------------------------
+REPO_URL="${repo_url}"
+REPO_DIR="${repo_dir}"
+if [ -n "$REPO_URL" ]; then
+  echo "--- cloning $REPO_URL ---"
+  if [ ! -d "$REPO_DIR/.git" ]; then
+    git clone "$REPO_URL" "$REPO_DIR" || \
+      echo "WARNING: clone failed (private repo?). Populate $REPO_DIR manually."
+  fi
+  git config --global --add safe.directory "$REPO_DIR" || true
+else
+  echo "WARNING: repo_url not set — $REPO_DIR must be populated manually with"
+  echo "at least deploy/sentinel/docker-compose.yml before sentinel.service can start."
+fi
+
+COMPOSE_DIR="$REPO_DIR/deploy/sentinel"
+mkdir -p "$COMPOSE_DIR"
+cat >"$COMPOSE_DIR/.env" <<EOF
+# Generated at boot by sentinel_user_data.sh.tftpl — do not edit by hand.
+# To change the running image tags, either re-run terraform with new
+# sentinel_image_tag/sentinel_gui_image_tag, or (what CI actually does on
+# every deploy) update this file over SSM and re-run \`docker compose up -d\`.
+ECR_REGISTRY=$ECR_REGISTRY
+ECR_REPO_PREFIX=${ecr_repo_prefix}
+SENTINEL_AI_TAG=${image_tag}
+SENTINEL_GUI_TAG=${gui_image_tag}
+SENTINEL_WEBHOOK_PORT=${webhook_port}
+SENTINEL_GUI_PORT=${gui_port}
+EOF
+
+cat >/etc/systemd/system/sentinel.service <<'UNIT'
 [Unit]
-Description=Sentinel AI — external control plane
+Description=Sentinel AI + GUI (docker compose)
 After=docker.service network-online.target
 Requires=docker.service
 Wants=network-online.target
 
 [Service]
-Restart=always
-RestartSec=5
-ExecStartPre=-/usr/bin/docker rm -f sentinel-ai
-ExecStart=/usr/bin/docker run --rm --name sentinel-ai \\
-  --env-file /etc/sentinel-ai.env \\
-  -p ${webhook_port}:8080 \\
-  -v /var/lib/sentinel:/var/lib/sentinel \\
-  $IMAGE
-ExecStop=/usr/bin/docker stop sentinel-ai
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=REPLACED_COMPOSE_DIR
+ExecStart=/usr/bin/docker compose --env-file REPLACED_COMPOSE_DIR/.env -f REPLACED_COMPOSE_DIR/docker-compose.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file REPLACED_COMPOSE_DIR/.env -f REPLACED_COMPOSE_DIR/docker-compose.yml down
+TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target
 UNIT
+# The unit file above is written with a quoted heredoc (no bash/Terraform
+# expansion at all) so it can be committed verbatim; substitute the one
+# real path into it now.
+sed -i "s#REPLACED_COMPOSE_DIR#$COMPOSE_DIR#g" /etc/systemd/system/sentinel.service
 
 systemctl daemon-reload
-systemctl enable --now sentinel-ai
+if [ -f "$COMPOSE_DIR/docker-compose.yml" ]; then
+  systemctl enable --now sentinel
+else
+  echo "WARNING: $COMPOSE_DIR/docker-compose.yml is missing (repo clone likely failed)."
+  echo "sentinel.service is enabled but will fail to start until that file exists."
+  systemctl enable sentinel
+fi
 
 cat >/var/lib/sentinel/remote-bootstrap-complete <<EOF
 bootstrapped_at=$(date -Is)
-image=$IMAGE
+sentinel_ai_image=$AI_IMAGE
+sentinel_gui_image=$GUI_IMAGE
 k3s_private_ip=${k3s_private_ip}
+public_ip=$PUBLIC_IP
 EOF
 echo "=== sentinel-remote bootstrap complete: $(date -Is) ==="
-echo "Check status: sudo systemctl status sentinel-ai"
-echo "Check logs:   sudo journalctl -u sentinel-ai -f"
+echo "Check status: sudo systemctl status sentinel"
+echo "Check logs:   sudo docker compose -f $COMPOSE_DIR/docker-compose.yml logs -f"
 echo "Test API:     curl -s http://localhost:${webhook_port}/readyz"
+echo "Test GUI:     curl -s http://localhost:${gui_port}/healthz"
+echo "Reach the GUI from your machine without opening any port:"
+echo "  aws ssm start-session --target <this-instance-id> --region $AWS_REGION \\"
+echo "    --document-name AWS-StartPortForwardingSession \\"
+echo "    --parameters '{\"portNumber\":[\"${gui_port}\"],\"localPortNumber\":[\"${gui_port}\"]}'"
+echo "  then open http://localhost:${gui_port}"

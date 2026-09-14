@@ -691,8 +691,26 @@ jobs:
       # back (pinning by commit SHA rather than tag, GitHub's own
       # Dependabot/code-scanning, Docker Scout, or Anchore Grype).
 
+  # -------------------------------------------------------------------------
+  # Deploy Sentinel (sentinel-ai + its GUI) to the standalone external EC2
+  # instance — see infra/terraform/sentinel_remote.tf.
+  #
+  # sentinel-gui is built and pushed HERE, not in the generic
+  # build-and-push-images matrix above, because it needs one piece of
+  # information only available in this job's context: the Sentinel
+  # instance's own public IP. sentinel-gui is a static bundle — the browser
+  # calls sentinel-ai directly, cross-origin (see
+  # deploy/sentinel/docker-compose.yml's docstring) — so VITE_API_BASE_URL
+  # has to be baked in at build time pointing at that address, or the GUI
+  # in the browser won't be able to reach the API at all.
+  #
+  # Deployment itself goes through the same SSM-only path as deploy-to-k3s
+  # (no inbound port, no kubectl/ssh from CI): it asks SSM to run a fixed
+  # sequence of commands that only ever touch
+  # /opt/sentinel-sre/deploy/sentinel — nothing else on the box.
+  # -------------------------------------------------------------------------
   deploy-to-sentinel:
-    name: Deploy Sentinel to external EC2
+    name: Deploy Sentinel (AI + GUI) to external EC2
     needs: build-and-push-images
     runs-on: ubuntu-latest
     environment: aws-demo
@@ -702,28 +720,74 @@ jobs:
       contents: read
 
     steps:
+      - uses: docker/setup-buildx-action@v4
+
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-sentinel-deploy-${{ github.run_id }}
 
-      - name: Deploy Sentinel
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Look up the Sentinel instance's public IP
+        id: sentinel_ip
+        run: |
+          set -euo pipefail
+          ip=$(aws ec2 describe-instances \
+            --instance-ids "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+          if [ -z "$ip" ] || [ "$ip" = "None" ]; then
+            echo "Could not resolve a public IP for the Sentinel instance." >&2
+            exit 1
+          fi
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+          echo "Sentinel public IP: $ip"
+
+      - uses: actions/checkout@v7
+
+      - name: Build and push sentinel-gui
+        uses: docker/build-push-action@v7
+        with:
+          context: sentinel-gui
+          build-args: |
+            VITE_API_BASE_URL=http://${{ steps.sentinel_ip.outputs.ip }}:${{ vars.SENTINEL_WEBHOOK_PORT || '8080' }}
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/sentinel-gui:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}/sentinel-gui:latest
+          cache-from: type=gha,scope=sentinel-gui
+          cache-to: type=gha,mode=max,scope=sentinel-gui
+
+      - name: Deploy sentinel-ai + sentinel-gui via docker compose
         shell: bash
         run: |
           set -euo pipefail
 
+          registry="${{ steps.ecr.outputs.registry }}"
+          prefix="${{ env.ECR_REPOSITORY_PREFIX }}"
+          sha="${{ github.sha }}"
+          compose_dir="/opt/sentinel-sre/deploy/sentinel"
+
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "set -e",
-              "aws ecr get-login-password --region ${{ vars.AWS_REGION }} | docker login --username AWS --password-stdin 890608336467.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com",
-              "docker pull 890608336467.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/sentinel-sre-demo/sentinel-ai:latest",
-              "systemctl restart sentinel-ai",
-              "systemctl is-active --quiet sentinel-ai"
-            ]' \
-            --comment "Deploy Sentinel latest image" \
+            --parameters "commands=[
+              \"set -e\",
+              \"aws ecr get-login-password --region ${{ vars.AWS_REGION }} | docker login --username AWS --password-stdin $registry\",
+              \"cd $compose_dir\",
+              \"git -C /opt/sentinel-sre pull --ff-only || true\",
+              \"sed -i 's/^SENTINEL_AI_TAG=.*/SENTINEL_AI_TAG=$sha/' .env\",
+              \"sed -i 's/^SENTINEL_GUI_TAG=.*/SENTINEL_GUI_TAG=$sha/' .env\",
+              \"docker compose --env-file .env pull\",
+              \"docker compose --env-file .env up -d --remove-orphans\",
+              \"docker compose --env-file .env ps\"
+            ]" \
+            --comment "Deploy Sentinel ${sha:0:7} from ${{ github.run_id }}" \
             --query "Command.CommandId" \
             --output text)
 
@@ -734,23 +798,28 @@ jobs:
               --command-id "$COMMAND_ID" \
               --instance-id "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
               --query "Status" \
-              --output text)
+              --output text 2>/dev/null || echo Pending)
 
             echo "Status: $STATUS"
 
             case "$STATUS" in
-              Success)
-                echo "Sentinel deployment succeeded."
-                exit 0
-                ;;
-              Failed|Cancelled|TimedOut)
-                echo "Sentinel deployment failed."
-                exit 1
-                ;;
+              Success|Failed|Cancelled|TimedOut) break ;;
             esac
 
             sleep 5
           done
 
-          echo "Timed out waiting for Sentinel deployment."
-          exit 1
+          echo "--- stdout ---"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
+            --query StandardOutputContent --output text || true
+          echo "--- stderr ---"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
+            --query StandardErrorContent --output text || true
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Sentinel deployment did not succeed (status: $STATUS)." >&2
+            exit 1
+          fi
+          echo "Sentinel deployment succeeded (sentinel-ai + sentinel-gui, tag $sha)."

@@ -183,6 +183,7 @@ variable "ecr_repository_names" {
     "notification-service",
     "frontend",
     "sentinel-ai",
+    "sentinel-gui",
   ]
 }
 
@@ -372,10 +373,46 @@ variable "sentinel_image_tag" {
   default     = "latest"
 }
 
-variable "prometheus_nodeport" {
-  description = "NodePort Prometheus is exposed on for a remote Sentinel — must match k8s/overlays/aws/observability-nodeport.yaml's prometheus-nodeport Service."
+variable "sentinel_gui_port" {
+  description = "Host/container port the Sentinel GUI (nginx) listens on. Fixed at 8081 inside the image (see sentinel-gui/nginx.conf); this only controls the host-side mapping."
   type        = number
-  default     = 30090
+  default     = 8081
+}
+
+variable "sentinel_gui_image_tag" {
+  description = <<-EOT
+    Tag of the sentinel-gui image in ECR to run on the standalone Sentinel
+    instance. Same caveat as var.sentinel_image_tag: this instance is not
+    managed by kubectl, so push/tag it yourself or let CI's
+    deploy-to-sentinel job keep it current.
+  EOT
+  type        = string
+  default     = "latest"
+}
+
+variable "enable_sentinel_gui_public_access" {
+  description = <<-EOT
+    Whether to open var.sentinel_gui_port on the Sentinel security group to
+    var.allowed_http_cidrs.
+
+    Defaults to false on purpose: sentinel_remote.tf's own design is that
+    the external Sentinel instance has a public IP for its OWN outbound
+    calls but is not reachable from the internet on any port. Flipping this
+    on punches a real hole in that.
+
+    The safer default way to reach the GUI is an SSM port-forward, which
+    needs no inbound rule at all:
+      aws ssm start-session --target <sentinel-instance-id> \
+        --document-name AWS-StartPortForwardingSession \
+        --parameters '{"portNumber":["8081"],"localPortNumber":["8081"]}'
+    then open http://localhost:8081.
+
+    Set this to true only if you specifically want the GUI reachable
+    directly (e.g. a public demo), and keep var.allowed_http_cidrs scoped
+    to your own IP if so.
+  EOT
+  type        = bool
+  default     = false
 }
 
 variable "loki_nodeport" {
