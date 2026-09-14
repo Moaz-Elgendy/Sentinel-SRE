@@ -8,7 +8,7 @@
 # added alongside it. If sentinel-gui is ever stopped or fails, sentinel-ai
 # keeps running headless exactly as it did before this file existed —
 # nothing about sentinel-ai depends on the GUI being up.
-#
+# dddd
 # sentinel-gui is a static React build served by nginx. It calls sentinel-ai
 # directly, cross-origin, from the browser (see sentinel-gui/nginx.conf and
 # sentinel-gui/src/api/client.js) — there is no server-side proxy here. That
