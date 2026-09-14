@@ -266,7 +266,7 @@ cat >/usr/local/bin/sentinel-deploy.sh <<'DEPLOY'
 # Deploy a specific image tag to the citizen portal namespace.
 #
 # Usage:
-#   sentinel-deploy.sh images <git-sha>   # roll the 4 service images to <git-sha>
+#   sentinel-deploy.sh images <git-sha>   # roll the 5 service images to <git-sha>
 #   sentinel-deploy.sh apply <git-sha>    # git checkout <git-sha> + kubectl apply -k
 #
 # "images" is the normal CI path: it changes only the container images,
@@ -313,6 +313,9 @@ case "$${MODE}" in
     kubectl -n "$${NS}" set image deployment/sentinel-ai \
       sentinel-ai="$${REGISTRY}/$${PREFIX}/sentinel-ai:$${SHA}" || \
       echo "note: sentinel-ai deployment not present yet, skipped"
+    kubectl -n "$${NS}" set image deployment/sentinel-gui \
+      sentinel-gui="$${REGISTRY}/$${PREFIX}/sentinel-gui:$${SHA}" || \
+      echo "note: sentinel-gui deployment not present yet, skipped"
     ;;
   apply)
     cd "$${REPO_DIR}"

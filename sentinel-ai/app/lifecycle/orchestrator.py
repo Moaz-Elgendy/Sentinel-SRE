@@ -307,8 +307,18 @@ class Orchestrator:
             findings = correlation.correlate(
                 incident=incident,
                 evidence=evidence,
+                # Read from the Policy Engine's own config, not `settings`
+                # directly — `PolicyConfig` is the single source of truth
+                # for this value (see the Sentinel Administration & Tuning
+                # Center work: it is now live-editable via
+                # `PUT /api/config/policy`, and `policy.py`'s own rollback
+                # precondition check reads this exact same
+                # `self.ctx.policy.config.deployment_correlation_window_minutes`
+                # a few calls downstream of here). Reading from `settings`
+                # instead would silently reintroduce a second, driftable
+                # copy of the same value the moment an admin changes it.
                 correlation_window_minutes=(
-                    self.ctx.settings.deployment_correlation_window_minutes
+                    self.ctx.policy.config.deployment_correlation_window_minutes
                 ),
                 cpu_threshold_cores=self.ctx.settings.validation_max_cpu_cores,
                 error_rate_threshold=self.ctx.settings.validation_max_error_rate,
@@ -493,8 +503,10 @@ class Orchestrator:
             findings = correlation.correlate(
                 incident=incident,
                 evidence=evidence,
+                # See the identical comment in authorize_and_remediate above
+                # for why this reads PolicyConfig, not settings, directly.
                 correlation_window_minutes=(
-                    self.ctx.settings.deployment_correlation_window_minutes
+                    self.ctx.policy.config.deployment_correlation_window_minutes
                 ),
                 cpu_threshold_cores=self.ctx.settings.validation_max_cpu_cores,
                 error_rate_threshold=self.ctx.settings.validation_max_error_rate,
