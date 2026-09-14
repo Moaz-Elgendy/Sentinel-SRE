@@ -80,6 +80,7 @@ from app.core.events import EventBus
 from app.core.logging_config import configure_logging
 from app.core.security import hash_password
 from app.domain.environment import Environment
+from app.lifecycle import policy_admin
 from app.lifecycle.orchestrator import Orchestrator, build_context
 from app.routers import (
     actions,
@@ -87,6 +88,7 @@ from app.routers import (
     auth,
     authorizations,
     chaos_scenarios,
+    config,
     dashboard,
     environments,
     events,
@@ -139,6 +141,35 @@ async def lifespan(app: FastAPI):
     event_bus = EventBus()
     ctx = build_context(settings, store, environment, event_bus=event_bus)
     orchestrator = Orchestrator(ctx)
+
+    # ---- Sentinel Administration & Tuning Center: reload live policy -----
+    # ---- overrides ---------------------------------------------------
+    # `PolicyConfig` (ctx.policy.config) was just built fresh from
+    # `settings`-derived defaults. Any change an admin previously applied
+    # via POST /api/config/policy/apply is stored in `config_overrides`
+    # (see app/store/sqlite_store.py) precisely so it survives this
+    # restart — reapply it now, before Sentinel processes its first
+    # incident, using the SAME validated apply path a live request uses
+    # (app/lifecycle/policy_admin.py), not a separate ad hoc assignment.
+    stored_policy_overrides = store.get_config_overrides("policy")
+    override_errors = policy_admin.reload_stored_overrides(
+        ctx.policy.config,
+        stored_policy_overrides,
+        ctx.policy.config.denied_deployments,
+        ctx.policy.config.denied_namespaces,
+    )
+    if override_errors:
+        # A bound tightened since this override was saved (e.g. a Sentinel
+        # upgrade lowered MAX_REPLICAS_CEILING) — fail loud, not silently
+        # ignore a safety-relevant stored override.
+        logger.error(
+            "stored_policy_overrides_invalid",
+            extra={"errors": override_errors, "overrides": stored_policy_overrides},
+        )
+    elif stored_policy_overrides:
+        logger.info(
+            "stored_policy_overrides_applied", extra={"fields": sorted(stored_policy_overrides)}
+        )
 
     # ---- Sentinel SRE Control Center (GUI) admin auth bootstrap ----------
     # No safe hardcoded secret/password (see core/config.py's field docs):
@@ -284,6 +315,7 @@ app.include_router(alerts.router)
 app.include_router(auth.router)
 app.include_router(incidents.router)
 app.include_router(feedback.router)
+app.include_router(config.router)
 app.include_router(authorizations.router)
 app.include_router(environments.router)
 app.include_router(chaos_scenarios.router)

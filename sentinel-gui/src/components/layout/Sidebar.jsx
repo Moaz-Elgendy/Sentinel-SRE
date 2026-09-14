@@ -8,6 +8,11 @@ const NAV_ITEMS = [
   { to: '/performance', label: 'Performance' },
 ]
 
+const ADMIN_NAV_ITEMS = [
+  { to: '/policies', label: 'Policies' },
+  { to: '/config-history', label: 'Configuration History' },
+]
+
 export default function Sidebar() {
   return (
     <aside className="sidebar">
@@ -25,6 +30,19 @@ export default function Sidebar() {
             key={item.to}
             to={item.to}
             end={item.end}
+            className={({ isActive }) => `sidebar__link${isActive ? ' sidebar__link--active' : ''}`}
+          >
+            {item.label}
+          </NavLink>
+        ))}
+      </nav>
+
+      <div className="sidebar__section-label">Administration</div>
+      <nav className="sidebar__nav">
+        {ADMIN_NAV_ITEMS.map((item) => (
+          <NavLink
+            key={item.to}
+            to={item.to}
             className={({ isActive }) => `sidebar__link${isActive ? ' sidebar__link--active' : ''}`}
           >
             {item.label}

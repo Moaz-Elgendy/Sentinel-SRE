@@ -357,6 +357,50 @@ which is up but degraded.
   postmortems, and may *propose* a fix. It never modifies application code and never merges
   anything.
 
+## Sentinel SRE Control Center (GUI)
+
+A separate application, `sentinel-gui/`, gives an SRE administrator a live view of everything
+above — the same lifecycle this document describes, watchable incident by incident — plus a
+narrow, audited way to intervene when Sentinel escalates. It does not change anything about the
+security boundary above; it is built to extend it consistently, not around it:
+
+- **A separate identity system.** Admin accounts (`admins` table in Sentinel's own SQLite store)
+  are unrelated to citizen-service's citizen auth and to `CHAOS_ADMIN_TOKEN` above — different
+  audience, different secret, different token (`app/core/security.py`, `app/core/deps.py`).
+- **Every GUI-facing endpoint is now authenticated.** `GET /api/incidents`, `/environments`, and
+  the new `/api/dashboard`, `/api/actions`, `/api/performance`, `/api/meta`, `/api/events` (SSE),
+  and `/api/incidents/{id}/{feedback,authorize,authorizations}` all require the admin JWT — see
+  `app/core/deps.py`'s `get_current_admin`. `/api/alerts/webhook` (Alertmanager) and
+  `/api/sentinel/chaos-scenarios` (its own pre-existing shared-secret gate) are unchanged.
+- **Real-time updates are a read-only signal, never a second source of truth.** An in-process
+  event bus (`app/core/events.py`) publishes one event from the same `Orchestrator._persist` call
+  that already writes every phase to SQLite — the GUI's SSE stream tells a connected browser
+  "re-fetch this incident," never carries state of its own. Single-process only, by design, since
+  Sentinel is single-replica (see `k8s/overlays/aws/sentinel/deployment.yaml`'s `strategy:
+  Recreate`); revisit if that ever changes.
+- **Diagnosis/remediation feedback is data collection, not live retraining.** `incident_feedback`
+  (`app/routers/feedback.py`) is read only by `/api/performance/summary` today. Nothing in the
+  Decision Engine reads it — submitting feedback cannot change how Sentinel handles the next
+  incident.
+- **Temporary SRE authorization does not add a second path to the cluster.** The one feature that
+  lets a human click cause a cluster mutation (`app/routers/authorizations.py`) still goes through
+  the real Policy Engine and Remediation Engine. It adds exactly one thing to `PolicyEngine.evaluate`
+  — an optional `human_override` that substitutes a human's judgement for the model's *confidence
+  number*, nothing else (see that parameter's docstring in `lifecycle/policy.py`). Every other
+  check — the frozen deny-list, the allow-lists, the action cap, the cooldown, and each action's own
+  preconditions — still applies in full, and is proven to by dedicated tests
+  (`tests/test_policy.py`'s `human_override` suite). The grant itself
+  (`temporary_authorizations` table) is scoped to one incident and one action, single-use, expires
+  in 15 minutes, and never edits `PolicyConfig`'s actual thresholds.
+- **Reachability matches Sentinel's own.** `sentinel-gui` is deliberately kept off any public
+  Ingress too (`k8s/overlays/aws/sentinel-gui/service.yaml`) — an SRE reaches both it and
+  `sentinel-ai` the same way, via `kubectl port-forward` (see `k8s/README.md`).
+
+A full implementation plan (page structure, API surface, data models, phased rollout) was written
+before any of this was built and is kept for reference in the repository's project history rather
+than duplicated here, since each router's own module docstring is the source of truth for its
+current behavior going forward.
+
 ## Testing the loop
 
 `scripts/incident-scenarios.sh` is the test harness for Sentinel itself, not just for this
@@ -464,6 +508,13 @@ refactor was written in. That is the load-bearing gap before calling this demo-r
 6. **Discovery is shallow, deliberately** (spec section 20's explicit instruction): namespace-scoped
    deployments/services/pod-count only. No dependency graph, no traffic-pattern modelling, no
    service-mesh topology.
+7. **The GUI assumes the in-cluster Sentinel topology, not the standalone remote one.**
+   `sentinel-gui`'s deployment (`k8s/overlays/aws/sentinel-gui/`) and its default
+   `VITE_API_BASE_URL` are built against `k8s/overlays/aws/sentinel/` (Sentinel running inside the
+   K3s cluster). The alternate `enable_remote_sentinel` topology
+   (`infra/terraform/sentinel_remote.tf` — Sentinel on its own external EC2 instance) has no GUI
+   deployment story yet; reaching that Sentinel's API today still means the systemd/journalctl
+   workflow `sentinel_user_data.sh.tftpl` sets up, not this GUI.
 
 ## Next steps toward replacing the external LLM with a standalone Sentinel model
 

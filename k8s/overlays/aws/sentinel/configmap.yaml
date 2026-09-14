@@ -103,3 +103,13 @@ data:
 
   # --- Storage -----------------------------------------------------------
   SENTINEL_DB_PATH: /data/sentinel.db
+
+  # --- Sentinel SRE Control Center (GUI) -----------------------------------
+  # The browser origin the GUI is served from. Set to the port-forwarded
+  # localhost address an SRE reaches sentinel-gui at (see
+  # ../sentinel-gui/deployment.yaml's long comment on why port-forward,
+  # not a public path, is how both of these are reached) — NOT the
+  # in-cluster Service DNS name, since CORS is enforced against the
+  # browser's actual origin, and the browser is always on the operator's
+  # laptop here, not inside the cluster.
+  SENTINEL_GUI_ORIGINS: http://localhost:8081

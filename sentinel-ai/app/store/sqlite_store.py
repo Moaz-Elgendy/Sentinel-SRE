@@ -137,6 +137,43 @@ CREATE TABLE IF NOT EXISTS temporary_authorizations (
     permanent_policy_changed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_authz_incident ON temporary_authorizations(incident_id);
+
+-- Sentinel Administration & Tuning Center: live configuration overrides and
+-- their audit history (see app/routers/config.py). Two tables, deliberately
+-- separate:
+--
+-- `config_overrides` is CURRENT STATE ONLY — one row per (category,
+-- field_name), upserted in place. This is what gets re-applied on top of
+-- `settings`-derived defaults at startup (see main.py's lifespan), so a
+-- live change survives a pod restart instead of silently reverting to
+-- whatever is in the ConfigMap.
+--
+-- `config_history` is APPEND-ONLY — every apply (and every restore, which
+-- is itself just another apply — see routers/config.py's restore endpoint)
+-- adds a new row and never edits or deletes an old one. This table, not
+-- `config_overrides`, is the real record of "who changed what, when, and
+-- why"; `config_overrides` alone could not answer that.
+CREATE TABLE IF NOT EXISTS config_overrides (
+    category        TEXT NOT NULL,
+    field_name      TEXT NOT NULL,
+    value_json       TEXT NOT NULL,
+    updated_at      REAL NOT NULL,
+    updated_by      TEXT NOT NULL,
+    PRIMARY KEY (category, field_name)
+);
+
+CREATE TABLE IF NOT EXISTS config_history (
+    id              TEXT PRIMARY KEY,
+    category        TEXT NOT NULL,
+    changes_json    TEXT NOT NULL,   -- [{field, old_value, new_value}, ...]
+    reason          TEXT,
+    admin_id        TEXT NOT NULL,
+    status          TEXT NOT NULL,   -- 'applied' | 'rejected'
+    detail          TEXT,            -- rejection reason, or a short summary
+    restores_change_id TEXT,         -- set when this entry is itself a restore
+    created_at      REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_config_history_category ON config_history(category);
 """
 
 
@@ -584,3 +621,109 @@ class SQLiteStore:
                 (incident_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---- configuration overrides + history (Sentinel Administration & ----
+    # ---- Tuning Center) -----------------------------------------------
+    def get_config_overrides(self, category: str) -> dict[str, Any]:
+        """Current effective overrides for one category, field_name ->
+        decoded value. Applied on top of settings-derived defaults at
+        startup (see main.py) and after every successful apply (see
+        routers/config.py) so the running process and the stored state
+        never disagree."""
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT field_name, value_json FROM config_overrides WHERE category = ?",
+                (category,),
+            ).fetchall()
+        return {r["field_name"]: json.loads(r["value_json"]) for r in rows}
+
+    def set_config_override(
+        self, category: str, field_name: str, value: Any, updated_at: float, updated_by: str
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO config_overrides (category, field_name, value_json, updated_at, updated_by)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(category, field_name) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by
+                """,
+                (category, field_name, json.dumps(value), updated_at, updated_by),
+            )
+            conn.commit()
+
+    def create_config_history_entry(
+        self,
+        entry_id: str,
+        category: str,
+        changes: list[dict[str, Any]],
+        reason: str | None,
+        admin_id: str,
+        status: str,
+        detail: str | None,
+        created_at: float,
+        restores_change_id: str | None = None,
+    ) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO config_history
+                    (id, category, changes_json, reason, admin_id, status, detail,
+                     restores_change_id, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    entry_id,
+                    category,
+                    json.dumps(changes),
+                    reason,
+                    admin_id,
+                    status,
+                    detail,
+                    restores_change_id,
+                    created_at,
+                ),
+            )
+            conn.commit()
+
+    def list_config_history(
+        self, category: str | None = None, limit: int = 100, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        conn = self._require()
+        with self._lock:
+            if category:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM config_history WHERE category = ?
+                    ORDER BY created_at DESC LIMIT ? OFFSET ?
+                    """,
+                    (category, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM config_history ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset),
+                ).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            d["changes"] = json.loads(d.pop("changes_json"))
+            results.append(d)
+        return results
+
+    def get_config_history_entry(self, entry_id: str) -> dict[str, Any] | None:
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                "SELECT * FROM config_history WHERE id = ?", (entry_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["changes"] = json.loads(d.pop("changes_json"))
+        return d

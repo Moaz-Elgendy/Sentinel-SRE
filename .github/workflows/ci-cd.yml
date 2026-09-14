@@ -14,7 +14,7 @@
 #
 # What this does, only on a push to main (not on PRs), and only after every
 # job above has passed:
-#   - Builds and pushes all four images to Amazon ECR, tagged with both
+#   - Builds and pushes all five images to Amazon ECR, tagged with both
 #     `latest` and the commit SHA
 #   - Deploys to the K3s cluster on EC2
 #
@@ -71,7 +71,7 @@
 #   nothing is deployed. This is the one to run when you just want to know
 #   "is the pipeline's AWS wiring still good."
 #
-# test_mode = full-dry-run: also builds and pushes all four images, but
+# test_mode = full-dry-run: also builds and pushes all five images, but
 #   tagged :manual-test-<run_id> — never :latest, never :<sha> — so it can
 #   never be picked up by a real deploy and never collides with a tag
 #   Sentinel might need to correlate or roll back to. Still does not deploy.
@@ -189,6 +189,28 @@ jobs:
           # the same value docker-compose's frontend build uses locally
           # (http://localhost:8000) — see that file for why.
           VITE_API_BASE_URL: ""
+
+  # Unlike frontend above, no VITE_API_BASE_URL override: sentinel-gui is
+  # never reached through an Ingress (see
+  # k8s/overlays/aws/sentinel-gui/deployment.yaml's comment for why — it
+  # deliberately stays off any public path, the same as sentinel-ai
+  # itself), so its Dockerfile default of http://localhost:8080 is correct
+  # for the real deployment too, not just local dev. Nothing to set here.
+  lint-and-build-sentinel-gui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sentinel-gui
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: sentinel-gui/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
 
   validate-k8s-manifests:
     runs-on: ubuntu-latest
@@ -382,7 +404,7 @@ jobs:
 
       - name: Confirm ECR read access
         run: |
-          for svc in citizen-service notification-service frontend sentinel-ai; do
+          for svc in citizen-service notification-service frontend sentinel-ai sentinel-gui; do
             echo "--- ${ECR_REPOSITORY_PREFIX}/${svc} ---"
             aws ecr describe-repositories \
               --repository-names "${ECR_REPOSITORY_PREFIX}/${svc}" \
@@ -461,6 +483,9 @@ jobs:
           - service: sentinel-ai
             context: sentinel-ai
             build_args: ""
+          - service: sentinel-gui
+            context: sentinel-gui
+            build_args: ""
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -496,6 +521,7 @@ jobs:
       - test-citizen-service
       - test-notification-service
       - lint-and-build-frontend
+      - lint-and-build-sentinel-gui
       - validate-k8s-manifests
       - test-sentinel-ai
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -523,6 +549,11 @@ jobs:
               VITE_API_BASE_URL=
           - service: sentinel-ai
             context: sentinel-ai
+            build_args: ""
+          - service: sentinel-gui
+            context: sentinel-gui
+            # No VITE_API_BASE_URL override — see lint-and-build-sentinel-gui's
+            # comment on why the Dockerfile default is correct here too.
             build_args: ""
     steps:
       - uses: actions/checkout@v7

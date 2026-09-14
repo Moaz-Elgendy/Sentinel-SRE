@@ -278,7 +278,8 @@ the browser) instead of quietly running the wrong thing.
 - **Chaos enabled**, so the failure scenarios exist to demonstrate.
 - **Sentinel added.** It has no local-development equivalent yet, so it is a resource in this
   overlay rather than a patch on the base. When a local Sentinel setup exists, it should be
-  promoted into `base/`.
+  promoted into `base/`. The Sentinel SRE Control Center GUI (`sentinel-gui/`) is added alongside
+  it for the same reason, and is reached the same way — see below.
 - **Replica counts right-sized for 2 vCPU.** Fixed by hand, no HPA.
 - **Alertmanager gets a webhook receiver** pointing at `http://sentinel-ai:8080/api/alerts/webhook`,
   plus the additional alert rules the new chaos scenarios need (`HighCPUUsage`,
@@ -294,6 +295,23 @@ on the node — for example:
 ```bash
 sudo kubectl -n citizen-portal port-forward svc/sentinel-ai 8080:8080
 ```
+
+**The Sentinel SRE Control Center GUI works the same way, and needs both port-forwards running
+at once** — one for the GUI's static bundle, one for the API it calls from your browser:
+
+```bash
+sudo kubectl -n citizen-portal port-forward svc/sentinel-ai 8080:8080 &
+sudo kubectl -n citizen-portal port-forward svc/sentinel-gui 8081:8081 &
+# then open http://localhost:8081 and sign in
+```
+
+This isn't a shortcut taken for convenience — `sentinel-gui/deployment.yaml`'s own comment explains
+why the GUI stays off any Ingress deliberately, the same as `sentinel-ai` itself. Sign-in
+credentials come from `SENTINEL_ADMIN_USERNAME`/`SENTINEL_ADMIN_PASSWORD` in
+`overlays/aws/secrets/sentinel.env` if you set them, or otherwise from a one-time password Sentinel
+generates and logs at startup — `sudo kubectl -n citizen-portal logs deploy/sentinel-ai | grep
+sentinel_gui_admin_bootstrapped` right after the first rollout, before that log line scrolls out of
+view.
 
 `docs/aws-deployment.md` has the full set, including how to tunnel a port through Session Manager
 to a laptop.

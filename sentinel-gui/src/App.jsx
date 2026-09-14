@@ -3,6 +3,7 @@ import AppLayout from './components/layout/AppLayout.jsx'
 import ProtectedRoute from './components/layout/ProtectedRoute.jsx'
 import { AuthProvider } from './context/AuthContext.jsx'
 import ActionHistoryPage from './pages/ActionHistoryPage.jsx'
+import ConfigHistoryPage from './pages/ConfigHistoryPage.jsx'
 import DashboardPage from './pages/DashboardPage.jsx'
 import DemoChaosPage from './pages/DemoChaosPage.jsx'
 import EnvironmentPage from './pages/EnvironmentPage.jsx'
@@ -11,6 +12,7 @@ import IncidentsListPage from './pages/IncidentsListPage.jsx'
 import LoginPage from './pages/LoginPage.jsx'
 import NotFoundPage from './pages/NotFoundPage.jsx'
 import PerformancePage from './pages/PerformancePage.jsx'
+import PoliciesPage from './pages/PoliciesPage.jsx'
 
 export default function App() {
   return (
@@ -26,6 +28,8 @@ export default function App() {
             <Route path="/environment" element={<EnvironmentPage />} />
             <Route path="/actions" element={<ActionHistoryPage />} />
             <Route path="/performance" element={<PerformancePage />} />
+            <Route path="/policies" element={<PoliciesPage />} />
+            <Route path="/config-history" element={<ConfigHistoryPage />} />
             <Route path="/demo" element={<DemoChaosPage />} />
           </Route>
         </Route>
