@@ -186,6 +186,14 @@ a {
   padding: 0 12px 6px;
 }
 
+.sidebar__section-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  padding: 16px 12px 6px;
+}
+
 .sidebar__link--demo {
   color: var(--text-faint);
   font-size: 12px;
@@ -945,6 +953,18 @@ input[type='email'] {
   border: 1px solid rgba(240, 68, 56, 0.3);
 }
 
+.alert-banner--success {
+  background: var(--ok-bg);
+  color: var(--ok);
+  border: 1px solid rgba(18, 183, 106, 0.3);
+}
+
+.alert-banner--warn {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border: 1px solid rgba(247, 144, 9, 0.3);
+}
+
 .spinner-wrap {
   display: flex;
   align-items: center;
@@ -1139,4 +1159,41 @@ input[type='email'] {
   display: flex;
   gap: 10px;
   margin-top: 12px;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Configuration history (Sentinel Administration & Tuning Center)        */
+/* ---------------------------------------------------------------------- */
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.history-entry {
+  border-bottom: 1px solid var(--border-soft);
+}
+.history-entry:last-child {
+  border-bottom: none;
+}
+
+.history-entry__header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 4px;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.history-entry__header:hover {
+  background: var(--border-soft);
+}
+
+.history-entry__body {
+  padding: 8px 4px 16px 4px;
 }

@@ -1,17 +1,31 @@
 # ClusterIP only, with no Ingress rule anywhere in this overlay.
 #
-# Sentinel's API is an internal control surface: the Alertmanager webhook
-# receiver that triggers incident processing, and read endpoints exposing
-# incident history. Neither is authenticated, because within the cluster the
-# only caller is Alertmanager.
+# Sentinel's API has two very different trust levels on the same Service:
 #
-# That lack of authentication is precisely why there is no Ingress path for
-# it. Exposing /api/alerts/webhook publicly would let anyone on the internet
-# fabricate an alert and cause Sentinel to investigate and remediate — an
-# unauthenticated trigger for autonomous cluster actions. Adding an Ingress
-# rule for this Service without first adding authentication would be a
-# serious mistake, so the comment is here rather than in a document nobody
-# reads.
+#   * /api/alerts/webhook — the Alertmanager webhook receiver. Genuinely
+#     unauthenticated, because within the cluster the only caller is
+#     Alertmanager, and this is the trigger for autonomous incident
+#     handling. Exposing this publicly would let anyone on the internet
+#     fabricate an alert and cause Sentinel to investigate and remediate —
+#     an unauthenticated trigger for autonomous cluster actions.
+#   * /api/sentinel/chaos-scenarios — gated by its own pre-existing
+#     shared-secret header (X-Chaos-Token), unrelated to the GUI's auth.
+#   * Everything else (/api/incidents, /environments, /api/dashboard,
+#     /api/actions, /api/performance, /api/meta, /api/events,
+#     /api/incidents/*/feedback, /api/incidents/*/authorize) is the
+#     Sentinel SRE Control Center GUI's API and IS admin-JWT-authenticated
+#     (see app/core/deps.py) — this is genuinely safe to reach from
+#     outside the cluster on its own merits.
+#
+# Adding this to an Ingress would still be a mistake TODAY, because a
+# Service-level route has no way to expose only the second group: Traefik
+# would need a path-based rule that happens to line up with exactly which
+# routers are auth-gated, which is exactly the kind of rule that silently
+# goes stale the next time a router is added. Until that is solved
+# properly, this Service stays off any Ingress and is reached by
+# `kubectl port-forward`, the same as the Sentinel GUI itself
+# (../sentinel-gui/service.yaml) — deploy that alongside this one and
+# port-forward both.
 #
 # To inspect incidents from a laptop, port-forward through SSM:
 #   aws ssm start-session --target <instance-id>

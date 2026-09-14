@@ -995,7 +995,7 @@ the intended path and the one the repository is built around.
 **Route B â€” build locally.** Useful for the very first deploy, before CI is wired, and for
 debugging. Steps 16 and 17 describe this route.
 
-## Step 16. Build the four images
+## Step 16. Build the five images
 
 From the repository root **on your own machine** (not on the node â€” the node has no Docker; K3s
 uses containerd and pulls from ECR).
@@ -1017,6 +1017,7 @@ docker build -t "${ECR_REGISTRY}/${PREFIX}/notification-service:${TAG}" ./notifi
 docker build -t "${ECR_REGISTRY}/${PREFIX}/sentinel-ai:${TAG}"          ./sentinel-ai
 docker build -t "${ECR_REGISTRY}/${PREFIX}/frontend:${TAG}" \
   --build-arg VITE_API_BASE_URL= ./frontend
+docker build -t "${ECR_REGISTRY}/${PREFIX}/sentinel-gui:${TAG}" ./sentinel-gui
 ```
 
 > **The frontend build argument is not optional and not cosmetic.** `VITE_API_BASE_URL=` (empty)
@@ -1024,8 +1025,14 @@ docker build -t "${ECR_REGISTRY}/${PREFIX}/frontend:${TAG}" \
 > `docker-compose` uses locally is `http://localhost:8000`, and a frontend built with that will
 > load fine on the public IP and then fail every API call, because the browser will be trying to
 > reach the visitor's own machine. If the portal renders but nothing works, check this first.
+>
+> **`sentinel-gui` needs NO build argument here** â€” unlike `frontend`, it is never reached through
+> the Ingress (see `k8s/overlays/aws/sentinel-gui/deployment.yaml`'s comment for why). Its default
+> `VITE_API_BASE_URL=http://localhost:8080` is correct as-is: it is always reached through
+> `kubectl port-forward` to an SRE's own laptop, where `localhost:8080` is exactly where the
+> equivalent `sentinel-ai` port-forward puts the API.
 
-Expected: four successful builds. Confirm:
+Expected: five successful builds. Confirm:
 
 ```bash
 docker images --filter "reference=${ECR_REGISTRY}/${PREFIX}/*" \
@@ -1038,11 +1045,12 @@ Expected output:
 REPOSITORY                                                              TAG        SIZE
 123456789012.dkr.ecr.eu-west-1.amazonaws.com/sentinel-sre-demo/frontend             9f3c1a8...  48MB
 123456789012.dkr.ecr.eu-west-1.amazonaws.com/sentinel-sre-demo/sentinel-ai          9f3c1a8...  180MB
+123456789012.dkr.ecr.eu-west-1.amazonaws.com/sentinel-sre-demo/sentinel-gui         9f3c1a8...  50MB
 123456789012.dkr.ecr.eu-west-1.amazonaws.com/sentinel-sre-demo/notification-service 9f3c1a8...  210MB
 123456789012.dkr.ecr.eu-west-1.amazonaws.com/sentinel-sre-demo/citizen-service      9f3c1a8...  240MB
 ```
 
-Sizes will differ. Four images with the same tag is the thing to confirm.
+Sizes will differ. Five images with the same tag is the thing to confirm.
 
 ## Step 17. Push to ECR
 
@@ -1060,7 +1068,7 @@ Login Succeeded
 Then:
 
 ```bash
-for svc in citizen-service notification-service frontend sentinel-ai; do
+for svc in citizen-service notification-service frontend sentinel-ai sentinel-gui; do
   docker push "${ECR_REGISTRY}/${PREFIX}/${svc}:${TAG}"
 done
 ```
