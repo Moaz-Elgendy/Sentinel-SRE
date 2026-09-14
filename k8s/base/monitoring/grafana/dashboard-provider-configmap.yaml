@@ -1,0 +1,19 @@
+# Points Grafana at /var/lib/grafana/dashboards for auto-loaded dashboard
+# JSON — see dashboard-json-configmap.yaml, mounted there in deployment.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: citizen-portal
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: citizen-portal
+        orgId: 1
+        folder: "Citizen Portal"
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards

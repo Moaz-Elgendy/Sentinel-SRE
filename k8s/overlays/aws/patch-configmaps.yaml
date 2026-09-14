@@ -1,0 +1,65 @@
+# ConfigMap overrides for the AWS environment.
+#
+# A strategic-merge patch on a ConfigMap's `data` map adds or replaces
+# individual keys and leaves the rest alone, so everything the base sets
+# (DATABASE_HOST, JWT_ALGORITHM, UPLOAD_DIR, ...) is inherited untouched.
+#
+# This is done as a patch rather than a configMapGenerator with
+# `behavior: merge`, because merge/replace generator behaviour only applies
+# to ConfigMaps that were themselves produced by a generator in the base —
+# and the base declares these as plain manifests.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: citizen-service-config
+  namespace: citizen-portal
+data:
+  # Chaos is off in the base, so a stock local deploy exposes no chaos
+  # surface at all (the endpoints return 404). The AWS environment exists
+  # specifically to demonstrate incident detection and autonomous
+  # remediation, so it has to be on.
+  #
+  # This is only safe because the accompanying CHAOS_ADMIN_TOKEN is a real
+  # generated secret rather than the base's `replace_me`, and because the
+  # chaos routes return 404 rather than 401 to an unauthenticated caller —
+  # so the surface is not discoverable. It is still the single most
+  # security-relevant setting in this overlay.
+  CHAOS_MODE: "true"
+
+  # The portal is reached by raw IP (http://<public-ip>) — there is no DNS
+  # name and no TLS yet, so the browser's Origin header is the IP.
+  #
+  # PUBLIC_IP_PLACEHOLDER is substituted at deploy time by
+  # scripts/deploy-aws.sh, which knows the Terraform output. It is left as
+  # an obviously-invalid placeholder rather than a wildcard on purpose:
+  # CORS_ALLOWED_ORIGINS guards session-bearing login and profile endpoints,
+  # and "*" would disable that protection permanently and invisibly.
+  # An unsubstituted placeholder fails loudly in the browser instead.
+  CORS_ALLOWED_ORIGINS: http://PUBLIC_IP_PLACEHOLDER
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notification-service-config
+  namespace: citizen-portal
+data:
+  CHAOS_MODE: "true"
+
+  # The base sets 0.3 here. That value is not just a default failure rate —
+  # notification-service's /api/chaos/reset restores
+  # notification_failure_rate to CHAOS_FAILURE_RATE rather than to zero
+  # (see notification-service/app/chaos/state.py's reset()). So with the
+  # base's 0.3, a "reset" would leave a 30% notification failure rate
+  # permanently armed the moment CHAOS_MODE is enabled.
+  #
+  # That would quietly break two things: Sentinel's reset_chaos_fault
+  # remediation could never report success, and its recovery validation
+  # would keep seeing failures after a reset it had just performed —
+  # leading it to conclude its own remediation had failed and escalate.
+  #
+  # Setting it to 0.0 makes "reset" mean "no fault", which is what both of
+  # those depend on.
+  CHAOS_FAILURE_RATE: "0.0"
+
+  CORS_ALLOWED_ORIGINS: http://PUBLIC_IP_PLACEHOLDER

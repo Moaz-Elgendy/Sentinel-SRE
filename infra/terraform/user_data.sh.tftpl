@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+#
+# Bootstrap for the Sentinel SRE demo K3s node.
+#
+# Rendered by Terraform (see ec2.tf) and executed by cloud-init on first
+# boot only. Progress is logged to /var/log/sentinel-bootstrap.log and the
+# script writes /var/lib/sentinel/bootstrap-complete on success, which is
+# the thing to check when verifying the instance came up correctly:
+#
+#   sudo cat /var/lib/sentinel/bootstrap-complete
+#   sudo tail -f /var/log/sentinel-bootstrap.log
+#
+# Deliberately NOT in here: any AWS access key. The instance authenticates
+# to ECR through its instance profile via IMDS.
+
+set -euo pipefail
+
+exec > >(tee -a /var/log/sentinel-bootstrap.log) 2>&1
+
+echo "=== sentinel bootstrap starting: $(date -Is) ==="
+
+AWS_REGION="${aws_region}"
+AWS_ACCOUNT_ID="${aws_account_id}"
+ECR_REGISTRY="${ecr_registry}"
+K3S_VERSION="${k3s_version}"
+APP_NAMESPACE="${app_namespace}"
+REPO_URL="${repo_url}"
+REPO_DIR="${repo_dir}"
+
+export DEBIAN_FRONTEND=noninteractive
+
+# ---------------------------------------------------------------------------
+# 1. Base packages
+# ---------------------------------------------------------------------------
+echo "--- installing base packages ---"
+apt-get update -y
+apt-get install -y --no-install-recommends \
+  curl ca-certificates unzip jq git
+
+# ---------------------------------------------------------------------------
+# 2. AWS CLI v2
+#
+# Needed for `aws ecr get-login-password` in the credential refresh timer
+# below. Ubuntu's archive ships awscli v1, which is old enough to be
+# awkward, so install v2 from AWS directly.
+# ---------------------------------------------------------------------------
+if ! command -v aws >/dev/null 2>&1; then
+  echo "--- installing AWS CLI v2 ---"
+  cd /tmp
+  curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+  unzip -q awscliv2.zip
+  ./aws/install
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+aws --version
+
+# ---------------------------------------------------------------------------
+# 3. SSM agent
+#
+# Ubuntu's official AMIs ship amazon-ssm-agent preinstalled as a snap. This
+# only makes sure it is enabled and running — without it there is no way to
+# administer this box at all, since there is no SSH port open.
+# ---------------------------------------------------------------------------
+echo "--- ensuring SSM agent is running ---"
+if snap list amazon-ssm-agent >/dev/null 2>&1; then
+  snap start amazon-ssm-agent || true
+  snap services amazon-ssm-agent || true
+else
+  # Fallback for an AMI without the snap preinstalled.
+  snap install amazon-ssm-agent --classic || true
+  snap start amazon-ssm-agent || true
+fi
+
+# ---------------------------------------------------------------------------
+# 4. K3s
+#
+# Traefik is K3s's bundled default ingress controller and is deliberately
+# left ENABLED — the whole ingress path for this environment is
+# Internet -> :80 -> Traefik -> Ingress -> Service. Do not add
+# --disable=traefik here, and do not install ingress-nginx alongside it;
+# two controllers both claiming :80 is a hostPort conflict.
+#
+# ServiceLB (klipper-lb) is also left enabled: it is what binds Traefik's
+# LoadBalancer Service to the node's :80/:443, which is what makes the
+# instance's public IP serve the portal without any cloud load balancer.
+#
+# --tls-san adds the public IP to the API server certificate. The API is
+# not exposed publicly (no 6443 security-group rule — see security.tf);
+# this only means a kubeconfig copied off the box for use over an SSM port
+# forward does not fail certificate validation.
+# ---------------------------------------------------------------------------
+echo "--- installing K3s ${k3s_version} ---"
+
+PUBLIC_IP="$(curl -sS -H "X-aws-ec2-metadata-token: $(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')" http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")"
+echo "detected public IP: $${PUBLIC_IP:-<none>}"
+
+INSTALL_ARGS=(
+  "--write-kubeconfig-mode" "0600"
+  "--node-name" "sentinel-k3s-node"
+)
+if [ -n "$${PUBLIC_IP}" ]; then
+  INSTALL_ARGS+=("--tls-san" "$${PUBLIC_IP}")
+fi
+
+curl -sfL https://get.k3s.io | \
+  INSTALL_K3S_VERSION="$${K3S_VERSION}" \
+  INSTALL_K3S_EXEC="server $${INSTALL_ARGS[*]}" \
+  sh -
+
+# k3s bundles kubectl; expose it under the normal name so every documented
+# command and every SSM-driven deploy can just say `kubectl`.
+ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+
+# kubeconfig is mode 0600 and owned by root, so kubectl requires sudo.
+# Exporting KUBECONFIG for login shells means `sudo kubectl get pods -A`
+# works without anyone having to remember the path.
+cat >/etc/profile.d/k3s.sh <<'PROFILE'
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+PROFILE
+chmod 0644 /etc/profile.d/k3s.sh
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+echo "--- waiting for node to become Ready (up to 5 min) ---"
+for _ in $(seq 1 60); do
+  if kubectl get nodes 2>/dev/null | grep -qw Ready; then
+    echo "node is Ready"
+    break
+  fi
+  sleep 5
+done
+kubectl get nodes -o wide || true
+
+echo "--- waiting for Traefik to be rolled out (up to 5 min) ---"
+# Traefik is installed by K3s asynchronously via a HelmChart CR, so the
+# Deployment does not exist immediately after k3s starts.
+for _ in $(seq 1 60); do
+  if kubectl -n kube-system get deployment traefik >/dev/null 2>&1; then
+    kubectl -n kube-system rollout status deployment/traefik --timeout=180s || true
+    break
+  fi
+  sleep 5
+done
+
+# ---------------------------------------------------------------------------
+# 5. Application namespace
+#
+# Created here rather than waiting for the first `kubectl apply` so the ECR
+# credential secret below has somewhere to live on first boot.
+# ---------------------------------------------------------------------------
+kubectl create namespace "$${APP_NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+# ---------------------------------------------------------------------------
+# 6. ECR pull credentials
+#
+# ECR authorization tokens are valid for 12 hours, so a static
+# imagePullSecret would break every night. This installs a refresh script
+# plus a systemd timer that rewrites the secret every 6 hours (and on
+# boot), using the instance profile for authentication — no stored keys.
+#
+# The alternative, /etc/rancher/k3s/registries.yaml, would need a k3s
+# restart on every token refresh; an imagePullSecret does not.
+# ---------------------------------------------------------------------------
+echo "--- installing ECR credential refresh ---"
+
+# Quoted heredoc delimiter — see the note above the sentinel-deploy.sh
+# heredoc below for the full explanation of the quoting convention.
+cat >/usr/local/bin/refresh-ecr-credentials.sh <<'REFRESH'
+#!/usr/bin/env bash
+# Refresh the ECR imagePullSecret. Credentials come from the EC2 instance
+# profile via IMDS; nothing is stored on disk, and the token this writes into
+# the Secret is valid for 12 hours (hence the 6-hourly timer).
+set -euo pipefail
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+export AWS_DEFAULT_REGION="${aws_region}"
+
+password="$(aws ecr get-login-password --region "${aws_region}")"
+
+kubectl -n "${app_namespace}" create secret docker-registry ecr-credentials \
+  --docker-server="${ecr_registry}" \
+  --docker-username=AWS \
+  --docker-password="$${password}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+echo "ecr-credentials refreshed in namespace ${app_namespace} at $(date -Is)"
+REFRESH
+chmod 0700 /usr/local/bin/refresh-ecr-credentials.sh
+
+cat >/etc/systemd/system/refresh-ecr-credentials.service <<'UNIT'
+[Unit]
+Description=Refresh ECR imagePullSecret for the citizen portal namespace
+After=k3s.service
+Requires=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/refresh-ecr-credentials.sh
+UNIT
+
+cat >/etc/systemd/system/refresh-ecr-credentials.timer <<'UNIT'
+[Unit]
+Description=Refresh ECR imagePullSecret every 6 hours
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=6h
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now refresh-ecr-credentials.timer
+# Run once immediately so the secret exists before the first deploy.
+systemctl start refresh-ecr-credentials.service || \
+  echo "WARNING: initial ECR credential refresh failed; the timer will retry"
+
+# ---------------------------------------------------------------------------
+# 7. Repository checkout
+#
+# The node keeps a checkout so an operator (or a CI-driven SSM command) can
+# `kubectl apply -k k8s/overlays/aws` without shipping rendered manifests
+# over SSM, which has a payload size limit.
+#
+# Only works unattended for a public repository. For a private one this
+# clone fails harmlessly and the directory must be populated another way —
+# see docs/aws-deployment.md.
+# ---------------------------------------------------------------------------
+if [ -n "$${REPO_URL}" ]; then
+  echo "--- cloning $${REPO_URL} ---"
+  if [ ! -d "$${REPO_DIR}/.git" ]; then
+    git clone "$${REPO_URL}" "$${REPO_DIR}" || \
+      echo "WARNING: clone failed (private repo?). Populate $${REPO_DIR} manually."
+  fi
+  git config --global --add safe.directory "$${REPO_DIR}" || true
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Deploy helper
+#
+# Invoked by CI over SSM (see .github/workflows/ci-cd.yml). Kept as a
+# script on the node, rather than a long inline command in the workflow, so
+# that the set of things CI is able to ask the node to do is fixed, small,
+# and reviewable here.
+# ---------------------------------------------------------------------------
+# NOTE ON QUOTING: the heredoc delimiters in this file are QUOTED, e.g.
+# <<'DEPLOY'. That means bash performs NO expansion while writing the file —
+# no variable expansion, no command substitution, no backtick evaluation.
+# Terraform still substitutes its own template placeholders, because it
+# processes this file before bash ever sees it. So the convention inside a
+# quoted heredoc is:
+#
+#   a single-dollar placeholder  -> substituted by Terraform, at render time
+#   a double-dollar placeholder  -> becomes a single dollar in the output,
+#                                   and is expanded by bash at runtime
+#
+# With an UNQUOTED delimiter every runtime dollar sign and every backtick
+# would need escaping, and getting one wrong does not fail loudly — it
+# executes the fragment during boot instead of writing it into the script.
+# That actually happened during development with a backtick in a comment.
+# Quoting the delimiter removes the entire class of bug.
+cat >/usr/local/bin/sentinel-deploy.sh <<'DEPLOY'
+#!/usr/bin/env bash
+# Deploy a specific image tag to the citizen portal namespace.
+#
+# Usage:
+#   sentinel-deploy.sh images <git-sha>   # roll the 4 service images to <git-sha>
+#   sentinel-deploy.sh apply <git-sha>    # git checkout <git-sha> + kubectl apply -k
+#
+# "images" is the normal CI path: it changes only the container images,
+# which produces a clean new ReplicaSet and therefore real rollout history
+# for Sentinel to correlate against and roll back to.
+#
+# "apply" is for manifest changes and requires the checkout in ${repo_dir}.
+set -euo pipefail
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+MODE="$${1:?usage: sentinel-deploy.sh <images|apply> <git-sha>}"
+SHA="$${2:?usage: sentinel-deploy.sh <images|apply> <git-sha>}"
+NS="${app_namespace}"
+REGISTRY="${ecr_registry}"
+PREFIX="${ecr_repo_prefix}"
+REPO_DIR="${repo_dir}"
+
+case "$${MODE}" in
+  images)
+    # "kubectl set image" only updates a Deployment that already exists, and
+    # its error when one does not is not obvious. The very first deploy of a
+    # fresh cluster has to create the resources, which is deploy-aws.sh's
+    # job, so fail here with the actual instruction rather than letting CI
+    # report "deployments.apps not found".
+    if ! kubectl -n "$${NS}" get deployment citizen-service >/dev/null 2>&1; then
+      echo "ERROR: the citizen-portal Deployments do not exist yet." >&2
+      echo "The first deploy must create them:" >&2
+      echo "  sudo $${REPO_DIR}/scripts/generate-aws-secrets.sh" >&2
+      echo "  sudo $${REPO_DIR}/scripts/deploy-aws.sh $${SHA}" >&2
+      echo "Subsequent CI deploys can then use this 'images' mode." >&2
+      exit 1
+    fi
+
+    # Init containers share the service image, so they are set too —
+    # otherwise the migration job would run the previous version's code.
+    kubectl -n "$${NS}" set image deployment/citizen-service \
+      citizen-service="$${REGISTRY}/$${PREFIX}/citizen-service:$${SHA}" \
+      migrate-and-seed="$${REGISTRY}/$${PREFIX}/citizen-service:$${SHA}"
+    kubectl -n "$${NS}" set image deployment/notification-service \
+      notification-service="$${REGISTRY}/$${PREFIX}/notification-service:$${SHA}" \
+      migrate="$${REGISTRY}/$${PREFIX}/notification-service:$${SHA}"
+    kubectl -n "$${NS}" set image deployment/frontend \
+      frontend="$${REGISTRY}/$${PREFIX}/frontend:$${SHA}"
+    kubectl -n "$${NS}" set image deployment/sentinel-ai \
+      sentinel-ai="$${REGISTRY}/$${PREFIX}/sentinel-ai:$${SHA}" || \
+      echo "note: sentinel-ai deployment not present yet, skipped"
+    ;;
+  apply)
+    cd "$${REPO_DIR}"
+    git fetch --all --tags
+    git checkout --detach "$${SHA}"
+    kubectl apply -k k8s/overlays/aws
+    ;;
+  *)
+    echo "unknown mode: $${MODE}" >&2
+    exit 2
+    ;;
+esac
+
+# Deliberately NOT waiting for rollout success here. A bad deployment is a
+# scenario this project exists to demonstrate: CI's job is to deploy, and
+# Sentinel's job is to notice and remediate. Blocking CI on rollout status
+# would mask exactly the failure mode we want observed.
+kubectl -n "$${NS}" get deployments -o wide
+DEPLOY
+chmod 0755 /usr/local/bin/sentinel-deploy.sh
+
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
+mkdir -p /var/lib/sentinel
+cat >/var/lib/sentinel/bootstrap-complete <<EOF
+completed_at=$(date -Is)
+k3s_version=$${K3S_VERSION}
+region=$${AWS_REGION}
+ecr_registry=$${ECR_REGISTRY}
+namespace=$${APP_NAMESPACE}
+EOF
+
+echo "=== sentinel bootstrap complete: $(date -Is) ==="

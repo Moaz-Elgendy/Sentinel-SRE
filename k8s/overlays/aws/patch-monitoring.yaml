@@ -1,0 +1,238 @@
+# Observability changes for the AWS environment.
+#
+# The stack itself is unchanged — same Prometheus, Loki, Grafana,
+# Alertmanager and Alloy, same versions, same configuration approach. Two
+# things are added:
+#
+#   1. Alertmanager gets a webhook receiver pointing at Sentinel. This is
+#      the single most important wiring change in the whole overlay: it is
+#      what turns Sentinel from a service that could poll into one that is
+#      *woken up* by an incident. Without it there is no detection trigger.
+#
+#   2. A second rules file with the alerts the base does not have, covering
+#      the failure scenarios that had no corresponding alert.
+#
+# Sentinel itself needs no scrape configuration: Prometheus discovers
+# targets by the prometheus.io/* pod annotations within the citizen-portal
+# namespace, and Sentinel's Deployment carries them, so it is picked up
+# automatically. Same for Loki — Alloy tails every pod in the namespace.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: citizen-portal
+data:
+  # Replaces the base's no-op `default` receiver (which deliberately had no
+  # integrations, so alerts were visible in the UI but went nowhere).
+  #
+  # Timings are tightened from the base's 30s/5m. The base values are
+  # sensible for paging a human, who should not be woken for something that
+  # self-resolves in 30 seconds. Sentinel is not a human: it can afford to
+  # look at an alert 10 seconds in, and the cost of it investigating
+  # something that turns out to be transient is a few PromQL queries. For a
+  # demonstration environment, a fast loop is also simply easier to watch.
+  alertmanager.yml: |
+    route:
+      receiver: sentinel
+      group_by: ["alertname", "app"]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 1h
+      routes:
+        # Deliberate chaos faults are routed the same way as everything
+        # else, on purpose. Sentinel is expected to work out for itself that
+        # a fault was injected (the chaos_* metrics tell it) and to reset it
+        # rather than escalate. Filtering these out here would remove the
+        # very signal that makes that possible.
+        - receiver: sentinel
+          matchers:
+            - severity =~ "critical|warning"
+
+    receivers:
+      - name: sentinel
+        webhook_configs:
+          # send_resolved matters: Sentinel uses the resolved notification
+          # to close an incident that recovered on its own, so it does not
+          # sit on an open incident forever or remediate something that has
+          # already healed.
+          - url: http://sentinel-ai:8080/api/alerts/webhook
+            send_resolved: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: citizen-portal
+data:
+  # A SECOND key in the same ConfigMap, not a replacement of
+  # citizen-portal.yml. Prometheus loads /etc/prometheus/rules/*.yml, so
+  # each ConfigMap key becomes its own rules file and both are evaluated.
+  #
+  # Doing it this way means the base's seven rules are inherited verbatim
+  # rather than copy-pasted here, so they cannot drift out of sync — which
+  # is exactly what would happen if this patch replaced citizen-portal.yml
+  # and someone later edited only one of the two copies.
+  aws-extra.yml: |
+    groups:
+      - name: citizen-portal.aws.rules
+        rules:
+          # --- CPU -------------------------------------------------------
+          # process_cpu_seconds_total comes from prometheus_client, which
+          # both Python services already export. This is deliberately NOT
+          # container_cpu_usage_seconds_total: that would need cAdvisor,
+          # which would need Prometheus to hold a ClusterRole with
+          # nodes/proxy — a real privilege increase for a signal we can get
+          # from the process itself.
+          #
+          # Threshold arithmetic: the container CPU limit is 500m, so the
+          # cgroup throttles the process at 0.5 cores and this rate can
+          # never exceed ~0.5 no matter how hard the process spins. The
+          # threshold therefore HAS to sit below 0.5 or the alert can never
+          # fire — 0.4 leaves a usable margin while staying well clear of
+          # normal request-handling load, which sits near idle.
+          #
+          # The `high-cpu` chaos scenario drives an 80%-duty busy loop, which
+          # gets throttled to ~0.5, so it crosses this comfortably.
+          - alert: HighCPUUsage
+            expr: >-
+              rate(process_cpu_seconds_total{kubernetes_namespace="citizen-portal"}[2m]) > 0.4
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} is using {{ $value | printf \"%.2f\" }} CPU cores"
+              description: >-
+                {{ $labels.app }} pod {{ $labels.kubernetes_pod_name }} has
+                sustained CPU above 0.4 cores for 2 minutes against a 500m
+                limit, so it is likely being throttled.
+
+          # --- Memory ----------------------------------------------------
+          # Threshold arithmetic, because getting this wrong makes the alert
+          # either useless or permanently firing:
+          #
+          #   container memory limit          268 MB  (256Mi)
+          #   observed steady-state RSS      ~105 MB
+          #   memory-leak scenario adds        67 MB  (64 MiB, see
+          #                                    scripts/incident-scenarios.sh)
+          #   RSS during the scenario        ~172 MB
+          #
+          # So the threshold has to sit above ~105 and below ~172. 150 MB
+          # gives ~45 MB of margin above idle (no false positives from
+          # normal request churn) and ~22 MB below the scenario's peak (the
+          # alert reliably fires), while still leaving ~118 MB of headroom
+          # before the kernel OOM-kills the pod — which is the difference
+          # between an incident Sentinel can remediate and one that has
+          # already happened.
+          #
+          # The chaos API permits up to 2048 MiB, which WILL OOMKill the
+          # pod. That is a legitimate demo of a different failure mode, but
+          # it is not the one this alert is tuned for.
+          - alert: MemoryLeakSuspected
+            expr: >-
+              process_resident_memory_bytes{kubernetes_namespace="citizen-portal"} > 150e6
+            for: 3m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} RSS is {{ $value | humanize1024 }}B"
+              description: >-
+                {{ $labels.app }} pod {{ $labels.kubernetes_pod_name }} has
+                held more than 150MB resident for 3 minutes against a 256Mi
+                limit. A restart reclaims it; if it climbs again afterwards
+                the leak is in the code, not the workload.
+
+          # --- Downstream dependency failure -----------------------------
+          # This closes a real gap in the base rules.
+          #
+          # NotificationDeliveryFailureRateHigh reads
+          # notification_deliveries_total, which is emitted BY
+          # notification-service. If notification-service is completely
+          # down it emits nothing, the ratio has no series, and that alert
+          # cannot fire — the outage is invisible to it.
+          #
+          # notification_dispatches_total is citizen-service's own view of
+          # calling notification-service, so it keeps reporting when the
+          # dependency is gone. It is the correct signal for a downstream
+          # outage, and nothing alerted on it before.
+          #
+          # It is also the only alert that catches the case where
+          # citizen-service's /readyz reports "degraded" while still
+          # returning HTTP 200 — a state no status-code-based check sees.
+          - alert: NotificationDispatchFailures
+            expr: >-
+              sum(rate(notification_dispatches_total{result="failure", kubernetes_namespace="citizen-portal"}[5m])) by (app)
+              /
+              sum(rate(notification_dispatches_total{kubernetes_namespace="citizen-portal"}[5m])) by (app)
+              > 0.20
+            for: 3m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} cannot reach notification-service"
+              description: >-
+                Over 20% of notification dispatches from {{ $labels.app }}
+                have failed for 3 minutes. citizen-service stays healthy and
+                returns 200s when this happens, so this alert is the only
+                signal that the dependency is broken.
+
+          # --- Chaos awareness -------------------------------------------
+          # Companions to the base's ChaosDatabaseFailure /
+          # ChaosLatencyInjection rules, for the two new fault types.
+          #
+          # These exist so an autonomous agent can distinguish a
+          # deliberately injected fault from a genuine one. Without them,
+          # a chaos CPU burn and a real runaway loop look identical, and the
+          # correct response differs: reset the fault, versus restart the
+          # deployment and investigate the code.
+          - alert: ChaosCPUBurn
+            expr: chaos_cpu_burn{kubernetes_namespace="citizen-portal"} == 1
+            for: 30s
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} has deliberate CPU burn enabled"
+              description: >-
+                A chaos CPU fault is active on {{ $labels.app }}. Any
+                HighCPUUsage alert firing alongside this is explained by it.
+
+          - alert: ChaosMemoryLeak
+            expr: chaos_memory_leak_mb{kubernetes_namespace="citizen-portal"} > 0
+            for: 30s
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.app }} is deliberately retaining {{ $value }}MB"
+              description: >-
+                A chaos memory fault is active on {{ $labels.app }}. Any
+                MemoryLeakSuspected alert firing alongside this is explained
+                by it.
+
+          # --- Sentinel's own health -------------------------------------
+          # The agent watching the system needs something watching it. If
+          # Sentinel is down, nothing is performing autonomous remediation
+          # and every other alert here is going nowhere — which is worth
+          # knowing, and is the one alert a human should actually look at.
+          - alert: SentinelDown
+            expr: up{app="sentinel-ai", kubernetes_namespace="citizen-portal"} == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Sentinel is down — no autonomous remediation is happening"
+              description: >-
+                Prometheus cannot scrape sentinel-ai. Alertmanager is still
+                delivering webhooks to it, but nothing is processing them.
+                Incidents will not be detected or remediated until it is back.
+
+          - alert: SentinelEscalating
+            expr: increase(sentinel_escalations_total[15m]) > 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Sentinel escalated an incident it could not remediate"
+              description: >-
+                Sentinel exhausted its safe remediation options, or policy
+                denied every candidate action. This is the designed handover
+                point to a human.

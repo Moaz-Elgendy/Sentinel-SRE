@@ -1,0 +1,62 @@
+# Pin every PVC to K3s's local-path StorageClass.
+#
+# The base PVCs set no storageClassName, which means "use the cluster
+# default". That happens to work on K3s — local-path IS the default — so
+# this patch changes no behaviour. It is here because relying on an
+# implicit default is how you get a surprise: if anyone later installs a
+# CSI driver that marks itself default (the AWS EBS CSI driver does exactly
+# this), these PVCs would silently start binding to it on the next
+# recreate, and Postgres would come up with an empty data directory.
+# Naming the class makes that impossible.
+#
+# ---------------------------------------------------------------------------
+# What local-path actually means here, stated honestly
+# ---------------------------------------------------------------------------
+# local-path is K3s's built-in Rancher local-path-provisioner. It creates a
+# hostPath directory under /var/lib/rancher/k3s/storage/ on the node. So:
+#
+#   * Data DOES survive pod deletion, pod recreation, rollouts, and node
+#     reboots. That satisfies the requirement that Postgres data outlive
+#     pod recreation, and it is what makes the database-failure chaos
+#     scenario recoverable rather than destructive.
+#
+#   * Data does NOT survive the EC2 instance being terminated or replaced,
+#     because the directory lives on the instance's root EBS volume. The
+#     Terraform sets prevent_destroy on the instance and
+#     delete_on_termination on the volume, which is the honest tradeoff for
+#     a single-node demo: cheap, and explicitly not a backup strategy.
+#
+#   * ReadWriteOnce is genuinely fine on one node — every pod schedules
+#     onto the same node, so the "RWO can't be shared across nodes" problem
+#     the base comments warn about cannot arise here. It WOULD arise the
+#     moment a second node is added, and citizen-uploads-pvc (mounted by 2
+#     citizen-service replicas) is the one that would break first.
+#
+# A real production answer is EBS via the AWS EBS CSI driver for the
+# databases and S3 for uploads. Both are deliberately out of scope: the CSI
+# driver needs additional IAM and adds per-volume cost, and neither changes
+# anything about what this environment demonstrates.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: citizen-postgres-pvc
+  namespace: citizen-portal
+spec:
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: notification-postgres-pvc
+  namespace: citizen-portal
+spec:
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: citizen-uploads-pvc
+  namespace: citizen-portal
+spec:
+  storageClassName: local-path

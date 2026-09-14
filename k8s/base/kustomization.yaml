@@ -1,0 +1,70 @@
+# The shared base: everything both environments run, with no
+# environment-specific configuration in it.
+#
+# This is not applied directly. Two overlays build on it:
+#
+#   k8s/overlays/local  local development (kind / minikube / Docker Desktop).
+#                       Adds the committed demo Secrets. Reached via
+#                       `kubectl apply -k k8s/`, which is unchanged from
+#                       before this directory existed.
+#   k8s/overlays/aws    the EC2 + K3s environment. Swaps ingress-nginx for
+#                       Traefik, images for ECR references pinned by git SHA,
+#                       and Secrets for values injected at deploy time; adds
+#                       Sentinel.
+#
+# Two things to know when editing:
+#
+#   * There are deliberately NO Secrets here. The demo values with committed
+#     passwords live in overlays/local/secrets/, so the AWS overlay cannot
+#     inherit a known password by anyone forgetting an override — the
+#     manifest simply is not in its resource list.
+#
+#   * The configuration here is the LOCAL flavour where the two differ
+#     (ingress-nginx, `:latest` image tags from a local image store). That is
+#     a pragmatic choice to keep the local workflow a single command with
+#     nothing to configure, not a statement that local is canonical.
+#     Anything that should be true in BOTH environments belongs here; the
+#     AWS overlay should only ever override genuine differences.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: citizen-portal
+
+resources:
+  - namespace.yaml
+  - postgres/pvc.yaml
+  - postgres/deployment.yaml
+  - postgres/service.yaml
+  - notification-postgres/pvc.yaml
+  - notification-postgres/deployment.yaml
+  - notification-postgres/service.yaml
+  - citizen-service/configmap.yaml
+  - citizen-service/pvc.yaml
+  - citizen-service/deployment.yaml
+  - citizen-service/service.yaml
+  - notification-service/configmap.yaml
+  - notification-service/deployment.yaml
+  - notification-service/service.yaml
+  - frontend/deployment.yaml
+  - frontend/service.yaml
+  - ingress/ingress.yaml
+  # Phase 9 — observability stack
+  - monitoring/prometheus/rbac.yaml
+  - monitoring/prometheus/configmap.yaml
+  - monitoring/prometheus/rules-configmap.yaml
+  - monitoring/prometheus/deployment.yaml
+  - monitoring/prometheus/service.yaml
+  - monitoring/alertmanager/configmap.yaml
+  - monitoring/alertmanager/deployment.yaml
+  - monitoring/alertmanager/service.yaml
+  - monitoring/loki/configmap.yaml
+  - monitoring/loki/deployment.yaml
+  - monitoring/loki/service.yaml
+  - monitoring/alloy/rbac.yaml
+  - monitoring/alloy/configmap.yaml
+  - monitoring/alloy/daemonset.yaml
+  - monitoring/grafana/datasources-configmap.yaml
+  - monitoring/grafana/dashboard-provider-configmap.yaml
+  - monitoring/grafana/dashboard-json-configmap.yaml
+  - monitoring/grafana/deployment.yaml
+  - monitoring/grafana/service.yaml
