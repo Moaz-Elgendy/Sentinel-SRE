@@ -149,10 +149,28 @@ terraform output sentinel_webhook_url
 ```bash
 aws ssm start-session --target $(terraform output -raw sentinel_instance_id) --region <region>
 sudo cat /var/lib/sentinel/remote-bootstrap-complete
-sudo systemctl status sentinel-ai
-sudo journalctl -u sentinel-ai -n 100 --no-pager
+sudo systemctl status sentinel
+sudo docker compose -f /opt/sentinel-sre/deploy/sentinel/docker-compose.yml logs -f
 curl -s http://localhost:8080/readyz | jq .
 curl -s http://localhost:8080/environments | jq .
+curl -s http://localhost:8081/healthz
+```
+
+Sentinel now runs as two containers under one `sentinel.service` (docker
+compose) unit: `sentinel-ai` (unchanged — the FastAPI process, port 8080)
+and `sentinel-gui` (the SRE Control Center web UI, port 8081). See
+`deploy/sentinel/docker-compose.yml`. `sentinel-gui` never having started,
+or being unhealthy, does not affect `sentinel-ai` — they're independent
+containers with independent restart policies.
+
+To open the GUI from your own machine without opening any inbound port
+(the default, since `var.enable_sentinel_gui_public_access` is `false`):
+
+```bash
+aws ssm start-session --target $(terraform output -raw sentinel_instance_id) --region <region> \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["8081"],"localPortNumber":["8081"]}'
+# then open http://localhost:8081
 ```
 
 The bootstrapped environment's id is `demo-env-remote` (see

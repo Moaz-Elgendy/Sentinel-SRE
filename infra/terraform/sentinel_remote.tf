@@ -286,14 +286,22 @@ locals {
     ecr_registry         = local.ecr_registry
     ecr_repo_prefix      = var.project_name
     image_tag            = var.sentinel_image_tag
+    gui_image_tag        = var.sentinel_gui_image_tag
     k3s_instance_id      = aws_instance.k3s.id
     k3s_private_ip       = aws_instance.k3s.private_ip
     webhook_port         = var.sentinel_webhook_port
+    gui_port             = var.sentinel_gui_port
     prometheus_port      = var.prometheus_nodeport
     loki_port            = var.loki_nodeport
     token_param_name     = "/${var.project_name}/sentinel/k8s-token"
     ca_param_name        = "/${var.project_name}/sentinel/k8s-ca-cert-b64"
     extra_env_param_name = "/${var.project_name}/sentinel/extra-env"
+    # Same repo-checkout mechanism the K3s node's user_data uses (see
+    # ec2.tf/user_data.sh.tftpl): this instance needs a checkout so it has
+    # deploy/sentinel/docker-compose.yml to run, without CI having to ship
+    # the compose file itself over SSM.
+    repo_url = var.repo_url == null ? "" : var.repo_url
+    repo_dir = "/opt/sentinel-sre"
   }) : ""
 }
 

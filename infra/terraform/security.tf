@@ -155,6 +155,25 @@ resource "aws_vpc_security_group_ingress_rule" "prometheus_from_sentinel" {
   }
 }
 
+# Opt-in only (see var.enable_sentinel_gui_public_access's docstring for
+# why this is off by default). When enabled, this is the ONLY inbound rule
+# on the Sentinel security group that isn't sourced from the K3s node's own
+# SG — everything else about that instance's exposure is unchanged.
+resource "aws_vpc_security_group_ingress_rule" "sentinel_gui_public" {
+  for_each = var.enable_remote_sentinel && var.enable_sentinel_gui_public_access ? toset(var.allowed_http_cidrs) : toset([])
+
+  security_group_id = aws_security_group.sentinel[0].id
+  description       = "Sentinel GUI (opt-in public access, see var.enable_sentinel_gui_public_access)"
+  cidr_ipv4         = each.value
+  from_port         = var.sentinel_gui_port
+  to_port           = var.sentinel_gui_port
+  ip_protocol       = "tcp"
+
+  tags = {
+    Name = "${var.project_name}-ingress-sentinel-gui"
+  }
+}
+
 resource "aws_vpc_security_group_ingress_rule" "loki_from_sentinel" {
   count = var.enable_remote_sentinel ? 1 : 0
 

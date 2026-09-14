@@ -1,0 +1,67 @@
+# Runs the external Sentinel control plane WITH its GUI, on the standalone
+# Sentinel EC2 instance (infra/terraform/sentinel_remote.tf).
+#
+# This does not change what sentinel-ai does or how it's configured — it is
+# still the exact same image, same /etc/sentinel-ai.env, same
+# /var/lib/sentinel volume, same port, as when it ran via a bare
+# `docker run` under systemd. sentinel-gui is a new, independent container
+# added alongside it. If sentinel-gui is ever stopped or fails, sentinel-ai
+# keeps running headless exactly as it did before this file existed —
+# nothing about sentinel-ai depends on the GUI being up.
+#
+# sentinel-gui is a static React build served by nginx. It calls sentinel-ai
+# directly, cross-origin, from the browser (see sentinel-gui/nginx.conf and
+# sentinel-gui/src/api/client.js) — there is no server-side proxy here. That
+# means:
+#   1. The sentinel-gui IMAGE must be built with VITE_API_BASE_URL pointing
+#      at wherever sentinel-ai is actually reachable (baked in at build
+#      time, Vite can't read it at runtime). CI does this — see
+#      .github/workflows/ci-cd.yml's deploy-to-sentinel job.
+#   2. sentinel-ai's SENTINEL_GUI_ORIGINS (in /etc/sentinel-ai.env) must
+#      include the origin the GUI is served from, or its CORS middleware
+#      will reject the browser's requests. The user-data bootstrap script
+#      sets this to this instance's own public IP automatically.
+#
+# Usage on the instance (also what CI does over SSM):
+#   cd /opt/sentinel-sre/deploy/sentinel
+#   docker compose --env-file .env pull
+#   docker compose --env-file .env up -d --remove-orphans
+
+services:
+  sentinel-ai:
+    image: ${ECR_REGISTRY}/${ECR_REPO_PREFIX}/sentinel-ai:${SENTINEL_AI_TAG:-latest}
+    container_name: sentinel-ai
+    restart: unless-stopped
+    env_file:
+      - /etc/sentinel-ai.env
+    ports:
+      - "${SENTINEL_WEBHOOK_PORT:-8080}:8080"
+    volumes:
+      - /var/lib/sentinel:/var/lib/sentinel
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  sentinel-gui:
+    image: ${ECR_REGISTRY}/${ECR_REPO_PREFIX}/sentinel-gui:${SENTINEL_GUI_TAG:-latest}
+    container_name: sentinel-gui
+    restart: unless-stopped
+    ports:
+      - "${SENTINEL_GUI_PORT:-8081}:8081"
+    # service_started, not service_healthy: sentinel-gui is static assets +
+    # nginx, it doesn't need sentinel-ai up to *start* serving — only to be
+    # useful once a browser loads it. Same "don't block on each other"
+    # reasoning as citizen-service/notification-service in the root
+    # docker-compose.yml.
+    depends_on:
+      sentinel-ai:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
