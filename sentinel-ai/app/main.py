@@ -80,6 +80,7 @@ from app.core.events import EventBus
 from app.core.logging_config import configure_logging
 from app.core.security import hash_password
 from app.domain.environment import Environment
+from app.lifecycle import policy_admin, rca_admin, remediation_admin
 from app.lifecycle.orchestrator import Orchestrator, build_context
 from app.routers import (
     actions,
@@ -87,6 +88,7 @@ from app.routers import (
     auth,
     authorizations,
     chaos_scenarios,
+    config,
     dashboard,
     environments,
     events,
@@ -140,6 +142,60 @@ async def lifespan(app: FastAPI):
     ctx = build_context(settings, store, environment, event_bus=event_bus)
     orchestrator = Orchestrator(ctx)
 
+    # ---- Sentinel Administration & Tuning Center: reload live policy -----
+    # ---- overrides ---------------------------------------------------
+    # `PolicyConfig` (ctx.policy.config) was just built fresh from
+    # `settings`-derived defaults. Any change an admin previously applied
+    # via POST /api/config/policy/apply is stored in `config_overrides`
+    # (see app/store/sqlite_store.py) precisely so it survives this
+    # restart — reapply it now, before Sentinel processes its first
+    # incident, using the SAME validated apply path a live request uses
+    # (app/lifecycle/policy_admin.py), not a separate ad hoc assignment.
+    stored_policy_overrides = store.get_config_overrides("policy")
+    override_errors = policy_admin.reload_stored_overrides(
+        ctx,
+        stored_policy_overrides,
+        ctx.policy.config.denied_deployments,
+        ctx.policy.config.denied_namespaces,
+    )
+    if override_errors:
+        # A bound tightened since this override was saved (e.g. a Sentinel
+        # upgrade lowered MAX_REPLICAS_CEILING) — fail loud, not silently
+        # ignore a safety-relevant stored override.
+        logger.error(
+            "stored_policy_overrides_invalid",
+            extra={"errors": override_errors, "overrides": stored_policy_overrides},
+        )
+    elif stored_policy_overrides:
+        logger.info(
+            "stored_policy_overrides_applied", extra={"fields": sorted(stored_policy_overrides)}
+        )
+
+    stored_rca_overrides = store.get_config_overrides("rca")
+    rca_override_errors = rca_admin.reload_stored_overrides(ctx.validator.thresholds, stored_rca_overrides)
+    if rca_override_errors:
+        logger.error(
+            "stored_rca_overrides_invalid",
+            extra={"errors": rca_override_errors, "overrides": stored_rca_overrides},
+        )
+    elif stored_rca_overrides:
+        logger.info("stored_rca_overrides_applied", extra={"fields": sorted(stored_rca_overrides)})
+
+    stored_remediation_overrides = store.get_config_overrides("remediation")
+    remediation_override_errors = remediation_admin.reload_stored_overrides(
+        ctx.remediation, stored_remediation_overrides
+    )
+    if remediation_override_errors:
+        logger.error(
+            "stored_remediation_overrides_invalid",
+            extra={"errors": remediation_override_errors, "overrides": stored_remediation_overrides},
+        )
+    elif stored_remediation_overrides:
+        logger.info(
+            "stored_remediation_overrides_applied",
+            extra={"fields": sorted(stored_remediation_overrides)},
+        )
+
     # ---- Sentinel SRE Control Center (GUI) admin auth bootstrap ----------
     # No safe hardcoded secret/password (see core/config.py's field docs):
     # generate one if the operator did not set one, and log it loudly so it
@@ -189,7 +245,7 @@ async def lifespan(app: FastAPI):
     app.state.context = ctx
     app.state.orchestrator = orchestrator
     app.state.event_bus = event_bus
-    health.register_runtime(store=store, k8s=ctx.k8s)
+    health.register_runtime(store=store, k8s=ctx.k8s, remediation=ctx.remediation)
 
     logger.info(
         "sentinel_started",
@@ -284,6 +340,7 @@ app.include_router(alerts.router)
 app.include_router(auth.router)
 app.include_router(incidents.router)
 app.include_router(feedback.router)
+app.include_router(config.router)
 app.include_router(authorizations.router)
 app.include_router(environments.router)
 app.include_router(chaos_scenarios.router)

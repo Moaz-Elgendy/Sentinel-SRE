@@ -1,0 +1,25 @@
+# ClusterIP only, deliberately — see deployment.yaml's long comment for why:
+# this mirrors sentinel-ai's own restraint (no Ingress, reached only via
+# `kubectl port-forward`) rather than opening a new public path for the
+# admin GUI. To inspect it from a laptop:
+#
+#   aws ssm start-session --target <instance-id>
+#   sudo kubectl -n citizen-portal port-forward svc/sentinel-gui 8081:8081
+#
+# (run alongside the equivalent sentinel-ai port-forward on 8080 — see
+# ../sentinel/service.yaml's own comment).
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel-gui
+  namespace: citizen-portal
+  labels:
+    app: sentinel-gui
+spec:
+  type: ClusterIP
+  selector:
+    app: sentinel-gui
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081

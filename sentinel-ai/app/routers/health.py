@@ -24,12 +24,13 @@ router = APIRouter(tags=["health"])
 
 # Set by main.py's lifespan. Module-level rather than app.state so the probes
 # stay trivially cheap and cannot themselves fail on a missing attribute.
-_runtime: dict[str, object] = {"store": None, "k8s": None}
+_runtime: dict[str, object] = {"store": None, "k8s": None, "remediation": None}
 
 
-def register_runtime(store: object, k8s: object) -> None:
+def register_runtime(store: object, k8s: object, remediation: object = None) -> None:
     _runtime["store"] = store
     _runtime["k8s"] = k8s
+    _runtime["remediation"] = remediation
 
 
 @router.get("/healthz")
@@ -56,8 +57,16 @@ def readiness(response: Response):
     checks["kubernetes"] = "up" if getattr(k8s, "available", False) else "down"
 
     # Configuration facts, surfaced here so an operator can confirm the mode
-    # Sentinel is actually running in without reading logs.
-    checks["mode"] = "dry_run" if settings.dry_run else "autonomous"
+    # Sentinel is actually running in without reading logs. Read from the
+    # live `RemediationEngine.dry_run` (via `register_runtime`), not
+    # `settings.dry_run` — the two can differ once an admin has toggled dry
+    # run live via the Sentinel Administration & Tuning Center (see
+    # app/lifecycle/remediation_admin.py), and this probe exists precisely
+    # so an operator can trust what it reports.
+    remediation = _runtime.get("remediation")
+    checks["mode"] = (
+        "dry_run" if getattr(remediation, "dry_run", settings.dry_run) else "autonomous"
+    )
     checks["llm"] = "enabled" if settings.llm_enabled else "rule_based_only"
 
     if checks["store"] == "down" or checks["kubernetes"] == "down":

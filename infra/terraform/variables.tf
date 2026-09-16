@@ -183,6 +183,7 @@ variable "ecr_repository_names" {
     "notification-service",
     "frontend",
     "sentinel-ai",
+    "sentinel-gui",
   ]
 }
 

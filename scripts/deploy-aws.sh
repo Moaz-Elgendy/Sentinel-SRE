@@ -160,7 +160,7 @@ for d in citizen-postgres notification-postgres; do
 done
 
 echo "--- waiting for application and observability stack ---"
-for d in citizen-service notification-service frontend prometheus alertmanager loki grafana sentinel-ai; do
+for d in citizen-service notification-service frontend prometheus alertmanager loki grafana sentinel-ai sentinel-gui; do
   # `|| true` deliberately: one component failing to become ready should not
   # abort the wait on the others. The verification block below reports the
   # real state, which is more useful than stopping at the first problem.

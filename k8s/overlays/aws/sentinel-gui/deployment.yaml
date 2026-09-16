@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel-gui
+  namespace: citizen-portal
+  labels:
+    app: sentinel-gui
+spec:
+  # One replica, matching the citizen frontend's own AWS right-sizing (see
+  # ../patch-replicas.yaml) and this being a low-traffic internal admin
+  # tool, not a citizen-facing service — there is no redundancy need to
+  # weigh against the node's tight CPU budget (see patch-replicas.yaml's
+  # arithmetic comment; this adds roughly the same ~50m request the
+  # citizen frontend does, which fits the existing documented headroom).
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app: sentinel-gui
+  template:
+    metadata:
+      labels:
+        app: sentinel-gui
+    spec:
+      imagePullSecrets:
+        - name: ecr-credentials
+      containers:
+        - name: sentinel-gui
+          # IMPORTANT — read before changing how this is reached:
+          #
+          # sentinel-ai's own Service (../sentinel/service.yaml) is
+          # deliberately ClusterIP-only with no Ingress path, because most
+          # of its API is now admin-JWT-authenticated but its Alertmanager
+          # webhook (/api/alerts/webhook) is NOT, and exposing that
+          # publicly would let anyone fabricate an alert and trigger
+          # autonomous remediation. sentinel-gui inherits that same
+          # restraint rather than opening a new public path: it is ALSO
+          # ClusterIP-only (see service.yaml alongside this file), reached
+          # by an SRE via `kubectl port-forward`, exactly like sentinel-ai
+          # already is.
+          #
+          # This is WHY sentinel-gui/Dockerfile's default
+          # VITE_API_BASE_URL (http://localhost:8080) is correct as-is and
+          # does NOT need a --build-arg override for this deployment: an
+          # SRE runs two port-forwards from their laptop —
+          #   kubectl -n citizen-portal port-forward svc/sentinel-ai 8080:8080
+          #   kubectl -n citizen-portal port-forward svc/sentinel-gui 8081:8081
+          # — then opens http://localhost:8081, whose bundle calls
+          # http://localhost:8080 for the API. Both land on localhost from
+          # the browser's point of view, which is also exactly what
+          # SENTINEL_GUI_ORIGINS is set to in ../sentinel/configmap.yaml.
+          #
+          # If this ever needs to be reachable without a port-forward,
+          # that is a deliberate exposure decision for an operator to make
+          # (NodePort behind a security group restricted to trusted IPs,
+          # matching ../observability-nodeport.yaml's pattern and its
+          # accompanying Terraform security-group rule) — not something to
+          # default to quietly here.
+          image: sentinel-gui
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            # Matches the citizen frontend's own footprint (k8s/frontend/
+            # deployment.yaml) — same workload shape: nginx serving one
+            # static Vite bundle.
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
