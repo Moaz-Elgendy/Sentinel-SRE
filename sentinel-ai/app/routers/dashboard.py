@@ -135,7 +135,7 @@ async def dashboard_summary(request: Request) -> dict[str, Any]:
         "generated_at": time.time(),
         "sentinel": {
             "monitoring": True,
-            "mode": "dry_run" if ctx.settings.dry_run else "autonomous",
+            "mode": "dry_run" if ctx.remediation.dry_run else "autonomous",
             "llm": "enabled" if ctx.settings.llm_enabled else "rule_based_only",
             "kubernetes_available": ctx.k8s.available,
         },

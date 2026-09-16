@@ -306,7 +306,7 @@ def apply_diffs(config: PolicyConfig, diffs: list[FieldDiff]) -> None:
 
 
 def reload_stored_overrides(
-    config: PolicyConfig,
+    ctx: Any,
     stored_overrides: dict[str, Any],
     frozen_deployments: frozenset[str],
     frozen_namespaces: frozenset[str],
@@ -314,7 +314,12 @@ def reload_stored_overrides(
     """Re-apply previously-saved overrides (from `config_overrides` — see
     app/store/sqlite_store.py) onto a freshly-built `PolicyConfig`, through
     the SAME validated path a live `POST /api/config/policy/apply` uses —
-    never a raw, unchecked assignment.
+    never a raw, unchecked assignment. Also re-syncs `RemediationEngine`/
+    `DecisionEngine` via `sync_dependent_engines` — a fresh `build_context()`
+    call builds all three from the SAME settings-derived values, so without
+    this a stored override to e.g. `allowed_deployments` would leave
+    `ctx.policy.config` correct but `ctx.remediation`'s independent copy
+    stale immediately after every restart.
 
     Called once at startup (see main.py's lifespan) so a change an admin
     made before a restart is still in effect after one. Returns the list of
@@ -325,7 +330,75 @@ def reload_stored_overrides(
     """
     if not stored_overrides:
         return []
+    config = ctx.policy.config
     errors, diffs = validate_changes(config, stored_overrides, frozen_deployments, frozen_namespaces)
     if not errors:
         apply_diffs(config, diffs)
+        sync_dependent_engines(ctx, diffs)
     return errors
+
+
+# Fields PolicyConfig shares, by value, with OTHER engines that each hold
+# their OWN independently-constructed copy — see sync_dependent_engines
+# below for why that duplication exists and must NOT be collapsed away.
+FIELDS_DUPLICATED_ELSEWHERE = frozenset(
+    {"allowed_namespaces", "allowed_deployments", "min_replicas", "max_replicas"}
+)
+
+
+def sync_dependent_engines(ctx: Any, diffs: list[FieldDiff]) -> None:
+    """After a policy apply, propagate the fields in
+    `FIELDS_DUPLICATED_ELSEWHERE` to every OTHER engine that holds its own
+    independent copy of them — `RemediationEngine` (allow-lists, deny-lists,
+    replica bounds) and `DecisionEngine` (replica bounds, for clamping a
+    scale candidate's target before Policy ever sees it).
+
+    This function exists because of something this inspection found that
+    was NOT obvious from PolicyConfig alone: `RemediationEngine.__init__`
+    deliberately keeps its own frozen copies of these fields rather than
+    reading `PolicyConfig` at call time, with an explicit comment —
+    "captured at construction... so a mutated global cannot widen this
+    engine's authority mid-incident." That is real, intentional defense in
+    depth, not an oversight, and per the explicit instruction not to weaken
+    the Policy -> Remediation -> Validation architecture, this function does
+    NOT collapse that independence by making RemediationEngine read
+    PolicyConfig live (the way the earlier `deployment_correlation_window_
+    minutes` / `validation_max_*` fixes redirected an ACCIDENTAL duplicate
+    to a single source — those had no such comment, no such rationale, and
+    were plain bugs).
+
+    Instead: RemediationEngine and DecisionEngine keep their own copies —
+    the independent re-check this function's docstring describes still
+    genuinely happens on every execution — but the ONE authenticated,
+    audited, validated admin-apply path (this module) is trusted to update
+    all of them together, atomically, in the same request. A "mutated
+    global" the original comment warns about is an uncontrolled write from
+    anywhere; this is not that.
+
+    Without this function, an admin who widens `allowed_deployments` via
+    `PUT /api/config/policy/apply` would see it marked "applied" while
+    Sentinel's actual remediation attempts kept failing with a confusing
+    "internal inconsistency" escalation, because `RemediationEngine`'s own
+    copy never changed.
+    """
+    changed_fields = {d.field for d in diffs if d.field in FIELDS_DUPLICATED_ELSEWHERE}
+    if not changed_fields:
+        return
+
+    remediation = getattr(ctx, "remediation", None)
+    decision = getattr(ctx, "decision", None)
+
+    if "allowed_namespaces" in changed_fields and remediation is not None:
+        remediation.allowed_namespaces = ctx.policy.config.allowed_namespaces
+    if "allowed_deployments" in changed_fields and remediation is not None:
+        remediation.allowed_deployments = ctx.policy.config.allowed_deployments
+    if "min_replicas" in changed_fields:
+        if remediation is not None:
+            remediation.min_replicas = ctx.policy.config.min_replicas
+        if decision is not None:
+            decision.min_replicas = ctx.policy.config.min_replicas
+    if "max_replicas" in changed_fields:
+        if remediation is not None:
+            remediation.max_replicas = ctx.policy.config.max_replicas
+        if decision is not None:
+            decision.max_replicas = ctx.policy.config.max_replicas
