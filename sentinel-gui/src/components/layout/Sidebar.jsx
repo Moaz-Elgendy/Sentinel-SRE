@@ -12,6 +12,8 @@ const ADMIN_NAV_ITEMS = [
   { to: '/policies', label: 'Policies' },
   { to: '/rca-config', label: 'RCA & Diagnosis' },
   { to: '/remediation-config', label: 'Remediation' },
+  { to: '/ai-config', label: 'AI & Reasoning' },
+  { to: '/monitoring-config', label: 'Monitoring' },
   { to: '/config-history', label: 'Configuration History' },
 ]
 

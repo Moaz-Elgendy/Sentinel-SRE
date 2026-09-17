@@ -155,6 +155,31 @@ def test_dashboard_summary_on_empty_store(gui_client):
     assert body["sentinel"]["kubernetes_available"] is False
     for service in body["system_health"]["services"]:
         assert service["healthy"] is None
+    assert body["latest_config_change"] is None
+
+
+def test_dashboard_summary_reflects_the_most_recent_applied_config_change(gui_client):
+    client, login = gui_client
+    headers = login(client)
+
+    client.post(
+        "/api/config/monitoring/apply",
+        json={"changes": {"prometheus_url": "http://prometheus.new:9090"}},
+        headers=headers,
+    )
+    # A rejected attempt right after it must NOT overwrite the "latest
+    # applied" answer with something that never actually changed.
+    client.post(
+        "/api/config/monitoring/apply",
+        json={"changes": {"prometheus_timeout_seconds": 999}},
+        headers=headers,
+    )
+
+    body = client.get("/api/dashboard/summary", headers=headers).json()
+    assert body["latest_config_change"]["category"] == "monitoring"
+    assert isinstance(body["latest_config_change"]["changed_by"], str)
+    assert body["latest_config_change"]["changed_by"]
+    assert body["latest_config_change"]["changed_at"] is not None
 
 
 def test_actions_on_empty_store(gui_client):

@@ -622,3 +622,267 @@ def test_remediation_history_and_restore_work_like_every_other_category(gui_clie
 
     client.post(f"/api/config/history/{change_id}/restore", headers=headers)
     assert ctx.remediation.dry_run is False
+
+
+def test_get_ai_requires_auth(gui_client):
+    client, _login = gui_client
+    assert client.get("/api/config/ai").status_code == 403
+
+
+def test_get_ai_returns_current_values_bounds_and_read_only_info(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.get("/api/config/ai", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["current"]["llm_provider"] == "openai"
+    assert body["current"]["openai_model"] == "gpt-4o-mini"
+    assert body["bounds"]["llm_provider"]["choices"] == ["openai", "gemini"]
+    assert body["read_only"]["temperature"] == 0.0
+    assert body["read_only"]["openai_api_key_configured"] is False
+    assert body["read_only"]["gemini_api_key_configured"] is False
+
+
+def test_get_ai_never_exposes_api_keys_anywhere_in_response(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    ctx = client.app.state.context
+    ctx.settings.openai_api_key = "sk-super-secret-value"
+    ctx.settings.gemini_api_key = "gm-also-secret"
+    body = client.get("/api/config/ai", headers=headers).json()
+    dumped = str(body)
+    assert "sk-super-secret-value" not in dumped
+    assert "gm-also-secret" not in dumped
+    assert "openai_api_key" not in body["current"]
+    assert "gemini_api_key" not in body["current"]
+
+
+def test_ai_preview_does_not_change_anything(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    ctx = client.app.state.context
+    preview = client.post(
+        "/api/config/ai/preview", json={"changes": {"openai_model": "gpt-4o"}}, headers=headers
+    ).json()
+    assert preview["valid"] is True
+    assert ctx.settings.openai_model == "gpt-4o-mini"  # unchanged
+
+
+def test_ai_apply_rejects_attempt_to_set_an_api_key(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post(
+        "/api/config/ai/apply", json={"changes": {"openai_api_key": "sk-whatever"}}, headers=headers
+    )
+    assert resp.status_code == 422
+    assert "never be read or written" in resp.text
+
+
+def test_ai_apply_rejects_an_invalid_provider(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post(
+        "/api/config/ai/apply", json={"changes": {"llm_provider": "claude"}}, headers=headers
+    )
+    assert resp.status_code == 422
+
+
+def test_a_rejected_api_key_attempt_is_redacted_in_the_audit_trail(gui_client):
+    """A rejected change is still audited (so a rejection attempt is
+    visible to other admins), but the submitted VALUE must never be
+    persisted anywhere for a sensitive field — not just excluded from the
+    live config response. GET /api/config/history is a different door than
+    GET /api/config/ai and must be checked separately."""
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post(
+        "/api/config/ai/apply",
+        json={"changes": {"openai_api_key": "sk-should-never-be-stored-anywhere"}},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+    assert "sk-should-never-be-stored-anywhere" not in resp.text
+
+    history = client.get("/api/config/history", params={"category": "ai"}, headers=headers).json()[
+        "history"
+    ]
+    assert len(history) == 1
+    assert history[0]["status"] == "rejected"
+    assert history[0]["changes"][0]["field"] == "openai_api_key"
+    assert history[0]["changes"][0]["new_value"] == "«redacted»"
+    assert "sk-should-never-be-stored-anywhere" not in str(history)
+
+
+def test_ai_preview_switching_provider_without_a_key_warns(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    preview = client.post(
+        "/api/config/ai/preview", json={"changes": {"llm_provider": "gemini"}}, headers=headers
+    ).json()
+    assert preview["valid"] is True
+    assert "GEMINI_API_KEY" in preview["diff"][0]["warning"]
+
+
+def test_ai_apply_actually_rebuilds_the_live_reasoner(gui_client):
+    """Not just that the API reports success -- that ctx.reasoner (read
+    fresh on every incident by Orchestrator._run) is a NEW instance
+    reflecting the change, exactly the guarantee ai_admin.py depends on."""
+    client, login = gui_client
+    headers = login(client)
+    ctx = client.app.state.context
+    ctx.settings.openai_api_key = "test-key-for-this-test"
+    assert ctx.reasoner is None  # no key was configured at startup
+
+    resp = client.post(
+        "/api/config/ai/apply",
+        json={"changes": {"openai_model": "gpt-4o"}, "reason": "trying a stronger model"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert ctx.reasoner is not None
+    assert ctx.reasoner.label == "openai:gpt-4o"
+
+
+def test_ai_apply_with_no_changes_is_rejected(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post("/api/config/ai/apply", json={"changes": {}}, headers=headers)
+    assert resp.status_code == 422
+
+
+def test_ai_history_and_restore_work_like_every_other_category(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    ctx = client.app.state.context
+    ctx.settings.openai_api_key = "test-key-for-this-test"
+
+    apply_resp = client.post(
+        "/api/config/ai/apply", json={"changes": {"openai_model": "gpt-4o"}}, headers=headers
+    )
+    change_id = apply_resp.json()["id"]
+    assert ctx.reasoner.label == "openai:gpt-4o"
+
+    history = client.get("/api/config/history", params={"category": "ai"}, headers=headers).json()[
+        "history"
+    ]
+    assert len(history) == 1
+    assert history[0]["changes"][0]["field"] == "openai_model"
+
+    client.post(f"/api/config/history/{change_id}/restore", headers=headers)
+    assert ctx.settings.openai_model == "gpt-4o-mini"
+    assert ctx.reasoner.label == "openai:gpt-4o-mini"  # restore also rebuilt the reasoner
+
+
+def test_get_monitoring_requires_auth(gui_client):
+    client, _login = gui_client
+    assert client.get("/api/config/monitoring").status_code == 403
+
+
+def test_get_monitoring_returns_current_bounds_and_read_only_info(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.get("/api/config/monitoring", headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["current"]["prometheus_url"] == "http://prometheus:9090"
+    assert body["current"]["loki_url"] == "http://loki:3100"
+    assert body["bounds"]["prometheus_timeout_seconds"] == {"type": "float", "min": 1.0, "max": 60.0}
+    assert body["read_only"]["kubernetes"]["mode"] == "in_cluster"
+    assert body["read_only"]["kubernetes"]["available"] is False  # gui_client's documented k8s state
+    assert "No configurable timeout" in body["read_only"]["health_checks"]["note"]
+
+
+def test_monitoring_apply_rejects_a_bearer_token_attempt(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post(
+        "/api/config/monitoring/apply",
+        json={"changes": {"prometheus_bearer_token": "sk-whatever"}},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+    assert "POST /environments" in resp.text
+
+
+def test_monitoring_apply_rejects_a_kubernetes_field(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post(
+        "/api/config/monitoring/apply",
+        json={"changes": {"kubernetes_namespace": "other-ns"}},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_monitoring_apply_rejects_a_malformed_url(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post(
+        "/api/config/monitoring/apply",
+        json={"changes": {"prometheus_url": "prometheus.internal:9090"}},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_monitoring_apply_changes_the_live_client_immediately(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    ctx = client.app.state.context
+    resp = client.post(
+        "/api/config/monitoring/apply",
+        json={"changes": {"prometheus_url": "http://prometheus.new:9090"}},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert ctx.prom.base_url == "http://prometheus.new:9090"
+
+
+def test_monitoring_apply_keeps_the_stored_environment_record_in_sync(gui_client):
+    """The exact staleness bug this category was designed around: without
+    the after_apply sync, GET /environments/{id} and /test-connection would
+    silently keep reporting the OLD Prometheus url forever, even though the
+    live evidence-collection client had already moved on."""
+    client, login = gui_client
+    headers = login(client)
+    ctx = client.app.state.context
+    environment_id = ctx.environment.id
+
+    client.post(
+        "/api/config/monitoring/apply",
+        json={"changes": {"prometheus_url": "http://prometheus.new:9090", "loki_timeout_seconds": 45}},
+        headers=headers,
+    )
+
+    env_resp = client.get(f"/environments/{environment_id}", headers=headers)
+    assert env_resp.status_code == 200
+    body = env_resp.json()
+    assert body["prometheus"]["url"] == "http://prometheus.new:9090"
+    # to_public_dict() doesn't surface timeout_seconds under a different key —
+    # confirm it round-tripped by reading the field directly off the model.
+    stored = client.app.state.store.get_environment(environment_id)
+    assert stored["loki"]["timeout_seconds"] == 45.0
+
+
+def test_monitoring_history_and_restore_work_like_every_other_category(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    ctx = client.app.state.context
+
+    apply_resp = client.post(
+        "/api/config/monitoring/apply",
+        json={"changes": {"prometheus_url": "http://prometheus.new:9090"}},
+        headers=headers,
+    )
+    change_id = apply_resp.json()["id"]
+
+    history = client.get(
+        "/api/config/history", params={"category": "monitoring"}, headers=headers
+    ).json()["history"]
+    assert len(history) == 1
+    assert history[0]["changes"][0]["field"] == "prometheus_url"
+
+    client.post(f"/api/config/history/{change_id}/restore", headers=headers)
+    assert ctx.prom.base_url == "http://prometheus:9090"
+    assert ctx.environment.prometheus.url == "http://prometheus:9090"  # restore re-synced too

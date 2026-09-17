@@ -3,6 +3,7 @@ import AppLayout from './components/layout/AppLayout.jsx'
 import ProtectedRoute from './components/layout/ProtectedRoute.jsx'
 import { AuthProvider } from './context/AuthContext.jsx'
 import ActionHistoryPage from './pages/ActionHistoryPage.jsx'
+import AiConfigPage from './pages/AiConfigPage.jsx'
 import ConfigHistoryPage from './pages/ConfigHistoryPage.jsx'
 import DashboardPage from './pages/DashboardPage.jsx'
 import DemoChaosPage from './pages/DemoChaosPage.jsx'
@@ -10,6 +11,7 @@ import EnvironmentPage from './pages/EnvironmentPage.jsx'
 import IncidentDetailPage from './pages/IncidentDetailPage.jsx'
 import IncidentsListPage from './pages/IncidentsListPage.jsx'
 import LoginPage from './pages/LoginPage.jsx'
+import MonitoringConfigPage from './pages/MonitoringConfigPage.jsx'
 import NotFoundPage from './pages/NotFoundPage.jsx'
 import PerformancePage from './pages/PerformancePage.jsx'
 import PoliciesPage from './pages/PoliciesPage.jsx'
@@ -33,6 +35,8 @@ export default function App() {
             <Route path="/policies" element={<PoliciesPage />} />
             <Route path="/rca-config" element={<RcaConfigPage />} />
             <Route path="/remediation-config" element={<RemediationConfigPage />} />
+            <Route path="/ai-config" element={<AiConfigPage />} />
+            <Route path="/monitoring-config" element={<MonitoringConfigPage />} />
             <Route path="/config-history" element={<ConfigHistoryPage />} />
             <Route path="/demo" element={<DemoChaosPage />} />
           </Route>

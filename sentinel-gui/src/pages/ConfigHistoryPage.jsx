@@ -78,14 +78,20 @@ function ChangeRow({ entry, onRestored }) {
   )
 }
 
+// Kept in one place, in registration order, so a new admin category only
+// needs one line added here to show up in the filter — mirrors
+// app/routers/config.py's own _CATEGORIES registry in spirit.
+const CATEGORIES = ['policy', 'rca', 'remediation', 'ai', 'monitoring']
+
 export default function ConfigHistoryPage() {
+  const [category, setCategory] = useState('')
   const [history, setHistory] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
   function refetch() {
     setLoading(true)
-    getConfigHistory()
+    getConfigHistory({ category: category || null })
       .then((data) => {
         setHistory(data)
         setError(null)
@@ -94,7 +100,7 @@ export default function ConfigHistoryPage() {
       .finally(() => setLoading(false))
   }
 
-  useEffect(refetch, [])
+  useEffect(refetch, [category])
 
   if (loading) return <Spinner label="Loading configuration history…" />
   if (error) return <AlertBanner>{extractErrorMessage(error, 'Could not load configuration history.')}</AlertBanner>
@@ -103,10 +109,23 @@ export default function ConfigHistoryPage() {
     <div className="page">
       <div className="page__header">
         <h1>Configuration History</h1>
+        <label className="field field--inline">
+          <span>Category</span>
+          <select className="select" value={category} onChange={(e) => setCategory(e.target.value)}>
+            <option value="">All</option>
+            {CATEGORIES.map((c) => (
+              <option key={c} value={c}>
+                {titleCase(c)}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
       <section className="card">
         {!history || history.length === 0 ? (
-          <p className="muted">No configuration changes recorded yet.</p>
+          <p className="muted">
+            {category ? `No ${titleCase(category)} changes recorded yet.` : 'No configuration changes recorded yet.'}
+          </p>
         ) : (
           <div className="history-list">
             {history.map((entry) => (
