@@ -292,6 +292,26 @@ a {
   margin-bottom: 0;
 }
 
+.config-change-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 16px;
+  font-size: 13px;
+  color: var(--text);
+  text-decoration: none;
+}
+.config-change-banner:hover {
+  border-color: var(--accent);
+}
+.config-change-banner__link {
+  margin-left: auto;
+  color: var(--accent);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Status pill / tags / severity                                          */
 /* ---------------------------------------------------------------------- */
@@ -910,6 +930,16 @@ input[type='email'] {
 }
 .field span {
   color: var(--text-muted);
+}
+
+.field--inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 0;
+}
+.field--inline .select {
+  width: auto;
 }
 
 .checkbox-field {

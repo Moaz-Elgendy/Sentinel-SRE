@@ -7,12 +7,24 @@ Sentinel Administration & Tuning Center — configuration.
   GET  /api/config/rca                    current RCA/validation thresholds + read-only detection info
   POST /api/config/rca/preview            validate a proposed RCA/validation change, no side effects
   POST /api/config/rca/apply              validate + apply + audit an RCA/validation change
+  GET  /api/config/remediation            current remediation config (dry_run) + read-only action ladder
+  POST /api/config/remediation/preview    validate a proposed remediation change, no side effects
+  POST /api/config/remediation/apply      validate + apply + audit a remediation change
+  GET  /api/config/ai                     current AI/reasoning config (provider/model/timeout/base_url)
+  POST /api/config/ai/preview             validate a proposed AI/reasoning change, no side effects
+  POST /api/config/ai/apply               validate + apply + audit an AI/reasoning change
+  GET  /api/config/monitoring             current Prometheus/Loki config + read-only K8s/health info
+  POST /api/config/monitoring/preview     validate a proposed monitoring change, no side effects
+  POST /api/config/monitoring/apply       validate + apply + audit a monitoring change
   GET  /api/config/history                append-only change history, any category
   POST /api/config/history/{id}/restore   revert one past change (itself a new change)
 
 Everything here is a thin I/O layer around the pure validate_changes/
-apply_diffs pairs in app/lifecycle/policy_admin.py (category "policy") and
-app/lifecycle/rca_admin.py (category "rca") — this module's only jobs are:
+apply_diffs pairs in app/lifecycle/policy_admin.py (category "policy"),
+app/lifecycle/rca_admin.py (category "rca"), app/lifecycle/remediation_admin.py
+(category "remediation"), app/lifecycle/ai_admin.py (category "ai"), and
+app/lifecycle/monitoring_admin.py (category "monitoring") — this module's
+only jobs are:
 read the request, call the right pure module, write the audit trail, and
 never apply anything `validate_changes` rejected. Every category is bounds-
 checked fresh on every request rather than trusting anything the client
@@ -43,7 +55,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from app.core.deps import get_current_admin
-from app.lifecycle import policy_admin, rca_admin, remediation_admin
+from app.lifecycle import ai_admin, monitoring_admin, policy_admin, rca_admin, remediation_admin
 
 router = APIRouter(prefix="/api/config", tags=["config"], dependencies=[Depends(get_current_admin)])
 
@@ -72,6 +84,16 @@ class CategoryHandler:
     # deliberately does NOT do (collapse RemediationEngine's independent
     # re-check into a live read of PolicyConfig).
     after_apply: Callable[[Any, list[Any]], None] | None = None
+    # Field names whose VALUE must never be persisted anywhere, including a
+    # rejected-change audit entry — not just excluded from EDITABLE_FIELDS.
+    # Only "ai" needs this today (see ai_admin.py: openai_api_key/
+    # gemini_api_key are rejected as unknown fields like any other, but an
+    # unknown-field rejection normally logs the submitted value verbatim
+    # for audit purposes — see _apply_and_audit below — which would leak an
+    # attempted key into GET /api/config/history in plaintext even though
+    # it was never applied). Redacted, never merely omitted, so the history
+    # entry still records that a value WAS submitted for that field.
+    sensitive_fields: frozenset[str] = frozenset()
 
 
 def _policy_validate(live_obj: Any, changes: dict[str, Any]) -> tuple[list[str], list[Any]]:
@@ -97,6 +119,24 @@ _CATEGORIES: dict[str, CategoryHandler] = {
         validate=remediation_admin.validate_changes,
         apply_diffs=remediation_admin.apply_diffs,
         snapshot=remediation_admin.snapshot,
+    ),
+    "ai": CategoryHandler(
+        get_live_object=lambda ctx: ctx.settings,
+        validate=ai_admin.validate_changes,
+        apply_diffs=ai_admin.apply_diffs,
+        snapshot=ai_admin.snapshot,
+        after_apply=ai_admin.rebuild_reasoner,
+        sensitive_fields=frozenset({"openai_api_key", "gemini_api_key"}),
+    ),
+    "monitoring": CategoryHandler(
+        get_live_object=lambda ctx: ctx,
+        validate=monitoring_admin.validate_changes,
+        apply_diffs=monitoring_admin.apply_diffs,
+        snapshot=monitoring_admin.snapshot,
+        after_apply=monitoring_admin.sync_environment_record,
+        sensitive_fields=frozenset(
+            {"prometheus_bearer_token", "loki_bearer_token", "kubernetes_token", "kubeconfig_b64"}
+        ),
     ),
 }
 
@@ -139,7 +179,14 @@ def _apply_and_audit(
         store.create_config_history_entry(
             entry_id=entry_id,
             category=category,
-            changes=[{"field": f, "old_value": None, "new_value": v} for f, v in changes.items()],
+            changes=[
+                {
+                    "field": f,
+                    "old_value": None,
+                    "new_value": "«redacted»" if f in handler.sensitive_fields else v,
+                }
+                for f, v in changes.items()
+            ],
             reason=reason,
             admin_id=admin_id,
             status="rejected",
@@ -296,6 +343,88 @@ def apply_remediation_change(
         "remediation",
         _CATEGORIES["remediation"],
         ctx.remediation,
+        payload.changes,
+        payload.reason,
+        current_admin["id"],
+        request.app.state.store,
+    )
+
+
+# ---------------------------------------------------------------------------
+# AI / Reasoning
+# ---------------------------------------------------------------------------
+@router.get("/ai")
+def get_ai_config(request: Request) -> dict[str, Any]:
+    ctx = _require_ctx(request)
+    store = request.app.state.store
+    return {
+        "current": ai_admin.snapshot(ctx.settings),
+        "bounds": ai_admin.bounds_metadata(),
+        "read_only": ai_admin.read_only_summary(ctx.settings),
+        **_latest_change_meta(store, "ai"),
+    }
+
+
+@router.post("/ai/preview")
+def preview_ai_change(payload: ChangeRequest, request: Request) -> dict[str, Any]:
+    ctx = _require_ctx(request)
+    errors, diffs = ai_admin.validate_changes(ctx.settings, payload.changes)
+    return {"valid": not errors, "errors": errors, "diff": [d.to_dict() for d in diffs]}
+
+
+@router.post("/ai/apply")
+def apply_ai_change(
+    payload: ChangeRequest, request: Request, current_admin: dict = Depends(get_current_admin)
+) -> dict[str, Any]:
+    ctx = _require_ctx(request)
+    if not payload.changes:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="no changes submitted")
+    return _apply_and_audit(
+        ctx,
+        "ai",
+        _CATEGORIES["ai"],
+        ctx.settings,
+        payload.changes,
+        payload.reason,
+        current_admin["id"],
+        request.app.state.store,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------------
+@router.get("/monitoring")
+def get_monitoring_config(request: Request) -> dict[str, Any]:
+    ctx = _require_ctx(request)
+    store = request.app.state.store
+    return {
+        "current": monitoring_admin.snapshot(ctx),
+        "bounds": monitoring_admin.bounds_metadata(),
+        "read_only": monitoring_admin.read_only_summary(ctx),
+        **_latest_change_meta(store, "monitoring"),
+    }
+
+
+@router.post("/monitoring/preview")
+def preview_monitoring_change(payload: ChangeRequest, request: Request) -> dict[str, Any]:
+    ctx = _require_ctx(request)
+    errors, diffs = monitoring_admin.validate_changes(ctx, payload.changes)
+    return {"valid": not errors, "errors": errors, "diff": [d.to_dict() for d in diffs]}
+
+
+@router.post("/monitoring/apply")
+def apply_monitoring_change(
+    payload: ChangeRequest, request: Request, current_admin: dict = Depends(get_current_admin)
+) -> dict[str, Any]:
+    ctx = _require_ctx(request)
+    if not payload.changes:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="no changes submitted")
+    return _apply_and_audit(
+        ctx,
+        "monitoring",
+        _CATEGORIES["monitoring"],
+        ctx,
         payload.changes,
         payload.reason,
         current_admin["id"],

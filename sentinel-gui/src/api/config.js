@@ -36,6 +36,30 @@ export function applyRemediationChange(changes, reason) {
   return client.post('/api/config/remediation/apply', { changes, reason: reason || null }).then((r) => r.data)
 }
 
+export function getAiConfig() {
+  return client.get('/api/config/ai').then((r) => r.data)
+}
+
+export function previewAiChange(changes) {
+  return client.post('/api/config/ai/preview', { changes }).then((r) => r.data)
+}
+
+export function applyAiChange(changes, reason) {
+  return client.post('/api/config/ai/apply', { changes, reason: reason || null }).then((r) => r.data)
+}
+
+export function getMonitoringConfig() {
+  return client.get('/api/config/monitoring').then((r) => r.data)
+}
+
+export function previewMonitoringChange(changes) {
+  return client.post('/api/config/monitoring/preview', { changes }).then((r) => r.data)
+}
+
+export function applyMonitoringChange(changes, reason) {
+  return client.post('/api/config/monitoring/apply', { changes, reason: reason || null }).then((r) => r.data)
+}
+
 export function getConfigHistory({ category = null, limit = 100, offset = 0 } = {}) {
   const params = { limit, offset }
   if (category) params.category = category

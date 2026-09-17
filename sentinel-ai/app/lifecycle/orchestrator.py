@@ -124,10 +124,12 @@ def build_context(
     s = settings_obj
     prom = PrometheusClient(
         environment.prometheus.url,
+        timeout=environment.prometheus.timeout_seconds,
         bearer_token=environment.prometheus.bearer_token,
     )
     loki = LokiClient(
         environment.loki.url,
+        timeout=environment.loki.timeout_seconds,
         bearer_token=environment.loki.bearer_token,
     )
     k8s = KubernetesClient(connection=environment.kubernetes)
