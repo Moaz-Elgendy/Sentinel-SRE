@@ -336,7 +336,7 @@ variable "enable_remote_sentinel" {
     for the in-cluster Sentinel Deployment, which keeps working either way.
   EOT
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "sentinel_instance_type" {

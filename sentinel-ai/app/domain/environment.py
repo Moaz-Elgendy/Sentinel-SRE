@@ -72,11 +72,21 @@ class KubernetesConnectionConfig(BaseModel):
 class PrometheusConnectionConfig(BaseModel):
     url: str
     bearer_token: str | None = None
+    # Not present before the Sentinel Administration & Tuning Center's
+    # Monitoring phase — previously PrometheusClient's `timeout` parameter
+    # was simply never passed from here, silently defaulting to the
+    # client's own hardcoded 10.0 with no settings-backed source and no
+    # persistence path at all (the exact "client holds a value nothing
+    # feeds it" gap every admin phase checks for). Giving it a real,
+    # persisted field closes that gap and lets the Monitoring config page
+    # make it genuinely, durably editable — see monitoring_admin.py.
+    timeout_seconds: float = 10.0
 
 
 class LokiConnectionConfig(BaseModel):
     url: str
     bearer_token: str | None = None
+    timeout_seconds: float = 10.0
 
 
 class GitHubConnectionConfig(BaseModel):

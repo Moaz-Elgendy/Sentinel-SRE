@@ -122,6 +122,25 @@ def _incident_counts(store: Any) -> dict[str, Any]:
     }
 
 
+def _latest_config_change(store: Any) -> dict[str, Any] | None:
+    """The Section 12 "config changed N minutes ago" indicator (Dashboard
+    Configuration History link) — one most-recent, category-agnostic read
+    of the same `config_history` table every admin page's own
+    `_latest_change_meta` already draws from (see app/routers/config.py).
+    Only an `applied` change counts; a rejected attempt shouldn't make the
+    dashboard claim something changed when nothing did.
+    """
+    recent = store.list_config_history(limit=5)
+    for entry in recent:
+        if entry.get("status") == "applied":
+            return {
+                "category": entry["category"],
+                "changed_at": entry["created_at"],
+                "changed_by": entry["admin_id"],
+            }
+    return None
+
+
 @router.get("/summary")
 async def dashboard_summary(request: Request) -> dict[str, Any]:
     ctx = _require_context(request)
@@ -135,7 +154,7 @@ async def dashboard_summary(request: Request) -> dict[str, Any]:
         "generated_at": time.time(),
         "sentinel": {
             "monitoring": True,
-            "mode": "dry_run" if ctx.settings.dry_run else "autonomous",
+            "mode": "dry_run" if ctx.remediation.dry_run else "autonomous",
             "llm": "enabled" if ctx.settings.llm_enabled else "rule_based_only",
             "kubernetes_available": ctx.k8s.available,
         },
@@ -149,4 +168,5 @@ async def dashboard_summary(request: Request) -> dict[str, Any]:
             "services": services,
         },
         "incidents": _incident_counts(store),
+        "latest_config_change": _latest_config_change(store),
     }

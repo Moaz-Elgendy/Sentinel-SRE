@@ -124,10 +124,12 @@ def build_context(
     s = settings_obj
     prom = PrometheusClient(
         environment.prometheus.url,
+        timeout=environment.prometheus.timeout_seconds,
         bearer_token=environment.prometheus.bearer_token,
     )
     loki = LokiClient(
         environment.loki.url,
+        timeout=environment.loki.timeout_seconds,
         bearer_token=environment.loki.bearer_token,
     )
     k8s = KubernetesClient(connection=environment.kubernetes)
@@ -320,9 +322,19 @@ class Orchestrator:
                 correlation_window_minutes=(
                     self.ctx.policy.config.deployment_correlation_window_minutes
                 ),
-                cpu_threshold_cores=self.ctx.settings.validation_max_cpu_cores,
-                error_rate_threshold=self.ctx.settings.validation_max_error_rate,
-                p95_threshold_seconds=self.ctx.settings.validation_max_p95_latency_seconds,
+                # Same reasoning as the correlation window above, and same
+                # fix: `ctx.validator.thresholds` (a `ValidationThresholds`
+                # instance — see lifecycle/validation.py) is what recovery
+                # validation actually checks against, and it is now
+                # live-editable via `PUT /api/config/rca` (see
+                # app/routers/rca_config.py). Reading `ctx.settings.
+                # validation_max_*` here instead would silently
+                # re-duplicate the same value: correlation would see an
+                # admin's change immediately, but recovery validation a
+                # few phases later would still be enforcing the old one.
+                cpu_threshold_cores=self.ctx.validator.thresholds.max_cpu_cores,
+                error_rate_threshold=self.ctx.validator.thresholds.max_error_rate,
+                p95_threshold_seconds=self.ctx.validator.thresholds.max_p95_seconds,
             )
             incident.record(
                 LifecyclePhase.CORRELATION,
@@ -379,7 +391,7 @@ class Orchestrator:
                 LifecyclePhase.AUTONOMOUS_EXECUTION,
                 f"executing {action.value} under temporary SRE authorization "
                 f"{authorization_id}"
-                + (" (DRY_RUN)" if self.ctx.settings.dry_run else ""),
+                + (" (DRY_RUN)" if self.ctx.remediation.dry_run else ""),  # live value, see ctx.remediation.dry_run
                 params=(verdict.adjusted_params or plan.params).to_dict(),
             )
             self._persist(incident)
@@ -434,7 +446,7 @@ class Orchestrator:
             incident.record(
                 LifecyclePhase.RECOVERY_VALIDATION,
                 "waiting for the settle period, then polling until recovery or "
-                f"timeout ({self.ctx.settings.validation_timeout_seconds}s)",
+                f"timeout ({self.ctx.validator.thresholds.timeout_seconds}s)",  # live value, see ctx.validator.thresholds
             )
             report = await self.ctx.validator.validate(
                 incident,
@@ -508,11 +520,12 @@ class Orchestrator:
                 correlation_window_minutes=(
                     self.ctx.policy.config.deployment_correlation_window_minutes
                 ),
-                cpu_threshold_cores=self.ctx.settings.validation_max_cpu_cores,
-                error_rate_threshold=self.ctx.settings.validation_max_error_rate,
-                p95_threshold_seconds=(
-                    self.ctx.settings.validation_max_p95_latency_seconds
-                ),
+                # See the identical comment in authorize_and_remediate above
+                # for why this reads `ctx.validator.thresholds`, not
+                # `settings`, directly.
+                cpu_threshold_cores=self.ctx.validator.thresholds.max_cpu_cores,
+                error_rate_threshold=self.ctx.validator.thresholds.max_error_rate,
+                p95_threshold_seconds=self.ctx.validator.thresholds.max_p95_seconds,
             )
             incident.record(
                 LifecyclePhase.CORRELATION,
@@ -606,7 +619,7 @@ class Orchestrator:
                 incident.record(
                     LifecyclePhase.AUTONOMOUS_EXECUTION,
                     f"executing {plan.action.value}"
-                    + (" (DRY_RUN)" if self.ctx.settings.dry_run else ""),
+                    + (" (DRY_RUN)" if self.ctx.remediation.dry_run else ""),  # live value, see ctx.remediation.dry_run
                     params=(verdict.adjusted_params or plan.params).to_dict(),
                 )
                 try:
@@ -653,7 +666,7 @@ class Orchestrator:
                 incident.record(
                     LifecyclePhase.RECOVERY_VALIDATION,
                     "waiting for the settle period, then polling until recovery or "
-                    f"timeout ({self.ctx.settings.validation_timeout_seconds}s)",
+                    f"timeout ({self.ctx.validator.thresholds.timeout_seconds}s)",  # live value, see ctx.validator.thresholds
                 )
                 report = await self.ctx.validator.validate(
                     incident,
