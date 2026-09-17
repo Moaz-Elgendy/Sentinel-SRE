@@ -43,7 +43,8 @@ export default function DashboardPage() {
   if (error) return <AlertBanner>{extractErrorMessage(error, 'Could not load the dashboard.')}</AlertBanner>
   if (!summary) return null
 
-  const { sentinel, environment, system_health: systemHealth, incidents } = summary
+  const { sentinel, environment, system_health: systemHealth, incidents, latest_config_change: latestConfigChange } =
+    summary
 
   return (
     <div className="page">
@@ -65,6 +66,17 @@ export default function DashboardPage() {
           }
         />
       </div>
+
+      {latestConfigChange && (
+        <Link to="/config-history" className="config-change-banner">
+          <span aria-hidden="true">⚙️</span>
+          <span>
+            {titleCase(latestConfigChange.category)} configuration changed{' '}
+            {formatRelativeTime(latestConfigChange.changed_at)} by {latestConfigChange.changed_by}
+          </span>
+          <span className="config-change-banner__link">View history →</span>
+        </Link>
+      )}
 
       <div className="grid grid--3">
         <section className="card">

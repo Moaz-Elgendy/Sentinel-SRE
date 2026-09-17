@@ -80,7 +80,7 @@ from app.core.events import EventBus
 from app.core.logging_config import configure_logging
 from app.core.security import hash_password
 from app.domain.environment import Environment
-from app.lifecycle import policy_admin, rca_admin, remediation_admin
+from app.lifecycle import ai_admin, policy_admin, rca_admin, remediation_admin
 from app.lifecycle.orchestrator import Orchestrator, build_context
 from app.routers import (
     actions,
@@ -195,6 +195,20 @@ async def lifespan(app: FastAPI):
             "stored_remediation_overrides_applied",
             extra={"fields": sorted(stored_remediation_overrides)},
         )
+
+    # ai_admin.reload_stored_overrides takes `ctx`, not `ctx.settings` alone
+    # (unlike rca/remediation above) — see ai_admin.py's module docstring:
+    # applying a stored provider/model/timeout/base_url override must also
+    # rebuild ctx.reasoner before Sentinel processes its first incident.
+    stored_ai_overrides = store.get_config_overrides("ai")
+    ai_override_errors = ai_admin.reload_stored_overrides(ctx, stored_ai_overrides)
+    if ai_override_errors:
+        logger.error(
+            "stored_ai_overrides_invalid",
+            extra={"errors": ai_override_errors, "overrides": stored_ai_overrides},
+        )
+    elif stored_ai_overrides:
+        logger.info("stored_ai_overrides_applied", extra={"fields": sorted(stored_ai_overrides)})
 
     # ---- Sentinel SRE Control Center (GUI) admin auth bootstrap ----------
     # No safe hardcoded secret/password (see core/config.py's field docs):
