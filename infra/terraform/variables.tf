@@ -348,7 +348,7 @@ variable "sentinel_instance_type" {
     region-availability caveat as var.instance_type applies.
   EOT
   type        = string
-  default     = "t3.micro"
+  default     = "t3.small"
 }
 
 variable "sentinel_webhook_port" {

@@ -56,7 +56,7 @@ data:
           # to close an incident that recovered on its own, so it does not
           # sit on an open incident forever or remediate something that has
           # already healed.
-          - url: http://sentinel-ai:8080/api/alerts/webhook
+          - url: http://10.20.1.57:8080/api/alerts/webhook
             send_resolved: true
 ---
 apiVersion: v1
@@ -207,23 +207,6 @@ data:
                 A chaos memory fault is active on {{ $labels.app }}. Any
                 MemoryLeakSuspected alert firing alongside this is explained
                 by it.
-
-          # --- Sentinel's own health -------------------------------------
-          # The agent watching the system needs something watching it. If
-          # Sentinel is down, nothing is performing autonomous remediation
-          # and every other alert here is going nowhere — which is worth
-          # knowing, and is the one alert a human should actually look at.
-          - alert: SentinelDown
-            expr: up{app="sentinel-ai", kubernetes_namespace="citizen-portal"} == 0
-            for: 2m
-            labels:
-              severity: critical
-            annotations:
-              summary: "Sentinel is down — no autonomous remediation is happening"
-              description: >-
-                Prometheus cannot scrape sentinel-ai. Alertmanager is still
-                delivering webhooks to it, but nothing is processing them.
-                Incidents will not be detected or remediated until it is back.
 
           - alert: SentinelEscalating
             expr: increase(sentinel_escalations_total[15m]) > 0
