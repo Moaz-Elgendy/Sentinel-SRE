@@ -96,6 +96,11 @@ output "sentinel_webhook_url" {
   value       = var.enable_remote_sentinel ? "http://${aws_instance.sentinel[0].private_ip}:${var.sentinel_webhook_port}/api/alerts/webhook" : null
 }
 
+output "sentinel_gui_url" {
+  description = "Public URL for the Sentinel SRE Control Center GUI — served by sentinel-gui's own nginx on the Sentinel instance, which also reverse-proxies /api/ to sentinel-ai privately. This is the only public entrypoint on the Sentinel instance; sentinel-ai itself is never reachable at this address."
+  value       = var.enable_remote_sentinel ? "http://${aws_instance.sentinel[0].public_ip}" : null
+}
+
 output "k3s_private_ip" {
   description = "Private IP of the K3s node. Needed to construct the remote Kubernetes API server URL (https://<this>:6443) and confirm it matches what sentinel_remote.tf baked into the Sentinel instance's user_data."
   value       = aws_instance.k3s.private_ip

@@ -1,8 +1,12 @@
 import axios from 'axios'
 
-// Points at sentinel-ai (see ../../sentinel-ai). Override with
-// VITE_API_BASE_URL at build time for a non-local deployment.
-const baseURL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080'
+// Empty (same-origin) by default: the built image is served behind its own
+// nginx reverse proxy in front of sentinel-ai (see ../../nginx.conf), so an
+// empty baseURL makes axios resolve '/api/...' against the page's own
+// origin — no CORS involved. Set VITE_API_BASE_URL at build time only for a
+// deployment that does NOT put that proxy in front of this bundle (see
+// ../../.env.example).
+const baseURL = import.meta.env.VITE_API_BASE_URL || ''
 
 export const client = axios.create({ baseURL })
 
@@ -69,7 +73,8 @@ export function extractErrorMessage(error, fallback = 'Something went wrong. Ple
   }
 
   if (error?.request) {
-    return `Could not reach Sentinel at ${client.defaults.baseURL}. It may be down, or this page's origin may not be in SENTINEL_GUI_ORIGINS (check the browser console for a CORS error).`
+    const target = client.defaults.baseURL || `${window.location.origin} (same-origin /api)`
+    return `Could not reach Sentinel at ${target}. It may be down, or, if VITE_API_BASE_URL was overridden for this build, this page's origin may not be in SENTINEL_GUI_ORIGINS (check the browser console for a CORS error).`
   }
 
   return fallback

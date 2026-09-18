@@ -94,13 +94,11 @@ case "${MODE}" in
     kubectl -n "${NS}" set image deployment/sentinel-ai \
       sentinel-ai="${REGISTRY}/${PREFIX}/sentinel-ai:${SHA}" || \
       echo "note: sentinel-ai deployment not present yet, skipped"
-    # sentinel-gui follows the exact same pattern as sentinel-ai above: a
-    # fresh/older cluster that has not deployed the sentinel-gui Deployment
-    # yet (see k8s/overlays/aws/sentinel-gui/) must not break this step for
-    # every other service.
-    kubectl -n "${NS}" set image deployment/sentinel-gui \
-      sentinel-gui="${REGISTRY}/${PREFIX}/sentinel-gui:${SHA}" || \
-      echo "note: sentinel-gui deployment not present yet, skipped"
+    # sentinel-gui is NOT set here any more: it has moved to the external
+    # Sentinel EC2 as part of the Sentinel control plane (see
+    # infra/terraform/sentinel_remote.tf) and is never deployed in K3s in
+    # either topology. See .github/workflows/ci-cd.yml's deploy-to-sentinel
+    # job for how its image gets updated instead.
     ;;
   apply)
     cd "${REPO_DIR}"

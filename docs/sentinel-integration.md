@@ -392,9 +392,17 @@ security boundary above; it is built to extend it consistently, not around it:
   (`tests/test_policy.py`'s `human_override` suite). The grant itself
   (`temporary_authorizations` table) is scoped to one incident and one action, single-use, expires
   in 15 minutes, and never edits `PolicyConfig`'s actual thresholds.
-- **Reachability matches Sentinel's own.** `sentinel-gui` is deliberately kept off any public
-  Ingress too (`k8s/overlays/aws/sentinel-gui/service.yaml`) — an SRE reaches both it and
-  `sentinel-ai` the same way, via `kubectl port-forward` (see `k8s/README.md`).
+- **Reachability is now a public reverse proxy, deliberately scoped.** `sentinel-gui` runs on the
+  external Sentinel EC2 (`infra/terraform/sentinel_remote.tf`), not in K3s, and its own nginx
+  (`sentinel-gui/nginx.conf`) is that instance's only public entrypoint. It serves the built SPA
+  and reverse-proxies everything under `/api/` to that instance's `sentinel-ai` over a private
+  Docker network — except `/api/alerts/webhook` and `/api/sentinel/chaos-scenarios`, which are
+  explicitly denied at the proxy (`404`) since Alertmanager and the chaos runner already reach
+  `sentinel-ai` directly over the private VPC network and never need the public path. The browser
+  calls same-origin `/api/...` (no `VITE_API_BASE_URL` override, no CORS grant needed) instead of
+  the previous model of two separate `kubectl port-forward` tunnels to a ClusterIP `sentinel-ai`
+  and `sentinel-gui` in K3s. `enable_remote_sentinel=false` (the in-cluster-only topology) has no
+  deployed GUI at all — see `k8s/README.md` for the `npm run dev` fallback for that case.
 
 A full implementation plan (page structure, API surface, data models, phased rollout) was written
 before any of this was built and is kept for reference in the repository's project history rather
@@ -508,13 +516,14 @@ refactor was written in. That is the load-bearing gap before calling this demo-r
 6. **Discovery is shallow, deliberately** (spec section 20's explicit instruction): namespace-scoped
    deployments/services/pod-count only. No dependency graph, no traffic-pattern modelling, no
    service-mesh topology.
-7. **The GUI assumes the in-cluster Sentinel topology, not the standalone remote one.**
-   `sentinel-gui`'s deployment (`k8s/overlays/aws/sentinel-gui/`) and its default
-   `VITE_API_BASE_URL` are built against `k8s/overlays/aws/sentinel/` (Sentinel running inside the
-   K3s cluster). The alternate `enable_remote_sentinel` topology
-   (`infra/terraform/sentinel_remote.tf` — Sentinel on its own external EC2 instance) has no GUI
-   deployment story yet; reaching that Sentinel's API today still means the systemd/journalctl
-   workflow `sentinel_user_data.sh.tftpl` sets up, not this GUI.
+7. **The GUI now assumes the standalone remote topology, not the in-cluster one.** `sentinel-gui`
+   has moved to the external Sentinel EC2 (`infra/terraform/sentinel_remote.tf`,
+   `sentinel_user_data.sh.tftpl`) and defaults to a same-origin `VITE_API_BASE_URL` (empty),
+   reverse-proxied to that instance's own `sentinel-ai` by `sentinel-gui/nginx.conf`. It has no
+   equivalent deployment against the in-cluster `k8s/overlays/aws/sentinel/` topology any more
+   (`enable_remote_sentinel=false`) — reaching that Sentinel's API in that mode still means the
+   `kubectl port-forward` workflow `k8s/README.md` describes, with `sentinel-gui`'s own `npm run
+   dev` pointed at it if a GUI is wanted there too.
 
 ## Next steps toward replacing the external LLM with a standalone Sentinel model
 
