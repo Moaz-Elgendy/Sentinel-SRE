@@ -11,7 +11,9 @@ This repository contains two things that only make sense together:
    controlled failures.
 2. **Sentinel AI** (`sentinel-ai/`) — an autonomous SRE agent that watches that application,
    investigates incidents, decides on remediation, and **executes it without asking a human**,
-   including rolling back a bad deployment.
+   including rolling back a bad deployment. **`sentinel-gui/`** is its companion admin console — a
+   separate React app, with its own login, for watching that lifecycle incident-by-incident and
+   intervening when Sentinel escalates.
 
 The application exists so Sentinel has something real to fail. Most demonstrations of "AI for
 operations" are built on a fabricated metric and a fabricated failure; this one is built on an
@@ -102,42 +104,48 @@ not hold — it escalates to a human and says exactly why.
                                         │
                                         ▼  (CI never touches the Kubernetes API)
   ┌─────────────────────────────────────────────────────────────────────────┐
-  │ AWS: VPC · public subnet · Internet Gateway · security group (:80 only) │
+  │ K3s node — citizen portal + observability (t3a.large, Ubuntu 24.04)     │
+  │ K3s v1.31.4+k3s1 — single node, control-plane + worker                  │
   │                                                                         │
-  │   one t3a.large EC2 instance — Ubuntu 24.04, 40 GiB encrypted gp3       │
-  │   ┌───────────────────────────────────────────────────────────────────┐ │
-  │   │ K3s v1.31.4+k3s1 — single node, control-plane + worker            │ │
-  │   │                                                                   │ │
-  │   │   Traefik (K3s's bundled ingress controller)                      │ │
-  │   │     │                                                             │ │
-  │   │     ├── / ────▶ frontend (nginx + React)                          │ │
-  │   │     └── /api ─▶ citizen-service ──▶ notification-service          │ │
-  │   │                       │                      │                    │ │
-  │   │                 citizen-postgres    notification-postgres         │ │
-  │   │                                                                   │ │
-  │   │   Prometheus ── Alertmanager                Grafana Alloy         │ │
-  │   │        │             │                            │               │ │
-  │   │        │             │  webhook                   ▼               │ │
-  │   │        │             └────────────┐             Loki              │ │
-  │   │        │                          ▼               │               │ │
-  │   │        └──── PromQL ──────▶  Sentinel AI  ◀── LogQL┘              │ │
-  │   │                             (FastAPI :8080)                       │ │
-  │   │                                   │                               │ │
-  │   │                       namespaced RBAC Role                        │ │
-  │   │                                   ▼                               │ │
-  │   │                          Kubernetes API (:6443, not public)       │ │
-  │   │                                                                   │ │
-  │   │   Grafana ──── reads ────▶ Prometheus + Loki                      │ │
-  │   └───────────────────────────────────────────────────────────────────┘ │
+  │   Traefik (K3s's bundled ingress controller)                            │
+  │     │                                                                   │
+  │     ├── / ────▶ frontend (nginx + React)                                │
+  │     └── /api ─▶ citizen-service ──▶ notification-service                │
+  │                       │                      │                          │
+  │                 citizen-postgres    notification-postgres               │
+  │                                                                         │
+  │   Prometheus ── Alertmanager                Grafana Alloy               │
+  │        │             │  webhook (to the Sentinel node)  │               │
+  │        │             └───────────────┐                 ▼               │
+  │        │ NodePort :30090             │               Loki               │
+  │        │                             │           NodePort :30100        │
+  │   Grafana ── reads ──▶ Prometheus + Loki                                │
+  └────────│─────────────────────────────│─────────────────│───────────────┘
+           │ PromQL                      │                 │ LogQL
+           ▼                             ▼                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ Sentinel node — its own EC2 instance, optional                          │
+  │ (infra/terraform/sentinel_remote.tf, `enable_remote_sentinel`)          │
+  │                                                                         │
+  │   nginx — the only public port on this instance                        │
+  │     ├── / ────▶ sentinel-gui (React SPA, the SRE Control Center)       │
+  │     └── /api ─▶ sentinel-ai (FastAPI :8080)                            │
+  │                       │                                                │
+  │            namespaced RBAC Role, reached over the K3s API              │
+  │            (:6443, security-group-scoped — not public)                 │
   └─────────────────────────────────────────────────────────────────────────┘
         │
         ▼
   GitHub issues / incident reports / postmortems · Slack (both optional)
 ```
 
-Administration of the instance is AWS Systems Manager Session Manager only — there is no SSH port
-and no key pair. Grafana, Prometheus, Alertmanager and Sentinel are not exposed publicly; they are
-reached by port-forwarding through Session Manager. Port 80 is the only inbound rule.
+Both EC2 instances are administered through AWS Systems Manager Session Manager only — there is no
+SSH port and no key pair. On the K3s node, Grafana, Prometheus and Alertmanager are not exposed
+publicly; they are reached by port-forwarding through Session Manager, and Prometheus and Loki are
+additionally reachable from the Sentinel node through two restricted NodePorts. On the Sentinel
+node, `sentinel-gui`'s nginx is the only public entrypoint, reverse-proxying `/api/` to `sentinel-ai`
+over a private Docker network. Each instance's security group allows exactly one inbound port from
+the internet (`:80`).
 
 ## Technology stack
 
@@ -171,6 +179,13 @@ reached by port-forwarding through Session Manager. Port 80 is the only inbound 
 - **`sentinel-ai/`** (`:8080`) — the SRE agent. Receives Alertmanager webhooks at
   `/api/alerts/webhook`, reads Prometheus and Loki, reads and patches Deployments through the
   Kubernetes API.
+- **`sentinel-gui/`** — the Sentinel SRE Control Center. A separate React SPA with its own admin
+  login (unrelated to citizen-service's citizen auth or to the chaos control API's
+  `X-Chaos-Token`), giving an operator a live view of the incident lifecycle and a narrow, audited
+  way to intervene when Sentinel escalates. It runs on its own EC2 instance, not in K3s — see
+  [Architecture](#architecture) — and every route it calls other than the Alertmanager webhook and
+  the chaos-scenario endpoint requires that admin JWT. Full detail is in
+  [`docs/sentinel-integration.md`](docs/sentinel-integration.md#sentinel-sre-control-center-gui).
 
 Each backend owns its own database and its own migrations. There are no cross-service joins and no
 shared schema — which is what makes "notification delivery is degraded but the portal is fine" a
@@ -178,23 +193,29 @@ state the system can actually be in, and therefore a state Sentinel has to disti
 
 ## AWS architecture
 
-Everything runs on one instance. The full list of AWS services used:
+The citizen portal and its observability stack run on one K3s instance. Sentinel — both
+`sentinel-ai` and `sentinel-gui` — optionally runs on a second, standalone instance instead of
+inside that cluster (`enable_remote_sentinel`, off by default; see
+[`infra/terraform/sentinel_remote.tf`](infra/terraform/sentinel_remote.tf) and
+[`docs/sentinel-remote-validation-runbook.md`](docs/sentinel-remote-validation-runbook.md)). The
+full list of AWS services used:
 
-**VPC, Internet Gateway, one public subnet, one route table, one security group, EC2, EBS, IAM,
-ECR, Systems Manager.**
+**VPC, Internet Gateway, one public subnet, one route table, security groups, EC2 (one or two
+instances), EBS, IAM, ECR, Systems Manager.**
 
 Deliberately not used: **EKS, RDS, ALB, NAT Gateway**, and (on AWS) **ingress-nginx**. The
 reasoning for each is in [Cost-conscious AWS architecture](#cost-conscious-aws-architecture) and
 in full in [`docs/aws-deployment.md`](docs/aws-deployment.md).
 
-The instance is a **`t3a.large`** (2 vCPU / 8 GiB) on Canonical's official **Ubuntu 24.04** AMI,
-with a **40 GiB encrypted gp3** root volume. It has an IAM instance profile for SSM and ECR pulls,
-and no other AWS permissions.
+The K3s instance is a **`t3a.large`** (2 vCPU / 8 GiB) on Canonical's official **Ubuntu 24.04**
+AMI, with a **40 GiB encrypted gp3** root volume. Each instance has an IAM instance profile for SSM
+and ECR pulls, and no other AWS permissions.
 
-Four **ECR** repositories hold the images: `sentinel-sre-demo/citizen-service`,
-`.../notification-service`, `.../frontend`, `.../sentinel-ai`. Deployments reference images **by
-git commit SHA, never `latest`** — the running ReplicaSet has to be traceable back to a commit,
-because "was something deployed just before this broke" is a question Sentinel answers
+Five **ECR** repositories hold the images: `sentinel-sre-demo/citizen-service`,
+`.../notification-service`, `.../frontend`, `.../sentinel-ai`, `.../sentinel-gui`. Deployments
+reference images **by git commit SHA, never `latest`** — the running ReplicaSet has to be
+traceable back to a commit, because "was something deployed just before this broke" is a question
+Sentinel answers
 mechanically rather than by asking someone.
 
 Infrastructure is Terraform in [`infra/terraform/`](infra/terraform/). State is local; there is no
@@ -603,6 +624,13 @@ meaningless.
 incident handling. The separate GUI-driven scenario runner is an operator action guarded by
 `CHAOS_ADMIN_TOKEN` and an allow-list of known `scripts/incident-scenarios.sh` scenario names.
 
+**`sentinel-gui` admin access.** Sign-in uses a separate admin-account system (unrelated to
+citizen-service's citizen auth), and every GUI-facing route requires that admin JWT except the
+Alertmanager webhook and the chaos-scenario endpoint, which keep their own existing gates.
+`sentinel-gui`'s nginx denies both of those at the reverse proxy, since Alertmanager and the chaos
+runner already reach `sentinel-ai` directly and never need the public path. Full detail is in
+[`docs/sentinel-integration.md`](docs/sentinel-integration.md#sentinel-sre-control-center-gui).
+
 ---
 
 ## Deployment
@@ -651,7 +679,11 @@ That command is **unchanged** despite the manifests having moved into `k8s/base/
 [`k8s/README.md`](k8s/README.md), which also covers image naming, the hosts-file entry for
 `citizen-portal.local`, port-forwarding the observability stack, and troubleshooting.
 
-Sentinel is currently only in the AWS overlay and has no local-development equivalent yet; see
+Neither `sentinel-ai` nor `sentinel-gui` has a local-development equivalent yet — both exist only
+on the optional standalone Sentinel EC2 instance (`enable_remote_sentinel`), not in `k8s/`. To
+exercise `sentinel-gui` against a local cluster anyway, run its own `npm run dev` with
+`VITE_API_BASE_URL` pointed at a `kubectl port-forward`'d `sentinel-ai` — see
+[`k8s/README.md`](k8s/README.md) and `sentinel-gui/.env.example`. See also
 [Future roadmap](#future-roadmap).
 
 Docker Compose still works too, for the application without Kubernetes — see
@@ -671,7 +703,8 @@ terraform plan
 terraform apply
 
 # 2. Configure GitHub: the OIDC role ARN and instance id as repository secrets,
-#    and the aws-demo Environment. See docs/github-configuration.md.
+#    and the aws-demo Environment. See infra/terraform/github_oidc.tf and the
+#    OIDC setup steps in docs/aws-deployment.md.
 
 # 3. On the node, over Session Manager — there is no SSH.
 aws ssm start-session --target <instance-id> --region <region>
@@ -764,8 +797,18 @@ the root-cause narrative is rule-generated. Nothing degrades silently; the incid
 `llm_used=false`. But "AI-powered" is doing less work in that configuration than the phrase
 suggests, and the honest framing is that the LLM enriches an analysis the rules already produce.
 
-**Local development has no Sentinel.** Sentinel is only in the AWS overlay, so the fastest
-environment to bring up is also the one where the agent cannot be exercised.
+**Local development has no Sentinel.** `sentinel-ai` and `sentinel-gui` exist only on the optional
+standalone Sentinel EC2 instance, so the fastest environment to bring up is also the one where the
+agent and its console cannot be exercised without extra manual steps.
+
+**The in-cluster Sentinel manifests
+([`k8s/overlays/aws/sentinel/`](k8s/overlays/aws/sentinel/)) are present but unused.** The AWS
+overlay's `kustomization.yaml` no longer lists that directory as a resource — its own comment
+says Sentinel now runs as an external control plane, and K3s hosts only the citizen workloads and
+observability stack. `infra/terraform/variables.tf`'s description of `enable_remote_sentinel`
+still calls the in-cluster deployment "the default," which this contradicts. This README describes
+the standalone-EC2 topology as current because that is what the manifests and Terraform actually
+wire up; the stale comment in `variables.tf` is worth a maintainer's look.
 
 **ingress-nginx locally is unmaintained.** Fine for a laptop, and the reason AWS uses Traefik
 instead. Not something to put in front of real traffic.
@@ -800,9 +843,9 @@ Roughly in the order that would actually help:
 
 | Document | What is in it |
 |---|---|
-| [`Phases.md`](Phases.md) | The full build history, phase by phase, with what was deferred and why at each step. The most honest document in the repo. |
-| [`docs/aws-deployment.md`](docs/aws-deployment.md) | The AWS architecture in detail and the deployment runbook. |
-| [`docs/github-configuration.md`](docs/github-configuration.md) | Repository secrets, the OIDC role, environments, branch protection. |
-| [`docs/sentinel-integration.md`](docs/sentinel-integration.md) | What Sentinel reads, what it may act on, `request_id` correlation, and chaos-awareness. |
-| [`k8s/README.md`](k8s/README.md) | Manifest layout, the base/overlay split, both deployment paths, troubleshooting. |
+| [`Phases.md`](Phases.md) | The build history through Phase 13, phase by phase, with what was deferred and why at each step. Written before the standalone Sentinel EC2 and `sentinel-gui` existed, so it does not cover them — see `docs/sentinel-integration.md` for that work instead. |
+| [`docs/aws-deployment.md`](docs/aws-deployment.md) | The AWS architecture in detail, the OIDC/repository-secrets setup, and the deployment runbook. |
+| [`docs/sentinel-integration.md`](docs/sentinel-integration.md) | What Sentinel reads, what it may act on, `request_id` correlation, chaos-awareness, and the `sentinel-gui` Control Center's design. |
+| [`docs/sentinel-remote-validation-runbook.md`](docs/sentinel-remote-validation-runbook.md) | Standing up and validating the standalone Sentinel EC2 instance (`enable_remote_sentinel`). |
+| [`k8s/README.md`](k8s/README.md) | Manifest layout, the base/overlay split, both deployment paths, reaching `sentinel-gui` locally, troubleshooting. |
 | [`scripts/`](scripts/) | `deploy-*.sh`, `deploy-aws.sh`, `generate-aws-secrets.sh`, `smoke-test.sh`, `incident-scenarios.sh`, `teardown.sh`. |
