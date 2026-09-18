@@ -36,26 +36,12 @@ namespace: citizen-portal
 
 resources:
   - ../../base
-  # Sentinel has no local equivalent yet, so it is added here rather than
-  # patched. When a local Sentinel setup exists, promote this to the base.
-  - sentinel/namespace-rbac.yaml
-  - sentinel/configmap.yaml
-  - sentinel/deployment.yaml
-  - sentinel/service.yaml
-  # The Sentinel SRE Control Center GUI (sentinel-gui) is deliberately NOT
-  # here. It used to be a ClusterIP Deployment reached by kubectl
-  # port-forward alongside sentinel-ai, but it has moved to the external
-  # Sentinel EC2 (see infra/terraform/sentinel_remote.tf and
-  # sentinel_user_data.sh.tftpl) as part of the Sentinel control plane, not
-  # the monitored application cluster. It is never deployed in K3s any
-  # more, in either topology.
-  # Additive NodePort Services for Prometheus/Loki, so a remote/external
-  # Sentinel (see infra/terraform/sentinel_remote.tf) can reach them without
-  # exposing either publicly — the security group is what actually
-  # restricts access, this just makes the port reachable on the node at
-  # all. Deploying this does not remove or change the in-cluster Sentinel
-  # Deployment above; the two topologies can coexist, and only one is
-  # normally active (KUBERNETES_MODE on whichever Sentinel is running).
+  # Sentinel now runs as an external control plane on the dedicated
+  # Sentinel EC2 instance. K3s only hosts the customer workloads and
+  # observability stack.
+  #
+  # Prometheus/Loki remain reachable by the external Sentinel through
+  # the restricted NodePorts below.
   - observability-nodeport.yaml
 
 # ---------------------------------------------------------------------------
@@ -85,10 +71,6 @@ images:
   - name: frontend
     newName: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/frontend
     newTag: PLACEHOLDER
-  - name: sentinel-ai
-    newName: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/sentinel-ai
-    newTag: PLACEHOLDER
-
 # ---------------------------------------------------------------------------
 # Secrets
 #
