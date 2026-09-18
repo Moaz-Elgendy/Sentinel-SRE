@@ -1,6 +1,10 @@
 import { getToken } from './client.js'
 
-const baseURL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080'
+// Same default as client.js — empty (same-origin) unless VITE_API_BASE_URL
+// was overridden at build time. EventSource needs a full URL rather than
+// axios's baseURL convenience, so build it against window.location when
+// baseURL is empty.
+const baseURL = import.meta.env.VITE_API_BASE_URL || window.location.origin
 
 /**
  * Opens the real-time event stream (sentinel-ai's GET /api/events — see

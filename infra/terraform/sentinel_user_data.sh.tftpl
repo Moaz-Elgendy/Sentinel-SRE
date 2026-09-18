@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # Bootstrap for the STANDALONE external Sentinel instance. Installs Docker,
 # fetches this instance's two credential parameters (never Terraform-managed
-# — see sentinel_remote.tf's docstring), and runs the sentinel-ai container
-# with KUBERNETES_MODE=remote pointed at the K3s node's private IP.
+# — see sentinel_remote.tf's docstring), and runs the sentinel-ai AND
+# sentinel-gui containers on a shared private Docker network
+# ("sentinel-net"), with KUBERNETES_MODE=remote pointed at the K3s node's
+# private IP.
+#
+# sentinel-gui's own nginx (see sentinel-gui/nginx.conf) is this instance's
+# ONLY public entrypoint (port ${gui_port}): it serves the built SPA and
+# reverse-proxies /api/ to sentinel-ai over sentinel-net by container name,
+# so sentinel-ai's own port is never exposed publicly just to make the GUI
+# reachable. sentinel-ai keeps its existing host-published port
+# ${webhook_port} for Alertmanager, unchanged — that path does not go
+# through sentinel-gui's proxy at all.
 #
 # Progress logged to /var/log/sentinel-remote-bootstrap.log; success marker
 # at /var/lib/sentinel/remote-bootstrap-complete, mirroring the K3s node's
@@ -27,6 +37,7 @@ systemctl enable --now docker
 AWS_REGION="${aws_region}"
 ECR_REGISTRY="${ecr_registry}"
 IMAGE="$ECR_REGISTRY/${ecr_repo_prefix}/sentinel-ai:${image_tag}"
+GUI_IMAGE="$ECR_REGISTRY/${ecr_repo_prefix}/sentinel-gui:${gui_image_tag}"
 
 echo "--- ECR login ---"
 aws ecr get-login-password --region "$AWS_REGION" \
@@ -34,6 +45,12 @@ aws ecr get-login-password --region "$AWS_REGION" \
 
 echo "--- pulling $IMAGE ---"
 docker pull "$IMAGE"
+
+echo "--- pulling $GUI_IMAGE ---"
+docker pull "$GUI_IMAGE"
+
+echo "--- creating private sentinel-net Docker network (idempotent) ---"
+docker network create sentinel-net 2>/dev/null || true
 
 echo "--- fetching credential parameters from SSM ---"
 K8S_TOKEN="$(aws ssm get-parameter --region "$AWS_REGION" \
@@ -103,7 +120,9 @@ Wants=network-online.target
 Restart=always
 RestartSec=5
 ExecStartPre=-/usr/bin/docker rm -f sentinel-ai
+ExecStartPre=-/usr/bin/docker network create sentinel-net
 ExecStart=/usr/bin/docker run --rm --name sentinel-ai \\
+  --network sentinel-net --network-alias sentinel-ai \\
   --env-file /etc/sentinel-ai.env \\
   -p ${webhook_port}:8080 \\
   -v /var/lib/sentinel:/var/lib/sentinel \\
@@ -114,15 +133,49 @@ ExecStop=/usr/bin/docker stop sentinel-ai
 WantedBy=multi-user.target
 UNIT
 
+# sentinel-gui: the Sentinel Control Center GUI, and (via its own nginx —
+# see sentinel-gui/nginx.conf) the ONLY public entrypoint on this instance.
+# It joins the same sentinel-net network as sentinel-ai above and reaches
+# it at http://sentinel-ai:8080 by that network alias — never via this
+# host's public IP or the ${webhook_port} host-published port. It needs no
+# env file: its API base URL is baked into the JS bundle at image build
+# time as same-origin (see sentinel-gui/Dockerfile's VITE_API_BASE_URL
+# default), not read at container runtime.
+cat >/etc/systemd/system/sentinel-gui.service <<UNIT
+[Unit]
+Description=Sentinel GUI — control-plane reverse proxy + SPA
+After=docker.service network-online.target sentinel-ai.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f sentinel-gui
+ExecStartPre=-/usr/bin/docker network create sentinel-net
+ExecStart=/usr/bin/docker run --rm --name sentinel-gui \\
+  --network sentinel-net --network-alias sentinel-gui \\
+  -p ${gui_port}:80 \\
+  $GUI_IMAGE
+ExecStop=/usr/bin/docker stop sentinel-gui
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 systemctl daemon-reload
 systemctl enable --now sentinel-ai
+systemctl enable --now sentinel-gui
 
 cat >/var/lib/sentinel/remote-bootstrap-complete <<EOF
 bootstrapped_at=$(date -Is)
 image=$IMAGE
+gui_image=$GUI_IMAGE
 k3s_private_ip=${k3s_private_ip}
 EOF
 echo "=== sentinel-remote bootstrap complete: $(date -Is) ==="
-echo "Check status: sudo systemctl status sentinel-ai"
+echo "Check status: sudo systemctl status sentinel-ai sentinel-gui"
 echo "Check logs:   sudo journalctl -u sentinel-ai -f"
+echo "              sudo journalctl -u sentinel-gui -f"
 echo "Test API:     curl -s http://localhost:${webhook_port}/readyz"
+echo "Test GUI:     curl -s http://localhost:${gui_port}/healthz"

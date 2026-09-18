@@ -10,11 +10,15 @@ RUN npm ci
 COPY . .
 
 # Baked into the production JS bundle at build time (Vite env vars are
-# resolved at build, not runtime). This is what the *browser* calls
-# directly — sentinel-ai's CORS allow-list (SENTINEL_GUI_ORIGINS, see
-# sentinel-ai/app/core/config.py) must include wherever this bundle is
-# served from. Override with --build-arg for a non-default deployment.
-ARG VITE_API_BASE_URL=http://localhost:8080
+# resolved at build, not runtime). Empty by default: src/api/client.js and
+# src/api/events.js treat an unset VITE_API_BASE_URL as "call same-origin
+# /api/...", which is what lets this image be served behind its own nginx
+# reverse proxy (see nginx.conf) with no CORS involved at all — the browser
+# never leaves the origin it loaded the GUI from. Override with
+# --build-arg VITE_API_BASE_URL=http://some-host:8080 only for a deployment
+# that does NOT put this nginx in front of sentinel-ai (e.g. pointing a
+# local `npm run dev` at a port-forwarded sentinel-ai for ad hoc testing).
+ARG VITE_API_BASE_URL=
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
 
 RUN npm run build
@@ -25,9 +29,12 @@ FROM nginx:1.27-alpine AS serve
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-EXPOSE 8081
+# 80, not 8081: this container is the Sentinel control plane's public
+# entrypoint now (see nginx.conf's module docstring), not a ClusterIP
+# service reached only via kubectl port-forward.
+EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:8081/healthz || exit 1
+    CMD wget -qO- http://127.0.0.1:80/healthz || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

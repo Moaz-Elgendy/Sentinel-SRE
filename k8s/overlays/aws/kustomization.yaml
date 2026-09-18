@@ -42,12 +42,13 @@ resources:
   - sentinel/configmap.yaml
   - sentinel/deployment.yaml
   - sentinel/service.yaml
-  # Sentinel SRE Control Center GUI — a separate static SPA + nginx
-  # Deployment, reached by the same port-forward pattern as sentinel-ai
-  # itself (see sentinel-gui/deployment.yaml for why). No local-development
-  # equivalent yet either, for the same reason sentinel/ above has none.
-  - sentinel-gui/deployment.yaml
-  - sentinel-gui/service.yaml
+  # The Sentinel SRE Control Center GUI (sentinel-gui) is deliberately NOT
+  # here. It used to be a ClusterIP Deployment reached by kubectl
+  # port-forward alongside sentinel-ai, but it has moved to the external
+  # Sentinel EC2 (see infra/terraform/sentinel_remote.tf and
+  # sentinel_user_data.sh.tftpl) as part of the Sentinel control plane, not
+  # the monitored application cluster. It is never deployed in K3s any
+  # more, in either topology.
   # Additive NodePort Services for Prometheus/Loki, so a remote/external
   # Sentinel (see infra/terraform/sentinel_remote.tf) can reach them without
   # exposing either publicly — the security group is what actually
@@ -86,9 +87,6 @@ images:
     newTag: PLACEHOLDER
   - name: sentinel-ai
     newName: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/sentinel-ai
-    newTag: PLACEHOLDER
-  - name: sentinel-gui
-    newName: ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/sentinel-gui
     newTag: PLACEHOLDER
 
 # ---------------------------------------------------------------------------

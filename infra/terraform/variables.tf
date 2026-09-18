@@ -373,6 +373,17 @@ variable "sentinel_image_tag" {
   default     = "latest"
 }
 
+variable "sentinel_gui_image_tag" {
+  description = <<-EOT
+    Tag of the sentinel-gui image in ECR to run on the standalone Sentinel
+    instance, alongside sentinel-ai (see var.sentinel_image_tag — same
+    mechanism, same caveats: push this tag before applying, or it will fail
+    to pull).
+  EOT
+  type        = string
+  default     = "latest"
+}
+
 variable "prometheus_nodeport" {
   description = "NodePort Prometheus is exposed on for a remote Sentinel — must match k8s/overlays/aws/observability-nodeport.yaml's prometheus-nodeport Service."
   type        = number

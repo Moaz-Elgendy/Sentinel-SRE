@@ -23,9 +23,14 @@
 # routers are auth-gated, which is exactly the kind of rule that silently
 # goes stale the next time a router is added. Until that is solved
 # properly, this Service stays off any Ingress and is reached by
-# `kubectl port-forward`, the same as the Sentinel GUI itself
-# (../sentinel-gui/service.yaml) — deploy that alongside this one and
-# port-forward both.
+# `kubectl port-forward`.
+#
+# (The external Sentinel EC2's own sentinel-gui reverse proxy — see
+# infra/terraform/sentinel_remote.tf — DOES solve this properly, with an
+# explicit deny on exactly those two paths ahead of its general /api/
+# proxy; see sentinel-gui/nginx.conf. That proxy fronts the external
+# sentinel-ai instance, not this in-cluster one, which is why this Service
+# still has no Ingress of its own.)
 #
 # To inspect incidents from a laptop, port-forward through SSM:
 #   aws ssm start-session --target <instance-id>

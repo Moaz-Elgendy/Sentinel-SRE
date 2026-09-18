@@ -190,12 +190,12 @@ jobs:
           # (http://localhost:8000) — see that file for why.
           VITE_API_BASE_URL: ""
 
-  # Unlike frontend above, no VITE_API_BASE_URL override: sentinel-gui is
-  # never reached through an Ingress (see
-  # k8s/overlays/aws/sentinel-gui/deployment.yaml's comment for why — it
-  # deliberately stays off any public path, the same as sentinel-ai
-  # itself), so its Dockerfile default of http://localhost:8080 is correct
-  # for the real deployment too, not just local dev. Nothing to set here.
+  # Also no VITE_API_BASE_URL override needed here, but for the SAME reason
+  # as frontend above, not the opposite one: sentinel-gui now runs on the
+  # external Sentinel EC2 behind its own reverse-proxying nginx (see
+  # sentinel-gui/nginx.conf and infra/terraform/sentinel_remote.tf), so its
+  # Dockerfile's empty default already produces same-origin /api/... calls.
+  # It has no in-cluster deployment or Ingress at all any more.
   lint-and-build-sentinel-gui:
     runs-on: ubuntu-latest
     defaults:
@@ -485,7 +485,10 @@ jobs:
             build_args: ""
           - service: sentinel-gui
             context: sentinel-gui
-            build_args: ""
+            # Explicit and empty, matching frontend above — see
+            # lint-and-build-sentinel-gui's comment for why.
+            build_args: |
+              VITE_API_BASE_URL=
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -552,9 +555,10 @@ jobs:
             build_args: ""
           - service: sentinel-gui
             context: sentinel-gui
-            # No VITE_API_BASE_URL override — see lint-and-build-sentinel-gui's
-            # comment on why the Dockerfile default is correct here too.
-            build_args: ""
+            # Explicit and empty, matching frontend above — see
+            # lint-and-build-sentinel-gui's comment for why.
+            build_args: |
+              VITE_API_BASE_URL=
     steps:
       - uses: actions/checkout@v7
 
@@ -785,6 +789,7 @@ jobs:
   deploy-to-sentinel:
     name: Deploy Sentinel to external EC2
     needs: build-and-push-images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: aws-demo
 
@@ -799,22 +804,38 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
 
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Deploys both sentinel-ai and sentinel-gui (its own nginx is the
+      # instance's only public entrypoint — see sentinel-gui/nginx.conf and
+      # infra/terraform/sentinel_remote.tf). Registry is discovered via the
+      # ECR login step above, not hardcoded, the same as every other job in
+      # this workflow — this instance has no k8s manifest / kustomize image
+      # transform to keep it consistent for free, so it has to be spelled out
+      # here instead.
       - name: Deploy Sentinel
         shell: bash
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
           set -euo pipefail
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "${{ secrets.SENTINEL_EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --parameters 'commands=[
-              "set -e",
-              "aws ecr get-login-password --region ${{ vars.AWS_REGION }} | docker login --username AWS --password-stdin 890608336467.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com",
-              "docker pull 890608336467.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com/sentinel-sre-demo/sentinel-ai:latest",
-              "systemctl restart sentinel-ai",
-              "systemctl is-active --quiet sentinel-ai"
-            ]' \
-            --comment "Deploy Sentinel latest image" \
+            --parameters "commands=[
+              \"set -e\",
+              \"aws ecr get-login-password --region ${{ vars.AWS_REGION }} | docker login --username AWS --password-stdin $REGISTRY\",
+              \"docker pull $REGISTRY/sentinel-sre-demo/sentinel-ai:latest\",
+              \"docker pull $REGISTRY/sentinel-sre-demo/sentinel-gui:latest\",
+              \"systemctl restart sentinel-ai\",
+              \"systemctl restart sentinel-gui\",
+              \"systemctl is-active --quiet sentinel-ai\",
+              \"systemctl is-active --quiet sentinel-gui\"
+            ]" \
+            --comment "Deploy Sentinel latest images" \
             --query "Command.CommandId" \
             --output text)
 

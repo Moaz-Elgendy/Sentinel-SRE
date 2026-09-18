@@ -160,7 +160,9 @@ for d in citizen-postgres notification-postgres; do
 done
 
 echo "--- waiting for application and observability stack ---"
-for d in citizen-service notification-service frontend prometheus alertmanager loki grafana sentinel-ai sentinel-gui; do
+# sentinel-gui is deliberately not in this list: it runs on the external
+# Sentinel EC2 (infra/terraform/sentinel_remote.tf), not in this cluster.
+for d in citizen-service notification-service frontend prometheus alertmanager loki grafana sentinel-ai; do
   # `|| true` deliberately: one component failing to become ready should not
   # abort the wait on the others. The verification block below reports the
   # real state, which is more useful than stopping at the first problem.

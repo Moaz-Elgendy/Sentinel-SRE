@@ -6,6 +6,16 @@
 # default leaves the existing single-instance environment completely
 # unchanged.
 #
+# This instance also runs sentinel-gui (the Sentinel SRE Control Center
+# GUI) — it is part of the Sentinel control plane, not the monitored
+# application cluster, and has no k8s/overlays/aws/sentinel-gui/ equivalent
+# any more (see sentinel_user_data.sh.tftpl). sentinel-gui's own nginx is
+# this instance's only public entrypoint (port 80, security.tf's
+# sentinel_gui_http rule): it serves the built SPA and reverse-proxies
+# /api/ to sentinel-ai over a private "sentinel-net" Docker network,
+# excluding the two endpoints (webhook, chaos-scenarios) that must stay
+# off any public path — see sentinel-gui/nginx.conf for the exact rules.
+#
 # Same VPC, same public subnet as the K3s node (see network.tf's docstring
 # for why there is no NAT Gateway / private subnet — same cost reasoning
 # applies here). Sentinel gets a public IP for its OWN outbound access
@@ -286,9 +296,11 @@ locals {
     ecr_registry         = local.ecr_registry
     ecr_repo_prefix      = var.project_name
     image_tag            = var.sentinel_image_tag
+    gui_image_tag        = var.sentinel_gui_image_tag
     k3s_instance_id      = aws_instance.k3s.id
     k3s_private_ip       = aws_instance.k3s.private_ip
     webhook_port         = var.sentinel_webhook_port
+    gui_port             = 80
     prometheus_port      = var.prometheus_nodeport
     loki_port            = var.loki_nodeport
     token_param_name     = "/${var.project_name}/sentinel/k8s-token"

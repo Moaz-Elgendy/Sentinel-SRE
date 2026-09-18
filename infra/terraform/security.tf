@@ -169,3 +169,37 @@ resource "aws_vpc_security_group_ingress_rule" "loki_from_sentinel" {
     Name = "${var.project_name}-ingress-loki-from-sentinel"
   }
 }
+
+# ---------------------------------------------------------------------------
+# Sentinel Control Center GUI — public :80 entrypoint on the Sentinel
+# instance itself (sentinel-gui's own nginx, see
+# infra/terraform/sentinel_user_data.sh.tftpl). Same allow-list variable as
+# the K3s node's own http rule above, deliberately: this is the same demo
+# network policy applied to a second public entrypoint, not a new one.
+#
+# No :443 rule here, and no enable_https_ingress gate to reuse — mirroring
+# the K3s node's own reasoning (see var.enable_https_ingress's docstring):
+# nothing in this environment terminates TLS yet, so an open-but-dead 443
+# would be worse than a closed one. Add it once TLS is actually configured
+# in sentinel-gui's nginx.
+#
+# sentinel-ai itself is NOT reachable through this rule or this port — it
+# stays exactly as private as it is today (previous rule in this file),
+# reached by the browser only via sentinel-gui's reverse proxy over the
+# private sentinel-net Docker network on the instance, never by IP:8080.
+# ---------------------------------------------------------------------------
+
+resource "aws_vpc_security_group_ingress_rule" "sentinel_gui_http" {
+  for_each = var.enable_remote_sentinel ? toset(var.allowed_http_cidrs) : toset([])
+
+  security_group_id = aws_security_group.sentinel[0].id
+  description       = "Sentinel Control Center GUI, via its own reverse proxy"
+  cidr_ipv4         = each.value
+  from_port         = 80
+  to_port           = 80
+  ip_protocol       = "tcp"
+
+  tags = {
+    Name = "${var.project_name}-sentinel-ingress-http"
+  }
+}

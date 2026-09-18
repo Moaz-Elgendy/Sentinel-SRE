@@ -1026,11 +1026,14 @@ docker build -t "${ECR_REGISTRY}/${PREFIX}/sentinel-gui:${TAG}" ./sentinel-gui
 > load fine on the public IP and then fail every API call, because the browser will be trying to
 > reach the visitor's own machine. If the portal renders but nothing works, check this first.
 >
-> **`sentinel-gui` needs NO build argument here** â€” unlike `frontend`, it is never reached through
-> the Ingress (see `k8s/overlays/aws/sentinel-gui/deployment.yaml`'s comment for why). Its default
-> `VITE_API_BASE_URL=http://localhost:8080` is correct as-is: it is always reached through
-> `kubectl port-forward` to an SRE's own laptop, where `localhost:8080` is exactly where the
-> equivalent `sentinel-ai` port-forward puts the API.
+> **`sentinel-gui` also needs no build argument here, and for the same underlying reason as
+> `frontend`.** `sentinel-gui/Dockerfile`’s default `VITE_API_BASE_URL=` (empty) is already
+> correct: this image is not deployed to K3s at all any more — it runs on the external Sentinel
+> EC2 (`infra/terraform/sentinel_remote.tf`) behind its own nginx (`sentinel-gui/nginx.conf`),
+> which serves the SPA and reverse-proxies `/api/` to that instance’s `sentinel-ai` same-origin.
+> Only pass `--build-arg VITE_API_BASE_URL=http://some-host:8080` if you are building a copy to run
+> WITHOUT that proxy in front of it (e.g. `npm run dev` against a `kubectl port-forward`’d
+> `sentinel-ai`).
 
 Expected: five successful builds. Confirm:
 

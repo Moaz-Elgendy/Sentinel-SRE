@@ -105,11 +105,13 @@ data:
   SENTINEL_DB_PATH: /data/sentinel.db
 
   # --- Sentinel SRE Control Center (GUI) -----------------------------------
-  # The browser origin the GUI is served from. Set to the port-forwarded
-  # localhost address an SRE reaches sentinel-gui at (see
-  # ../sentinel-gui/deployment.yaml's long comment on why port-forward,
-  # not a public path, is how both of these are reached) — NOT the
-  # in-cluster Service DNS name, since CORS is enforced against the
-  # browser's actual origin, and the browser is always on the operator's
-  # laptop here, not inside the cluster.
-  SENTINEL_GUI_ORIGINS: http://localhost:8081
+  # The browser origin(s) the GUI is served from. This in-cluster
+  # sentinel-ai no longer has a co-deployed GUI (sentinel-gui now lives on
+  # the external Sentinel EC2 as part of the control plane — see
+  # infra/terraform/sentinel_remote.tf — and reaches sentinel-ai there
+  # same-origin through its own reverse proxy, which needs no CORS grant at
+  # all). This setting only matters if an SRE runs sentinel-gui's `npm run
+  # dev` server locally against a `kubectl port-forward`'d copy of THIS
+  # in-cluster sentinel-ai for ad hoc testing — hence the Vite dev server's
+  # default origin, not a deployed GUI's.
+  SENTINEL_GUI_ORIGINS: http://localhost:5173
