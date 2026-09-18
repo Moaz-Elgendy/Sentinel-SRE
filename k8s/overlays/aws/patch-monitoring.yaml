@@ -56,7 +56,7 @@ data:
           # to close an incident that recovered on its own, so it does not
           # sit on an open incident forever or remediate something that has
           # already healed.
-          - url: http://sentinel-ai:8080/api/alerts/webhook
+          - url: http://10.20.1.57:8080/api/alerts/webhook
             send_resolved: true
 ---
 apiVersion: v1
