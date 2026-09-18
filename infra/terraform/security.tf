@@ -128,12 +128,12 @@ resource "aws_vpc_security_group_egress_rule" "all" {
 resource "aws_vpc_security_group_ingress_rule" "k8s_api_from_sentinel" {
   count = var.enable_remote_sentinel ? 1 : 0
 
-  security_group_id           = aws_security_group.k3s_node.id
-  description                 = "Kubernetes API, from the external Sentinel instance only"
+  security_group_id            = aws_security_group.k3s_node.id
+  description                  = "Kubernetes API, from the external Sentinel instance only"
   referenced_security_group_id = aws_security_group.sentinel[0].id
-  from_port                   = 6443
-  to_port                     = 6443
-  ip_protocol                 = "tcp"
+  from_port                    = 6443
+  to_port                      = 6443
+  ip_protocol                  = "tcp"
 
   tags = {
     Name = "${var.project_name}-ingress-k8s-api-from-sentinel"
@@ -143,12 +143,12 @@ resource "aws_vpc_security_group_ingress_rule" "k8s_api_from_sentinel" {
 resource "aws_vpc_security_group_ingress_rule" "prometheus_from_sentinel" {
   count = var.enable_remote_sentinel ? 1 : 0
 
-  security_group_id           = aws_security_group.k3s_node.id
-  description                 = "Prometheus NodePort, from the external Sentinel instance only"
+  security_group_id            = aws_security_group.k3s_node.id
+  description                  = "Prometheus NodePort, from the external Sentinel instance only"
   referenced_security_group_id = aws_security_group.sentinel[0].id
-  from_port                   = var.prometheus_nodeport
-  to_port                     = var.prometheus_nodeport
-  ip_protocol                 = "tcp"
+  from_port                    = var.prometheus_nodeport
+  to_port                      = var.prometheus_nodeport
+  ip_protocol                  = "tcp"
 
   tags = {
     Name = "${var.project_name}-ingress-prometheus-from-sentinel"
@@ -158,12 +158,12 @@ resource "aws_vpc_security_group_ingress_rule" "prometheus_from_sentinel" {
 resource "aws_vpc_security_group_ingress_rule" "loki_from_sentinel" {
   count = var.enable_remote_sentinel ? 1 : 0
 
-  security_group_id           = aws_security_group.k3s_node.id
-  description                 = "Loki NodePort, from the external Sentinel instance only"
+  security_group_id            = aws_security_group.k3s_node.id
+  description                  = "Loki NodePort, from the external Sentinel instance only"
   referenced_security_group_id = aws_security_group.sentinel[0].id
-  from_port                   = var.loki_nodeport
-  to_port                     = var.loki_nodeport
-  ip_protocol                 = "tcp"
+  from_port                    = var.loki_nodeport
+  to_port                      = var.loki_nodeport
+  ip_protocol                  = "tcp"
 
   tags = {
     Name = "${var.project_name}-ingress-loki-from-sentinel"

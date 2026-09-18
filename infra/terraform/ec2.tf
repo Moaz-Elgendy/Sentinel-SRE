@@ -20,16 +20,20 @@ locals {
   ecr_registry = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
 
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
-    aws_region      = var.aws_region
-    aws_account_id  = data.aws_caller_identity.current.account_id
-    ecr_registry    = local.ecr_registry
-    ecr_repo_prefix = var.project_name
-    k3s_version     = var.k3s_version
-    app_namespace   = var.app_namespace
-    repo_url        = var.repo_url == null ? "" : var.repo_url
+    aws_region     = var.aws_region
+    aws_account_id = data.aws_caller_identity.current.account_id
+    ecr_registry   = local.ecr_registry
+    k3s_version    = var.k3s_version
+    app_namespace  = var.app_namespace
+    repo_url       = var.repo_url == null ? "" : var.repo_url
     # Where the repository is checked out on the node. Passed in rather than
-    # hardcoded in the template so the bootstrap script and the two helper
-    # scripts it writes cannot disagree about the path.
+    # hardcoded in the template so the bootstrap script and the ECR-refresh
+    # helper it writes cannot disagree about the path. Must match
+    # scripts/sentinel-deploy.sh's own REPO_DIR constant, and var.project_name
+    # must match that script's own PREFIX constant (both "sentinel-sre-demo"
+    # by default). Nothing here embeds scripts/sentinel-deploy.sh's content
+    # (EC2 user_data has a hard 16 KiB limit) -- first boot instead installs
+    # it FROM this checkout; see step 8 in user_data.sh.tftpl.
     repo_dir = "/opt/sentinel-sre"
   })
 }

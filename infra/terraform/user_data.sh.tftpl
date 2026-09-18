@@ -244,98 +244,32 @@ fi
 # script on the node, rather than a long inline command in the workflow, so
 # that the set of things CI is able to ask the node to do is fixed, small,
 # and reviewable here.
-# ---------------------------------------------------------------------------
-# NOTE ON QUOTING: the heredoc delimiters in this file are QUOTED, e.g.
-# <<'DEPLOY'. That means bash performs NO expansion while writing the file —
-# no variable expansion, no command substitution, no backtick evaluation.
-# Terraform still substitutes its own template placeholders, because it
-# processes this file before bash ever sees it. So the convention inside a
-# quoted heredoc is:
 #
-#   a single-dollar placeholder  -> substituted by Terraform, at render time
-#   a double-dollar placeholder  -> becomes a single dollar in the output,
-#                                   and is expanded by bash at runtime
+# The script content is NOT embedded in this template and never was meant
+# to survive that way: EC2 user_data has a hard 16 KiB limit enforced by
+# AWS (and by Terraform's aws_instance validation), and
+# scripts/sentinel-deploy.sh alone is already several KB and will only
+# grow. Instead, first boot installs it FROM the repository checkout that
+# step 7 above just made in $${REPO_DIR} -- no copy of the script's bytes
+# lives in Terraform state or in this template at all.
 #
-# With an UNQUOTED delimiter every runtime dollar sign and every backtick
-# would need escaping, and getting one wrong does not fail loudly — it
-# executes the fragment during boot instead of writing it into the script.
-# That actually happened during development with a backtick in a comment.
-# Quoting the delimiter removes the entire class of bug.
-cat >/usr/local/bin/sentinel-deploy.sh <<'DEPLOY'
-#!/usr/bin/env bash
-# Deploy a specific image tag to the citizen portal namespace.
-#
-# Usage:
-#   sentinel-deploy.sh images <git-sha>   # roll the 5 service images to <git-sha>
-#   sentinel-deploy.sh apply <git-sha>    # git checkout <git-sha> + kubectl apply -k
-#
-# "images" is the normal CI path: it changes only the container images,
-# which produces a clean new ReplicaSet and therefore real rollout history
-# for Sentinel to correlate against and roll back to.
-#
-# "apply" is for manifest changes and requires the checkout in ${repo_dir}.
-set -euo pipefail
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-
-MODE="$${1:?usage: sentinel-deploy.sh <images|apply> <git-sha>}"
-SHA="$${2:?usage: sentinel-deploy.sh <images|apply> <git-sha>}"
-NS="${app_namespace}"
-REGISTRY="${ecr_registry}"
-PREFIX="${ecr_repo_prefix}"
-REPO_DIR="${repo_dir}"
-
-case "$${MODE}" in
-  images)
-    # "kubectl set image" only updates a Deployment that already exists, and
-    # its error when one does not is not obvious. The very first deploy of a
-    # fresh cluster has to create the resources, which is deploy-aws.sh's
-    # job, so fail here with the actual instruction rather than letting CI
-    # report "deployments.apps not found".
-    if ! kubectl -n "$${NS}" get deployment citizen-service >/dev/null 2>&1; then
-      echo "ERROR: the citizen-portal Deployments do not exist yet." >&2
-      echo "The first deploy must create them:" >&2
-      echo "  sudo $${REPO_DIR}/scripts/generate-aws-secrets.sh" >&2
-      echo "  sudo $${REPO_DIR}/scripts/deploy-aws.sh $${SHA}" >&2
-      echo "Subsequent CI deploys can then use this 'images' mode." >&2
-      exit 1
-    fi
-
-    # Init containers share the service image, so they are set too —
-    # otherwise the migration job would run the previous version's code.
-    kubectl -n "$${NS}" set image deployment/citizen-service \
-      citizen-service="$${REGISTRY}/$${PREFIX}/citizen-service:$${SHA}" \
-      migrate-and-seed="$${REGISTRY}/$${PREFIX}/citizen-service:$${SHA}"
-    kubectl -n "$${NS}" set image deployment/notification-service \
-      notification-service="$${REGISTRY}/$${PREFIX}/notification-service:$${SHA}" \
-      migrate="$${REGISTRY}/$${PREFIX}/notification-service:$${SHA}"
-    kubectl -n "$${NS}" set image deployment/frontend \
-      frontend="$${REGISTRY}/$${PREFIX}/frontend:$${SHA}"
-    kubectl -n "$${NS}" set image deployment/sentinel-ai \
-      sentinel-ai="$${REGISTRY}/$${PREFIX}/sentinel-ai:$${SHA}" || \
-      echo "note: sentinel-ai deployment not present yet, skipped"
-    kubectl -n "$${NS}" set image deployment/sentinel-gui \
-      sentinel-gui="$${REGISTRY}/$${PREFIX}/sentinel-gui:$${SHA}" || \
-      echo "note: sentinel-gui deployment not present yet, skipped"
-    ;;
-  apply)
-    cd "$${REPO_DIR}"
-    git fetch --all --tags
-    git checkout --detach "$${SHA}"
-    kubectl apply -k k8s/overlays/aws
-    ;;
-  *)
-    echo "unknown mode: $${MODE}" >&2
-    exit 2
-    ;;
-esac
-
-# Deliberately NOT waiting for rollout success here. A bad deployment is a
-# scenario this project exists to demonstrate: CI's job is to deploy, and
-# Sentinel's job is to notice and remediate. Blocking CI on rollout status
-# would mask exactly the failure mode we want observed.
-kubectl -n "$${NS}" get deployments -o wide
-DEPLOY
-chmod 0755 /usr/local/bin/sentinel-deploy.sh
+# Why an indirection is needed at all, rather than just re-running
+# Terraform after an edit: Terraform deliberately does NOT push a changed
+# user_data to an already-running instance (user_data_replace_on_change =
+# false in ec2.tf) -- so even a much smaller embedded copy would still
+# never reach a live node. The single source of truth is the repository
+# file; both first boot (here) and every later CI deploy (the script's own
+# "sync" mode, invoked by ci-cd.yml's deploy-to-k3s job before "images")
+# install that exact file from a git checkout, so neither path can
+# disagree with the repo or with each other, and neither touches
+# user_data.
+if [ -f "$${REPO_DIR}/scripts/sentinel-deploy.sh" ]; then
+  install -m 0755 "$${REPO_DIR}/scripts/sentinel-deploy.sh" /usr/local/bin/sentinel-deploy.sh
+else
+  echo "WARNING: $${REPO_DIR}/scripts/sentinel-deploy.sh not found (private repo clone failed above?)."
+  echo "/usr/local/bin/sentinel-deploy.sh was NOT installed. Populate $${REPO_DIR} manually, then run:"
+  echo "  install -m 0755 $${REPO_DIR}/scripts/sentinel-deploy.sh /usr/local/bin/sentinel-deploy.sh"
+fi
 
 # ---------------------------------------------------------------------------
 # Done

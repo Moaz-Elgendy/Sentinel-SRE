@@ -606,12 +606,13 @@ jobs:
   # already exists on the node, and the node talks to its own local API
   # server over loopback.
   #
-  # What the node runs is /usr/local/bin/sentinel-deploy.sh, baked in at
-  # provisioning time by infra/terraform/user_data.sh.tftpl. It accepts a
-  # mode and a git SHA and nothing else — so even a fully compromised
-  # workflow cannot run arbitrary commands on the node or arbitrary kubectl
-  # against the cluster. The IAM policy narrows it further:
-  # ssm:SendCommand is scoped to this one instance and the
+  # What the node runs is /usr/local/bin/sentinel-deploy.sh, installed at
+  # provisioning time by infra/terraform/user_data.sh.tftpl (which now
+  # splices in scripts/sentinel-deploy.sh verbatim — see that file's own
+  # header for why). It accepts a mode and a git SHA and nothing else — so
+  # even a fully compromised workflow cannot run arbitrary commands on the
+  # node or arbitrary kubectl against the cluster. The IAM policy narrows it
+  # further: ssm:SendCommand is scoped to this one instance and the
   # AWS-RunShellScript document only.
   #
   # `images` mode (kubectl set image) rather than `apply`:
@@ -621,6 +622,23 @@ jobs:
   #   roll back to. A full `apply` is only needed when manifests changed, and
   #   is left as a deliberate operator action over SSM — see
   #   docs/aws-deployment.md.
+  #
+  # `sync` mode, run first and best-effort, before `images`:
+  #   Terraform will NOT push a changed user_data to an already-running
+  #   instance (user_data_replace_on_change = false in infra/terraform/
+  #   ec2.tf — deliberately, so an edit here cannot silently replace, and
+  #   wipe, a live cluster). Without this step, a fix to
+  #   scripts/sentinel-deploy.sh (e.g. adding a newly-introduced service to
+  #   the `images` case) would sit correctly in the repo forever without
+  #   ever reaching the node that is actually running. `sync` re-installs
+  #   /usr/local/bin/sentinel-deploy.sh from this exact commit's checkout on
+  #   the node, so `images` right after it always runs the current logic.
+  #   It is deliberately best-effort: a node whose installed script predates
+  #   `sync` mode itself has no way to understand this command the very
+  #   first time it is rolled out (see docs/aws-deployment.md's "one-time
+  #   bootstrap" note) — that must not block the `images` deploy that
+  #   follows, which is why this step's failure is reported but never fails
+  #   the job.
   # -------------------------------------------------------------------------
   deploy-to-k3s:
     needs: build-and-push-images
@@ -641,6 +659,48 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: Sync sentinel-deploy.sh on the node (best-effort)
+        id: sync
+        run: |
+          set -euo pipefail
+
+          command_id=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Sync sentinel-deploy.sh to ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}" \
+            --parameters commands="/usr/local/bin/sentinel-deploy.sh sync ${GITHUB_SHA}" \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM command: ${command_id}"
+
+          status=Pending
+          for _ in $(seq 1 30); do
+            status=$(aws ssm get-command-invocation \
+              --command-id "${command_id}" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+              --query Status --output text 2>/dev/null || echo Pending)
+            case "${status}" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+
+          echo "--- sync status: ${status} ---"
+          aws ssm get-command-invocation --command-id "${command_id}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query StandardOutputContent --output text || true
+          aws ssm get-command-invocation --command-id "${command_id}" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query StandardErrorContent --output text || true
+
+          if [ "${status}" != "Success" ]; then
+            echo "::warning::sentinel-deploy.sh sync did not succeed (status: ${status})." \
+              "images mode will still run against whatever version of the script is" \
+              "currently installed on the node. If this is the very first run after" \
+              "adding 'sync' mode, this is expected once — see docs/aws-deployment.md."
+          fi
+          # Deliberately always exit 0: sync is a best-effort freshness step,
+          # never a gate on the deploy that follows.
 
       - name: Trigger deploy on the node via SSM
         id: send
