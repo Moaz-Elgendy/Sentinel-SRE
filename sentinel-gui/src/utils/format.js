@@ -3,10 +3,21 @@ export function formatTimestamp(epochSeconds) {
   return new Date(epochSeconds * 1000).toLocaleString()
 }
 
+// Clock time only (e.g. "14:03:22") — for dense timelines where the date is
+// already obvious from context.
+export function formatClock(epochSeconds) {
+  if (epochSeconds == null) return '—'
+  return new Date(epochSeconds * 1000).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
 export function formatRelativeTime(epochSeconds) {
   if (epochSeconds == null) return '—'
   const diffSeconds = Date.now() / 1000 - epochSeconds
-  if (diffSeconds < 0) return 'just now'
+  if (diffSeconds < 5) return 'just now'
   if (diffSeconds < 60) return `${Math.floor(diffSeconds)}s ago`
   if (diffSeconds < 3600) return `${Math.floor(diffSeconds / 60)}m ago`
   if (diffSeconds < 86400) return `${Math.floor(diffSeconds / 3600)}h ago`

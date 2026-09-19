@@ -1,190 +1,133 @@
-import { useEffect, useState } from 'react'
-import AlertBanner from '../components/AlertBanner.jsx'
-import Spinner from '../components/Spinner.jsx'
+import { Fragment } from 'react'
 import { applyRemediationChange, getRemediationConfig, previewRemediationChange } from '../api/config.js'
-import { extractErrorMessage } from '../api/client.js'
-import { formatRelativeTime, titleCase } from '../utils/format.js'
+import { ChangeReview, LastChanged, ReadOnlyCard } from '../components/config/ConfigParts.jsx'
+import AlertBanner from '../components/ui/AlertBanner.jsx'
+import Button from '../components/ui/Button.jsx'
+import Card from '../components/ui/Card.jsx'
+import { ErrorState } from '../components/ui/EmptyState.jsx'
+import Icon from '../components/ui/Icon.jsx'
+import { PageSkeleton } from '../components/ui/Loading.jsx'
+import PageHeader from '../components/ui/PageHeader.jsx'
+import StatusPill from '../components/ui/StatusPill.jsx'
+import { useConfigEditor } from '../hooks/useConfigEditor.js'
+import { usePageTitle } from '../hooks/usePageTitle.js'
+import { titleCase } from '../utils/format.js'
+
+// This page has one editable setting (dry run) and it is changed through the
+// same review → confirm flow as everything else, started from the toggle.
+const makeDraft = (current) => ({ dry_run: current.dry_run })
+const diffChanges = () => ({})
 
 export default function RemediationConfigPage() {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState(null)
+  usePageTitle('Remediation')
+  const editor = useConfigEditor({
+    load: getRemediationConfig,
+    previewChange: previewRemediationChange,
+    applyChange: applyRemediationChange,
+    makeDraft,
+    diffChanges,
+    loadErrorMessage: 'Could not load remediation configuration.',
+  })
+  const { data, preview } = editor
 
-  const [preview, setPreview] = useState(null)
-  const [reason, setReason] = useState('')
-  const [reviewing, setReviewing] = useState(false)
-  const [applying, setApplying] = useState(false)
-  const [actionError, setActionError] = useState(null)
-  const [justApplied, setJustApplied] = useState(false)
-
-  function loadConfig() {
-    setLoading(true)
-    getRemediationConfig()
-      .then((body) => {
-        setData(body)
-        setLoadError(null)
-      })
-      .catch((err) => setLoadError(extractErrorMessage(err, 'Could not load remediation configuration.')))
-      .finally(() => setLoading(false))
+  if (editor.loading) return <PageSkeleton label="Loading remediation configuration…" cards={2} />
+  if (editor.loadError) {
+    return <ErrorState title="Couldn't load remediation configuration" message={editor.loadError} onRetry={editor.retryLoad} />
   }
-
-  useEffect(loadConfig, [])
-
-  async function handleToggleDryRun() {
-    setPreview(null)
-    setActionError(null)
-    setReviewing(true)
-    try {
-      const nextValue = !data.current.dry_run
-      const result = await previewRemediationChange({ dry_run: nextValue })
-      setPreview({ ...result, changes: { dry_run: nextValue } })
-    } catch (err) {
-      setActionError(extractErrorMessage(err, 'Could not validate this change.'))
-    } finally {
-      setReviewing(false)
-    }
-  }
-
-  async function handleApply() {
-    setApplying(true)
-    setActionError(null)
-    try {
-      await applyRemediationChange(preview.changes, reason)
-      setPreview(null)
-      setReason('')
-      setJustApplied(true)
-      loadConfig()
-    } catch (err) {
-      setActionError(extractErrorMessage(err, 'Could not apply this change.'))
-    } finally {
-      setApplying(false)
-    }
-  }
-
-  if (loading) return <Spinner label="Loading remediation configuration…" />
-  if (loadError) return <AlertBanner>{loadError}</AlertBanner>
   if (!data) return null
 
   const readOnly = data.read_only
+  const dryRun = data.current.dry_run
 
   return (
     <div className="page">
-      <div className="page__header">
-        <div>
-          <h1>Remediation</h1>
-          <p className="page__subtitle">
-            {data.last_changed_at && (
-              <>Last changed {formatRelativeTime(data.last_changed_at)} by {data.last_changed_by}.</>
-            )}
-          </p>
-        </div>
-      </div>
+      <PageHeader
+        title="Remediation"
+        subtitle={
+          <>
+            How Sentinel applies the actions it decides on.
+            <LastChanged at={data.last_changed_at} by={data.last_changed_by} />
+          </>
+        }
+      />
 
-      {justApplied && !preview && (
+      {editor.justApplied && !preview && (
         <AlertBanner tone="success">Configuration applied — Sentinel is using the new value now.</AlertBanner>
       )}
-      {actionError && <AlertBanner>{actionError}</AlertBanner>}
+      {editor.actionError && <AlertBanner>{editor.actionError}</AlertBanner>}
 
       {preview ? (
-        <section className="card card--escalation">
-          <h2 className="card__title">Review change</h2>
-          {preview.errors.length > 0 ? (
-            <div>
-              {preview.errors.map((err) => (
-                <p key={err} className="muted">
-                  ✗ {err}
-                </p>
-              ))}
-              <button type="button" className="button button--ghost" onClick={() => setPreview(null)}>
-                Cancel
-              </button>
+        <ChangeReview
+          preview={preview}
+          reason={editor.reason}
+          onReasonChange={editor.setReason}
+          applying={editor.applying}
+          onApply={editor.apply}
+          onCancel={editor.cancelReview}
+        />
+      ) : (
+        <>
+          <Card
+            title="Dry run mode"
+            description="When on, Sentinel decides and authorises actions exactly as normal, but does not apply them to the cluster — everything else (evidence, RCA, Policy Engine, audit trail) runs for real."
+          >
+            <div className="mode-row">
+              <div className="mode-row__state">
+                <StatusPill
+                  size="lg"
+                  status={dryRun ? 'unknown' : 'escalated'}
+                  label={dryRun ? 'Dry run — no cluster mutations' : 'Autonomous — actions are applied'}
+                />
+              </div>
+              <Button
+                variant={dryRun ? 'caution' : 'secondary'}
+                onClick={() => editor.review({ dry_run: !dryRun })}
+                busy={editor.reviewing}
+                busyLabel="Validating…"
+              >
+                {dryRun ? 'Turn dry run off' : 'Turn dry run on'}
+              </Button>
             </div>
-          ) : (
-            <>
+          </Card>
+
+          <ReadOnlyCard title="Action ladder" description={readOnly.description}>
+            <div className="card card--flush table-wrap">
               <table className="table">
+                <caption className="sr-only">Candidate remediation actions per root cause</caption>
                 <thead>
                   <tr>
-                    <th>Field</th>
-                    <th>Current</th>
-                    <th>New</th>
+                    <th scope="col">Root cause</th>
+                    <th scope="col">Candidate actions, in order</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {preview.diff.map((d) => (
-                    <tr key={d.field}>
-                      <td>{titleCase(d.field)}</td>
-                      <td className="mono">{String(d.old_value)}</td>
-                      <td className="mono">{String(d.new_value)}</td>
+                  {Object.entries(readOnly.action_ladder).map(([rootCause, actions]) => (
+                    <tr key={rootCause}>
+                      <td>{titleCase(rootCause)}</td>
+                      <td>
+                        {actions.length > 0 ? (
+                          <span className="ladder">
+                            {actions.map((action, i) => (
+                              <Fragment key={action}>
+                                {i > 0 && <Icon name="arrowRight" size={12} className="ladder__arrow" />}
+                                <span className="tag">{titleCase(action)}</span>
+                              </Fragment>
+                            ))}
+                          </span>
+                        ) : (
+                          <span className="muted">Never remediable</span>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {preview.diff.filter((d) => d.warning).map((d) => (
-                <AlertBanner key={d.field} tone="warn">
-                  {d.warning}
-                </AlertBanner>
-              ))}
-              <label className="field">
-                <span>Reason (optional, but recommended for the audit trail)</span>
-                <textarea
-                  className="select feedback-form__note"
-                  rows={2}
-                  value={reason}
-                  onChange={(e) => setReason(e.target.value)}
-                />
-              </label>
-              <div className="authorization-confirm__actions">
-                <button type="button" className="button button--ghost" onClick={() => setPreview(null)}>
-                  Cancel
-                </button>
-                <button type="button" className="button button--primary" onClick={handleApply} disabled={applying}>
-                  {applying ? 'Applying…' : 'Confirm & Apply'}
-                </button>
-              </div>
-            </>
-          )}
-        </section>
-      ) : (
-        <>
-          <section className="card">
-            <h2 className="card__title">Dry run mode</h2>
-            <p className="muted small">
-              When on, Sentinel decides and authorises actions exactly as normal, but does not apply them to the
-              cluster — everything else (evidence, RCA, Policy Engine, audit trail) runs for real.
-            </p>
-            <div className="service-row">
-              <span className={data.current.dry_run ? 'decision-tag decision-tag--allowed' : 'decision-tag decision-tag--denied'}>
-                {data.current.dry_run ? 'DRY RUN — no cluster mutations' : 'AUTONOMOUS — actions are applied'}
-              </span>
-              <button type="button" className="button button--ghost" onClick={handleToggleDryRun} disabled={reviewing}>
-                {reviewing ? 'Validating…' : data.current.dry_run ? 'Turn dry run off' : 'Turn dry run on'}
-              </button>
             </div>
-          </section>
-
-          <section className="card">
-            <h2 className="card__title">Action ladder (read-only)</h2>
-            <p className="muted small">{readOnly.description}</p>
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Root cause</th>
-                  <th>Candidate actions, in order</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(readOnly.action_ladder).map(([rootCause, actions]) => (
-                  <tr key={rootCause}>
-                    <td>{titleCase(rootCause)}</td>
-                    <td className="mono">{actions.length > 0 ? actions.map(titleCase).join(' → ') : '— (never remediable)'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <p className="muted small">
-              Fallback confidence discount: {readOnly.fallback_confidence_discount} per step down the ladder.
+            <p className="muted small ladder__footnote">
+              Fallback confidence discount: <span className="num">{readOnly.fallback_confidence_discount}</span> per step down the
+              ladder.
             </p>
-          </section>
+          </ReadOnlyCard>
         </>
       )}
     </div>

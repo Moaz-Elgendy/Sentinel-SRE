@@ -1,9 +1,14 @@
-import { useEffect, useState } from 'react'
-import AlertBanner from '../components/AlertBanner.jsx'
-import Spinner from '../components/Spinner.jsx'
 import { applyMonitoringChange, getMonitoringConfig, previewMonitoringChange } from '../api/config.js'
-import { extractErrorMessage } from '../api/client.js'
-import { formatRelativeTime, titleCase } from '../utils/format.js'
+import { ChangeReview, ConfigActionBar, LastChanged, ReadOnlyCard } from '../components/config/ConfigParts.jsx'
+import AlertBanner from '../components/ui/AlertBanner.jsx'
+import Card from '../components/ui/Card.jsx'
+import { ErrorState } from '../components/ui/EmptyState.jsx'
+import Field from '../components/ui/Field.jsx'
+import { PageSkeleton } from '../components/ui/Loading.jsx'
+import PageHeader from '../components/ui/PageHeader.jsx'
+import StatusPill from '../components/ui/StatusPill.jsx'
+import { useConfigEditor } from '../hooks/useConfigEditor.js'
+import { usePageTitle } from '../hooks/usePageTitle.js'
 
 // Bounds (min/max) come from the backend's /api/config/monitoring `bounds`
 // payload — see monitoring_admin.py's TIMEOUT_BOUNDS, single source of truth.
@@ -13,6 +18,10 @@ const FIELDS = [
   { field: 'loki_url', label: 'Loki URL', type: 'string' },
   { field: 'loki_timeout_seconds', label: 'Loki timeout (seconds)', type: 'float' },
 ]
+
+function makeDraft(current) {
+  return Object.fromEntries(FIELDS.map(({ field }) => [field, current[field]]))
+}
 
 function diffChanges(current, draft) {
   const changes = {}
@@ -29,71 +38,21 @@ function diffChanges(current, draft) {
 }
 
 export default function MonitoringConfigPage() {
-  const [data, setData] = useState(null)
-  const [draft, setDraft] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState(null)
+  usePageTitle('Monitoring')
+  const editor = useConfigEditor({
+    load: getMonitoringConfig,
+    previewChange: previewMonitoringChange,
+    applyChange: applyMonitoringChange,
+    makeDraft,
+    diffChanges,
+    loadErrorMessage: 'Could not load monitoring configuration.',
+  })
+  const { data, draft, changes, preview } = editor
 
-  const [preview, setPreview] = useState(null)
-  const [reason, setReason] = useState('')
-  const [reviewing, setReviewing] = useState(false)
-  const [applying, setApplying] = useState(false)
-  const [actionError, setActionError] = useState(null)
-  const [justApplied, setJustApplied] = useState(false)
-
-  function loadConfig() {
-    setLoading(true)
-    getMonitoringConfig()
-      .then((body) => {
-        setData(body)
-        setDraft(Object.fromEntries(FIELDS.map(({ field }) => [field, body.current[field]])))
-        setLoadError(null)
-      })
-      .catch((err) => setLoadError(extractErrorMessage(err, 'Could not load monitoring configuration.')))
-      .finally(() => setLoading(false))
+  if (editor.loading) return <PageSkeleton label="Loading monitoring configuration…" cards={2} />
+  if (editor.loadError) {
+    return <ErrorState title="Couldn't load monitoring configuration" message={editor.loadError} onRetry={editor.retryLoad} />
   }
-
-  useEffect(loadConfig, [])
-
-  function handleFieldChange(field, value) {
-    setDraft((prev) => ({ ...prev, [field]: value }))
-    setPreview(null)
-    setJustApplied(false)
-  }
-
-  async function handleReview() {
-    const changes = diffChanges(data.current, draft)
-    if (Object.keys(changes).length === 0) return
-    setReviewing(true)
-    setActionError(null)
-    try {
-      const result = await previewMonitoringChange(changes)
-      setPreview({ ...result, changes })
-    } catch (err) {
-      setActionError(extractErrorMessage(err, 'Could not validate these changes.'))
-    } finally {
-      setReviewing(false)
-    }
-  }
-
-  async function handleApply() {
-    setApplying(true)
-    setActionError(null)
-    try {
-      await applyMonitoringChange(preview.changes, reason)
-      setPreview(null)
-      setReason('')
-      setJustApplied(true)
-      loadConfig()
-    } catch (err) {
-      setActionError(extractErrorMessage(err, 'Could not apply these changes.'))
-    } finally {
-      setApplying(false)
-    }
-  }
-
-  if (loading) return <Spinner label="Loading monitoring configuration…" />
-  if (loadError) return <AlertBanner>{loadError}</AlertBanner>
   if (!data || !draft) return null
 
   const readOnly = data.read_only
@@ -101,148 +60,95 @@ export default function MonitoringConfigPage() {
 
   return (
     <div className="page">
-      <div className="page__header">
-        <div>
-          <h1>Monitoring</h1>
-          <p className="page__subtitle">
-            Prometheus and Loki connection settings.{' '}
-            {data.last_changed_at && (
-              <>Last changed {formatRelativeTime(data.last_changed_at)} by {data.last_changed_by}.</>
-            )}
-          </p>
-        </div>
-      </div>
+      <PageHeader
+        title="Monitoring"
+        subtitle={
+          <>
+            Prometheus and Loki connection settings.
+            <LastChanged at={data.last_changed_at} by={data.last_changed_by} />
+          </>
+        }
+      />
 
-      {justApplied && !preview && (
+      {editor.justApplied && !preview && (
         <AlertBanner tone="success">Configuration applied — Sentinel is using the new values now.</AlertBanner>
       )}
-      {actionError && <AlertBanner>{actionError}</AlertBanner>}
+      {editor.actionError && <AlertBanner>{editor.actionError}</AlertBanner>}
 
       {preview ? (
-        <section className="card card--escalation">
-          <h2 className="card__title">Review changes</h2>
-          {preview.errors.length > 0 ? (
-            <div>
-              {preview.errors.map((err) => (
-                <p key={err} className="muted">
-                  ✗ {err}
-                </p>
-              ))}
-              <button type="button" className="button button--ghost" onClick={() => setPreview(null)}>
-                Back to editing
-              </button>
-            </div>
-          ) : (
-            <>
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Field</th>
-                    <th>Current</th>
-                    <th>New</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {preview.diff.map((d) => (
-                    <tr key={d.field}>
-                      <td>{titleCase(d.field)}</td>
-                      <td className="mono">{String(d.old_value)}</td>
-                      <td className="mono">{String(d.new_value)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              <label className="field">
-                <span>Reason (optional, but recommended for the audit trail)</span>
-                <textarea
-                  className="select feedback-form__note"
-                  rows={2}
-                  value={reason}
-                  onChange={(e) => setReason(e.target.value)}
-                />
-              </label>
-              <div className="authorization-confirm__actions">
-                <button type="button" className="button button--ghost" onClick={() => setPreview(null)}>
-                  Cancel
-                </button>
-                <button type="button" className="button button--primary" onClick={handleApply} disabled={applying}>
-                  {applying ? 'Applying…' : 'Confirm & Apply'}
-                </button>
-              </div>
-            </>
-          )}
-        </section>
+        <ChangeReview
+          preview={preview}
+          reason={editor.reason}
+          onReasonChange={editor.setReason}
+          applying={editor.applying}
+          onApply={editor.apply}
+          onCancel={editor.cancelReview}
+        />
       ) : (
         <>
-          <section className="card">
-            <h2 className="card__title">Prometheus &amp; Loki</h2>
-            <div className="grid grid--2">
+          <Card title="Prometheus & Loki">
+            <div className="form-grid">
               {FIELDS.map(({ field, label, type }) => (
-                <label className="field" key={field}>
-                  <span>{label}</span>
+                <Field
+                  key={field}
+                  label={label}
+                  hint={type === 'float' ? `Allowed range ${data.bounds[field].min}–${data.bounds[field].max}` : undefined}
+                  modified={field in changes}
+                >
                   <input
                     type={type === 'float' ? 'number' : 'text'}
                     step={type === 'float' ? '1' : undefined}
                     min={type === 'float' ? data.bounds[field].min : undefined}
                     max={type === 'float' ? data.bounds[field].max : undefined}
-                    className="select"
+                    className={type === 'float' ? 'input' : 'input mono'}
                     value={draft[field]}
-                    onChange={(e) => handleFieldChange(field, e.target.value)}
+                    onChange={(e) => editor.setField(field, e.target.value)}
                   />
-                </label>
+                </Field>
               ))}
             </div>
-          </section>
+          </Card>
 
-          <button
-            type="button"
-            className="button button--primary"
-            onClick={handleReview}
-            disabled={reviewing || Object.keys(diffChanges(data.current, draft)).length === 0}
-          >
-            {reviewing ? 'Validating…' : 'Review changes'}
-          </button>
+          <ConfigActionBar
+            changeCount={editor.changeCount}
+            reviewing={editor.reviewing}
+            onReview={() => editor.review()}
+            onDiscard={editor.discard}
+          />
 
-          <section className="card">
-            <h2 className="card__title">Kubernetes connection (read-only)</h2>
-            <p className="muted small">{readOnly.description}</p>
-            <dl className="stat-list">
-              <div className="stat-list__row">
+          <ReadOnlyCard title="Kubernetes connection" description={readOnly.description}>
+            <dl>
+              <div className="dl__row">
                 <dt>Mode</dt>
                 <dd>{k8s.mode}</dd>
               </div>
-              <div className="stat-list__row">
+              <div className="dl__row">
                 <dt>Namespace</dt>
-                <dd>{k8s.namespace}</dd>
+                <dd className="mono">{k8s.namespace}</dd>
               </div>
-              <div className="stat-list__row">
+              <div className="dl__row">
                 <dt>Reachable</dt>
                 <dd>
-                  <span
-                    className={
-                      k8s.available ? 'decision-tag decision-tag--allowed' : 'decision-tag decision-tag--denied'
-                    }
-                  >
-                    {k8s.available ? 'Yes' : `No${k8s.init_error ? ` — ${k8s.init_error}` : ''}`}
-                  </span>
+                  <StatusPill
+                    status={k8s.available ? 'operational' : 'critical'}
+                    label={k8s.available ? 'Yes' : `No${k8s.init_error ? ` — ${k8s.init_error}` : ''}`}
+                  />
                 </dd>
               </div>
-              <div className="stat-list__row">
+              <div className="dl__row">
                 <dt>Prometheus bearer token configured</dt>
                 <dd>{readOnly.prometheus_bearer_token_configured ? 'Yes' : 'No'}</dd>
               </div>
-              <div className="stat-list__row">
+              <div className="dl__row">
                 <dt>Loki bearer token configured</dt>
                 <dd>{readOnly.loki_bearer_token_configured ? 'Yes' : 'No'}</dd>
               </div>
             </dl>
-          </section>
+          </ReadOnlyCard>
 
-          <section className="card">
-            <h2 className="card__title">Health checks (read-only)</h2>
-            <p className="muted small">{readOnly.health_checks.description}</p>
-            <p className="muted small">{readOnly.health_checks.note}</p>
-          </section>
+          <ReadOnlyCard title="Health checks" description={readOnly.health_checks.description}>
+            <p className="muted">{readOnly.health_checks.note}</p>
+          </ReadOnlyCard>
         </>
       )}
     </div>

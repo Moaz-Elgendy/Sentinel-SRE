@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
 import AppLayout from './components/layout/AppLayout.jsx'
 import ProtectedRoute from './components/layout/ProtectedRoute.jsx'
+import { ToastProvider } from './components/ui/Toast.jsx'
 import { AuthProvider } from './context/AuthContext.jsx'
 import ActionHistoryPage from './pages/ActionHistoryPage.jsx'
 import AiConfigPage from './pages/AiConfigPage.jsx'
@@ -21,30 +22,32 @@ import RemediationConfigPage from './pages/RemediationConfigPage.jsx'
 export default function App() {
   return (
     <AuthProvider>
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
+      <ToastProvider>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
 
-        <Route element={<ProtectedRoute />}>
-          <Route element={<AppLayout />}>
-            <Route path="/" element={<DashboardPage />} />
-            <Route path="/incidents" element={<IncidentsListPage />} />
-            <Route path="/incidents/:incidentId" element={<IncidentDetailPage />} />
-            <Route path="/environment" element={<EnvironmentPage />} />
-            <Route path="/actions" element={<ActionHistoryPage />} />
-            <Route path="/performance" element={<PerformancePage />} />
-            <Route path="/policies" element={<PoliciesPage />} />
-            <Route path="/rca-config" element={<RcaConfigPage />} />
-            <Route path="/remediation-config" element={<RemediationConfigPage />} />
-            <Route path="/ai-config" element={<AiConfigPage />} />
-            <Route path="/monitoring-config" element={<MonitoringConfigPage />} />
-            <Route path="/config-history" element={<ConfigHistoryPage />} />
-            <Route path="/demo" element={<DemoChaosPage />} />
+          <Route element={<ProtectedRoute />}>
+            <Route element={<AppLayout />}>
+              <Route path="/" element={<DashboardPage />} />
+              <Route path="/incidents" element={<IncidentsListPage />} />
+              <Route path="/incidents/:incidentId" element={<IncidentDetailPage />} />
+              <Route path="/environment" element={<EnvironmentPage />} />
+              <Route path="/actions" element={<ActionHistoryPage />} />
+              <Route path="/performance" element={<PerformancePage />} />
+              <Route path="/policies" element={<PoliciesPage />} />
+              <Route path="/rca-config" element={<RcaConfigPage />} />
+              <Route path="/remediation-config" element={<RemediationConfigPage />} />
+              <Route path="/ai-config" element={<AiConfigPage />} />
+              <Route path="/monitoring-config" element={<MonitoringConfigPage />} />
+              <Route path="/config-history" element={<ConfigHistoryPage />} />
+              <Route path="/demo" element={<DemoChaosPage />} />
+            </Route>
           </Route>
-        </Route>
 
-        <Route path="/404" element={<NotFoundPage />} />
-        <Route path="*" element={<Navigate to="/404" replace />} />
-      </Routes>
+          <Route path="/404" element={<NotFoundPage />} />
+          <Route path="*" element={<Navigate to="/404" replace />} />
+        </Routes>
+      </ToastProvider>
     </AuthProvider>
   )
 }

@@ -1,0 +1,111 @@
+/* ==========================================================================
+   Design tokens
+   One source of truth for colour, type, spacing, radius, elevation and
+   motion. Components and pages consume these — they never hard-code values.
+   ========================================================================== */
+:root {
+  color-scheme: dark;
+
+  /* Surfaces — four steps, each visibly one level above the last. */
+  --surface-0: #0a0e14; /* app canvas */
+  --surface-1: #0f141b; /* sidebar, topbar */
+  --surface-2: #131a23; /* cards */
+  --surface-3: #1a232f; /* hover, table header, floating chrome */
+  --surface-inset: #0c1118; /* inputs, code, log output */
+  --scrim: rgba(4, 7, 11, 0.66);
+
+  /* Borders */
+  --border: #212c39;
+  --border-strong: #2f3c4d;
+  --border-subtle: #1a232e;
+
+  /* Text — all three pass WCAG AA (4.5:1) on surface-0 through surface-3. */
+  --text: #e8edf4;
+  --text-2: #9ba7b7;
+  --text-3: #8391a2;
+
+  /* Interactive */
+  --accent: #7db0ff; /* links, focus, active nav (text-safe) */
+  --accent-solid: #2563eb; /* primary button fill (white text = 5.2:1) */
+  --accent-solid-hover: #1d4ed8;
+  --accent-tint: rgba(59, 130, 246, 0.14);
+  --accent-edge: rgba(96, 165, 250, 0.4);
+
+  /* Semantic status. Each tone has: text/icon colour, solid fill (dots),
+     a tinted background and a tinted edge. Never use one for decoration. */
+  --ok: #34c98a;
+  --ok-solid: #12b76a;
+  --ok-tint: rgba(18, 183, 106, 0.13);
+  --ok-edge: rgba(18, 183, 106, 0.34);
+
+  --warn: #f5a524;
+  --warn-solid: #f79009;
+  --warn-tint: rgba(247, 144, 9, 0.13);
+  --warn-edge: rgba(247, 144, 9, 0.38);
+
+  --bad: #f8635a;
+  --bad-solid: #f04438;
+  --bad-tint: rgba(240, 68, 56, 0.14);
+  --bad-edge: rgba(240, 68, 56, 0.4);
+
+  --info: #6aa6ff; /* in-progress: investigating, remediating, validating */
+  --info-solid: #3b82f6;
+  --info-tint: rgba(59, 130, 246, 0.14);
+  --info-edge: rgba(59, 130, 246, 0.38);
+
+  --neutral: #97a2b1; /* unknown, idle, informational */
+  --neutral-solid: #6b7686;
+  --neutral-tint: rgba(107, 118, 134, 0.16);
+  --neutral-edge: rgba(107, 118, 134, 0.36);
+
+  /* Typography */
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-kpi: 28px;
+
+  /* Spacing — 4px scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  /* Radius — deliberately small; nothing on this console is a pill except badges */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  /* Elevation — cards are flat (border only). Shadow is reserved for things
+     that float above the page: dialogs, toasts, the sticky action bar. */
+  --shadow-float: 0 10px 30px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border-strong);
+
+  /* Layout */
+  --sidebar-w: 232px;
+  --topbar-h: 52px;
+  --content-max: 1240px;
+
+  /* Motion — fast and purposeful */
+  --dur-1: 120ms;
+  --dur-2: 200ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+  /* Stacking */
+  --z-sticky: 10;
+  --z-topbar: 20;
+  --z-drawer: 40;
+  --z-dialog: 60;
+  --z-toast: 70;
+}
