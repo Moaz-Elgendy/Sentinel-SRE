@@ -1,6 +1,9 @@
-import { formatDuration, formatTimestamp } from '../../utils/format.js'
+import { formatClock, formatDuration } from '../../utils/format.js'
+import Icon from '../ui/Icon.jsx'
 
 const TERMINAL_STATUSES = new Set(['resolved', 'escalated', 'auto_resolved'])
+
+const STATE_TEXT = { done: 'Completed', active: 'In progress', pending: 'Not reached yet' }
 
 /**
  * Renders the mandated lifecycle spine (Detection -> ... -> Documentation)
@@ -13,6 +16,10 @@ const TERMINAL_STATUSES = new Set(['resolved', 'escalated', 'auto_resolved'])
  * "pending" otherwise. A hard page refresh mid-incident renders identically
  * to what a live update would have shown, because both read the same
  * fields.
+ *
+ * Presentation only: the visual pulse on the active step exists because that
+ * step is genuinely in progress, and it is also stated in text for screen
+ * readers ("In progress").
  */
 export default function LiveFlowDiagram({ incident, phaseMeta }) {
   const order = phaseMeta?.primary_flow_order ?? []
@@ -37,7 +44,10 @@ export default function LiveFlowDiagram({ incident, phaseMeta }) {
     let status = 'pending'
     if (reached) status = isCurrent ? 'active' : 'done'
 
-    const nextPhaseAt = order.slice(index + 1).map((p) => firstSeenAt[p]).find((v) => v != null)
+    const nextPhaseAt = order
+      .slice(index + 1)
+      .map((p) => firstSeenAt[p])
+      .find((v) => v != null)
     const duration = reached && nextPhaseAt != null ? nextPhaseAt - at : null
 
     return {
@@ -58,21 +68,31 @@ export default function LiveFlowDiagram({ incident, phaseMeta }) {
       ? { label: 'System Recovered', at: incident.resolved_at }
       : null
 
+  if (stages.length === 0) {
+    return <p className="muted">The lifecycle phases haven't loaded yet.</p>
+  }
+
   return (
-    <div className="flow-diagram">
-      <ol className="flow-diagram__list">
+    <div className="flow">
+      <ol className="flow__list">
         {stages.map((stage) => (
-          <li key={stage.phase} className={`flow-stage flow-stage--${stage.status}`}>
-            <div className="flow-stage__marker" aria-hidden="true">
-              {stage.status === 'done' && '✓'}
-              {stage.status === 'active' && '●'}
-              {stage.status === 'pending' && '○'}
-            </div>
+          <li
+            key={stage.phase}
+            className={`flow-stage flow-stage--${stage.status}`}
+            aria-current={stage.status === 'active' ? 'step' : undefined}
+          >
+            <span className="flow-stage__marker" aria-hidden="true">
+              {stage.status === 'done' && <Icon name="check" size={12} />}
+              {stage.status === 'active' && <span className="flow-stage__core" />}
+            </span>
             <div className="flow-stage__body">
-              <div className="flow-stage__label">{stage.label}</div>
+              <div className="flow-stage__label">
+                {stage.label}
+                <span className="sr-only"> — {STATE_TEXT[stage.status]}</span>
+              </div>
               {stage.at != null && (
                 <div className="flow-stage__meta">
-                  {formatTimestamp(stage.at)}
+                  {formatClock(stage.at)}
                   {stage.duration != null && <> · took {formatDuration(stage.duration)}</>}
                 </div>
               )}
@@ -82,23 +102,28 @@ export default function LiveFlowDiagram({ incident, phaseMeta }) {
         ))}
         {resolvedNode && (
           <li className="flow-stage flow-stage--done flow-stage--terminal">
-            <div className="flow-stage__marker" aria-hidden="true">✓</div>
+            <span className="flow-stage__marker" aria-hidden="true">
+              <Icon name="check" size={12} />
+            </span>
             <div className="flow-stage__body">
               <div className="flow-stage__label">{resolvedNode.label}</div>
-              {resolvedNode.at != null && (
-                <div className="flow-stage__meta">{formatTimestamp(resolvedNode.at)}</div>
-              )}
+              {resolvedNode.at != null && <div className="flow-stage__meta">{formatClock(resolvedNode.at)}</div>}
             </div>
           </li>
         )}
       </ol>
 
       {incident.escalated && (
-        <div className="flow-branch flow-branch--escalated">
-          <div className="flow-branch__connector" aria-hidden="true" />
-          <div className="flow-branch__body">
-            <div className="flow-branch__label">⚠ Escalated to SRE</div>
-            <div className="flow-branch__detail">{incident.escalation_detail || 'No safe autonomous action available.'}</div>
+        <div className="flow-branch">
+          <Icon name="alertTriangle" size={16} className="flow-branch__icon" />
+          <div>
+            <div className="flow-branch__label">Escalated to SRE</div>
+            {/* While escalated, the reason is already shown in the action-required card above. */}
+            {incident.status !== 'escalated' && (
+              <div className="flow-branch__detail">
+                {incident.escalation_detail || 'No safe autonomous action available.'}
+              </div>
+            )}
           </div>
         </div>
       )}

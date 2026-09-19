@@ -1,13 +1,21 @@
 import { Link } from 'react-router-dom'
+import EmptyState from '../components/ui/EmptyState.jsx'
+import { usePageTitle } from '../hooks/usePageTitle.js'
 
 export default function NotFoundPage() {
+  usePageTitle('Page not found')
   return (
-    <div className="empty-state">
-      <h1>404</h1>
-      <p>That page doesn't exist.</p>
-      <Link to="/" className="button button--primary">
-        Back to dashboard
-      </Link>
-    </div>
+    <main className="auth-page">
+      <EmptyState
+        icon="search"
+        title="Page not found"
+        description="That page doesn't exist, or it has moved."
+        action={
+          <Link to="/" className="button button--primary">
+            Back to dashboard
+          </Link>
+        }
+      />
+    </main>
   )
 }

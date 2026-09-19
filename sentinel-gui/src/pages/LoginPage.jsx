@@ -1,10 +1,15 @@
 import { useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import AlertBanner from '../components/AlertBanner.jsx'
 import { extractErrorMessage } from '../api/client.js'
+import AlertBanner from '../components/ui/AlertBanner.jsx'
+import Button from '../components/ui/Button.jsx'
+import Field from '../components/ui/Field.jsx'
+import Icon, { BrandMark } from '../components/ui/Icon.jsx'
 import { useAuth } from '../context/AuthContext.jsx'
+import { usePageTitle } from '../hooks/usePageTitle.js'
 
 export default function LoginPage() {
+  usePageTitle('Sign in')
   const { login } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
@@ -12,6 +17,7 @@ export default function LoginPage() {
   const [form, setForm] = useState({ username: '', password: '' })
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const [showPassword, setShowPassword] = useState(false)
 
   function handleChange(event) {
     const { name, value } = event.target
@@ -35,46 +41,73 @@ export default function LoginPage() {
 
   return (
     <div className="auth-page">
-      <form className="auth-card" onSubmit={handleSubmit}>
+      <main className="auth-card">
         <div className="auth-card__brand">
-          <span className="sidebar__brand-mark" aria-hidden="true" />
+          <BrandMark size={36} />
           <div>
             <h1>Sentinel SRE Control Center</h1>
-            <p className="auth-subtitle">Authorized SRE administrator access only.</p>
+            <p className="auth-card__subtitle">Authorized SRE administrator access only.</p>
           </div>
         </div>
 
-        <AlertBanner>{error}</AlertBanner>
+        <form onSubmit={handleSubmit} className="stack">
+          <AlertBanner>{error}</AlertBanner>
 
-        <label className="field">
-          <span>Username</span>
-          <input
-            type="text"
-            name="username"
-            value={form.username}
-            onChange={handleChange}
-            required
-            autoComplete="username"
-            autoFocus
-          />
-        </label>
+          <Field label="Username">
+            <input
+              type="text"
+              name="username"
+              className="input"
+              value={form.username}
+              onChange={handleChange}
+              required
+              autoComplete="username"
+              autoFocus
+            />
+          </Field>
 
-        <label className="field">
-          <span>Password</span>
-          <input
-            type="password"
-            name="password"
-            value={form.password}
-            onChange={handleChange}
-            required
-            autoComplete="current-password"
-          />
-        </label>
+          <Field label="Password">
+            <PasswordInput
+              value={form.password}
+              onChange={handleChange}
+              visible={showPassword}
+              onToggle={() => setShowPassword((v) => !v)}
+            />
+          </Field>
 
-        <button type="submit" className="button button--primary button--block" disabled={submitting}>
-          {submitting ? 'Signing in…' : 'Sign in'}
+          <Button type="submit" variant="primary" className="button--block" busy={submitting} busyLabel="Signing in…">
+            Sign in
+          </Button>
+        </form>
+      </main>
+    </div>
+  )
+}
+
+// Field injects id / aria-describedby into its direct child, so the input and
+// its reveal toggle live inside one wrapper component that forwards them.
+function PasswordInput({ visible, onToggle, ...inputProps }) {
+  return (
+    <div className="input-group input-group--trailing">
+      <input
+        type={visible ? 'text' : 'password'}
+        name="password"
+        className="input"
+        required
+        autoComplete="current-password"
+        {...inputProps}
+      />
+      <span className="input-group__trailing">
+        <button
+          type="button"
+          className="icon-button icon-button--sm"
+          onClick={onToggle}
+          aria-pressed={visible}
+          aria-label={visible ? 'Hide password' : 'Show password'}
+        >
+          <Icon name={visible ? 'eyeOff' : 'eye'} size={15} />
         </button>
-      </form>
+      </span>
     </div>
   )
 }

@@ -1,26 +1,49 @@
-import { useEffect, useState } from 'react'
-import AlertBanner from '../components/AlertBanner.jsx'
-import Spinner from '../components/Spinner.jsx'
-import { getConfigHistory, restoreConfigChange } from '../api/config.js'
+import { useCallback, useEffect, useId, useState } from 'react'
 import { extractErrorMessage } from '../api/client.js'
+import { getConfigHistory, restoreConfigChange } from '../api/config.js'
+import AlertBanner from '../components/ui/AlertBanner.jsx'
+import Button from '../components/ui/Button.jsx'
+import Card from '../components/ui/Card.jsx'
+import ConfirmDialog from '../components/ui/ConfirmDialog.jsx'
+import EmptyState, { ErrorState } from '../components/ui/EmptyState.jsx'
+import Icon from '../components/ui/Icon.jsx'
+import { TableSkeleton } from '../components/ui/Loading.jsx'
+import PageHeader from '../components/ui/PageHeader.jsx'
+import Tag from '../components/ui/Tag.jsx'
+import { useToast } from '../components/ui/Toast.jsx'
+import { usePageTitle } from '../hooks/usePageTitle.js'
 import { formatTimestamp, titleCase } from '../utils/format.js'
 
+// Kept in one place, in registration order, so a new admin category only
+// needs one line added here to show up in the filter — mirrors
+// app/routers/config.py's own _CATEGORIES registry in spirit.
+const CATEGORIES = ['policy', 'rca', 'remediation', 'ai', 'monitoring']
+
+function formatValue(value) {
+  if (Array.isArray(value)) return value.join(', ') || '—'
+  return String(value)
+}
+
 function ChangeRow({ entry, onRestored }) {
+  const toast = useToast()
+  const bodyId = useId()
   const [expanded, setExpanded] = useState(false)
+  const [confirming, setConfirming] = useState(false)
   const [restoring, setRestoring] = useState(false)
   const [error, setError] = useState(null)
 
+  const fields = entry.changes.map((c) => c.field).join(', ')
+
   async function handleRestore() {
-    const confirmed = window.confirm(
-      `Restore will revert this specific change (${entry.changes.map((c) => c.field).join(', ')}) back to its previous value(s), as a new, audited change. Continue?`
-    )
-    if (!confirmed) return
     setRestoring(true)
     setError(null)
     try {
       await restoreConfigChange(entry.id)
+      setConfirming(false)
+      toast(`Restored ${fields} to its previous value`)
       onRestored()
     } catch (err) {
+      setConfirming(false)
       setError(extractErrorMessage(err, 'Could not restore this change.'))
     } finally {
       setRestoring(false)
@@ -28,112 +51,194 @@ function ChangeRow({ entry, onRestored }) {
   }
 
   return (
-    <div className="history-entry">
-      <button type="button" className="history-entry__header" onClick={() => setExpanded((v) => !v)}>
-        <span className="mono">{formatTimestamp(entry.created_at)}</span>
-        <span>{entry.admin_id}</span>
-        <span className="tag tag--muted">{titleCase(entry.category)}</span>
-        <span className="mono">{entry.changes.map((c) => c.field).join(', ')}</span>
-        {entry.restores_change_id && <span className="tag">restore</span>}
-        <span
-          className={
-            entry.status === 'applied' ? 'decision-tag decision-tag--allowed' : 'decision-tag decision-tag--denied'
-          }
-        >
-          {titleCase(entry.status)}
-        </span>
+    <li className="history-entry">
+      <button
+        type="button"
+        className="history-entry__header"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        aria-controls={bodyId}
+      >
+        <Icon name={expanded ? 'chevronDown' : 'chevronRight'} size={14} />
+        <span className="history-entry__time mono">{formatTimestamp(entry.created_at)}</span>
+        <span className="history-entry__admin">{entry.admin_id}</span>
+        <Tag>{titleCase(entry.category)}</Tag>
+        <span className="history-entry__fields mono truncate">{fields}</span>
+        {entry.restores_change_id && <Tag tone="info">Restore</Tag>}
+        <Tag tone={entry.status === 'applied' ? 'ok' : 'bad'}>{titleCase(entry.status)}</Tag>
       </button>
 
       {expanded && (
-        <div className="history-entry__body">
-          {entry.reason && <p className="muted">Reason: "{entry.reason}"</p>}
-          {entry.detail && <p className="muted">{entry.detail}</p>}
-          <table className="table">
-            <thead>
-              <tr>
-                <th>Field</th>
-                <th>Before</th>
-                <th>After</th>
-              </tr>
-            </thead>
-            <tbody>
-              {entry.changes.map((c) => (
-                <tr key={c.field}>
-                  <td>{titleCase(c.field)}</td>
-                  <td className="mono">{Array.isArray(c.old_value) ? c.old_value.join(', ') || '—' : String(c.old_value)}</td>
-                  <td className="mono">{Array.isArray(c.new_value) ? c.new_value.join(', ') || '—' : String(c.new_value)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {error && <AlertBanner>{error}</AlertBanner>}
-          {entry.status === 'applied' && (
-            <button type="button" className="button button--ghost" onClick={handleRestore} disabled={restoring}>
-              {restoring ? 'Restoring…' : 'Restore this change'}
-            </button>
-          )}
+        <div className="history-entry__body" id={bodyId}>
+          <div className="stack">
+            {entry.reason && (
+              <p>
+                <span className="muted">Reason:</span> “{entry.reason}”
+              </p>
+            )}
+            {entry.detail && <p className="muted">{entry.detail}</p>}
+
+            <div className="card card--flush table-wrap">
+              <table className="table">
+                <caption className="sr-only">Fields changed</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Setting</th>
+                    <th scope="col">Before</th>
+                    <th scope="col">After</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {entry.changes.map((c) => (
+                    <tr key={c.field}>
+                      <td>{titleCase(c.field)}</td>
+                      <td className="mono muted">{formatValue(c.old_value)}</td>
+                      <td className="mono diff__new">{formatValue(c.new_value)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {error && <AlertBanner>{error}</AlertBanner>}
+            {entry.status === 'applied' && (
+              <div>
+                <Button icon="history" onClick={() => setConfirming(true)}>
+                  Restore this change
+                </Button>
+              </div>
+            )}
+          </div>
         </div>
       )}
-    </div>
+
+      <ConfirmDialog
+        open={confirming}
+        title="Restore this change?"
+        confirmLabel="Restore change"
+        busy={restoring}
+        onConfirm={handleRestore}
+        onCancel={() => setConfirming(false)}
+      >
+        <p>
+          This reverts <strong className="mono">{fields}</strong> to the previous value
+          {entry.changes.length > 1 ? 's' : ''}. It is applied as a new, audited change — the history is never rewritten.
+        </p>
+      </ConfirmDialog>
+    </li>
   )
 }
 
-// Kept in one place, in registration order, so a new admin category only
-// needs one line added here to show up in the filter — mirrors
-// app/routers/config.py's own _CATEGORIES registry in spirit.
-const CATEGORIES = ['policy', 'rca', 'remediation', 'ai', 'monitoring']
-
 export default function ConfigHistoryPage() {
+  usePageTitle('Configuration history')
   const [category, setCategory] = useState('')
+  const [query, setQuery] = useState('')
   const [history, setHistory] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
-  function refetch() {
-    setLoading(true)
-    getConfigHistory({ category: category || null })
+  // Only the very first load shows a skeleton; after that the list stays on
+  // screen while a filter change or a restore refreshes it.
+  const refetch = useCallback(() => {
+    return getConfigHistory({ category: category || null })
       .then((data) => {
         setHistory(data)
         setError(null)
       })
       .catch((err) => setError(err))
       .finally(() => setLoading(false))
+  }, [category])
+
+  useEffect(() => {
+    refetch()
+  }, [refetch])
+
+  if (loading && !history) return <TableSkeleton label="Loading configuration history…" rows={6} />
+  if (!history) {
+    return (
+      <ErrorState
+        title="Couldn't load configuration history"
+        message={extractErrorMessage(error, 'Sentinel did not respond.')}
+        onRetry={() => {
+          setLoading(true)
+          refetch()
+        }}
+      />
+    )
   }
 
-  useEffect(refetch, [category])
-
-  if (loading) return <Spinner label="Loading configuration history…" />
-  if (error) return <AlertBanner>{extractErrorMessage(error, 'Could not load configuration history.')}</AlertBanner>
+  const needle = query.trim().toLowerCase()
+  const entries = history.filter((entry) => {
+    if (!needle) return true
+    return [entry.admin_id, entry.reason, ...entry.changes.map((c) => c.field)]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(needle))
+  })
 
   return (
     <div className="page">
-      <div className="page__header">
-        <h1>Configuration History</h1>
-        <label className="field field--inline">
-          <span>Category</span>
-          <select className="select" value={category} onChange={(e) => setCategory(e.target.value)}>
-            <option value="">All</option>
+      <PageHeader
+        title="Configuration history"
+        subtitle="Every change made through the Administration pages: who, when, what, and why. Any applied change can be restored."
+      />
+
+      {error && (
+        <AlertBanner tone="warn" title="Showing the last data received">
+          {extractErrorMessage(error, 'Could not refresh configuration history.')}
+        </AlertBanner>
+      )}
+
+      <Card flush>
+        <div className="toolbar" role="search">
+          <div className="input-group toolbar__search">
+            <Icon name="search" size={14} />
+            <input
+              type="search"
+              className="input"
+              placeholder="Search admin, setting or reason"
+              aria-label="Search configuration history by admin, setting or reason"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+          <select className="select" aria-label="Category" value={category} onChange={(e) => setCategory(e.target.value)}>
+            <option value="">All categories</option>
             {CATEGORIES.map((c) => (
               <option key={c} value={c}>
                 {titleCase(c)}
               </option>
             ))}
           </select>
-        </label>
-      </div>
-      <section className="card">
-        {!history || history.length === 0 ? (
-          <p className="muted">
-            {category ? `No ${titleCase(category)} changes recorded yet.` : 'No configuration changes recorded yet.'}
-          </p>
+          <span className="toolbar__spacer" />
+          <span className="toolbar__count" aria-live="polite">
+            {entries.length} {entries.length === 1 ? 'change' : 'changes'}
+          </span>
+        </div>
+
+        {entries.length === 0 ? (
+          <EmptyState
+            title={
+              needle
+                ? 'No changes match your search'
+                : category
+                  ? `No ${titleCase(category)} changes recorded yet`
+                  : 'No configuration changes recorded yet'
+            }
+            description={
+              needle
+                ? 'Try a different admin, setting or reason.'
+                : 'When an administrator applies a change on a configuration page, it is recorded here.'
+            }
+            compact
+          />
         ) : (
-          <div className="history-list">
-            {history.map((entry) => (
+          <ul className="history-list">
+            {entries.map((entry) => (
               <ChangeRow key={entry.id} entry={entry} onRestored={refetch} />
             ))}
-          </div>
+          </ul>
         )}
-      </section>
+      </Card>
     </div>
   )
 }

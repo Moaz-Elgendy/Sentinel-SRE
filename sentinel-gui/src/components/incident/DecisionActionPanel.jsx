@@ -1,4 +1,5 @@
 import { formatDuration, formatPercent, formatTimestamp, titleCase } from '../../utils/format.js'
+import Tag from '../ui/Tag.jsx'
 
 function ParamsSummary({ params }) {
   if (!params) return null
@@ -9,7 +10,16 @@ function ParamsSummary({ params }) {
   if (params.replicas != null) parts.push(`replicas: ${params.replicas}`)
   if (params.target_revision != null) parts.push(`target revision: ${params.target_revision}`)
   if (parts.length === 0) return null
-  return <div className="mono muted">{parts.join(' · ')}</div>
+  return <div className="mono muted small">{parts.join(' · ')}</div>
+}
+
+function Step({ title, children }) {
+  return (
+    <div className="step">
+      <div className="step__title">{title}</div>
+      <div className="step__content">{children}</div>
+    </div>
+  )
 }
 
 /**
@@ -22,70 +32,60 @@ function AttemptCard({ attempt, index }) {
   const { plan, verdict, result, validation } = attempt
 
   return (
-    <div className="attempt-card">
-      <div className="attempt-card__header">
-        <span className="tag">Attempt {index + 1}</span>
-        <span className="muted">{formatTimestamp(attempt.at)}</span>
+    <div className="attempt">
+      <div className="attempt__header">
+        <Tag tone="info">Attempt {index + 1}</Tag>
+        <span className="muted small">{formatTimestamp(attempt.at)}</span>
       </div>
 
-      <div className="attempt-card__section">
-        <div className="attempt-card__section-title">Candidate action</div>
+      <Step title="Candidate action">
         <div>
-          {titleCase(plan.action)} · confidence {formatPercent(plan.confidence)}
+          <strong>{titleCase(plan.action)}</strong> <span className="muted">· confidence {formatPercent(plan.confidence)}</span>
         </div>
         <ParamsSummary params={plan.params} />
         {plan.rationale && <p className="muted">{plan.rationale}</p>}
-      </div>
+      </Step>
 
       {verdict && (
-        <div className="attempt-card__section">
-          <div className="attempt-card__section-title">Policy evaluation</div>
-          <div className={verdict.allowed ? 'decision-tag decision-tag--allowed' : 'decision-tag decision-tag--denied'}>
+        <Step title="Policy evaluation">
+          <Tag tone={verdict.allowed ? 'ok' : 'bad'}>
             {verdict.allowed ? 'Approved' : `Denied — ${titleCase(verdict.reason)}`}
-          </div>
+          </Tag>
           {verdict.detail && <p className="muted">{verdict.detail}</p>}
           {verdict.checks && Object.keys(verdict.checks).length > 0 && (
-            <ul className="checks-list">
+            <ul className="checks">
               {Object.entries(verdict.checks).map(([check, passed]) => (
-                <li key={check} className={passed ? 'checks-list__pass' : 'checks-list__fail'}>
-                  {passed ? '✓' : '✗'} {titleCase(check)}
+                <li key={check} className={passed ? 'checks__pass' : 'checks__fail'}>
+                  <span aria-hidden="true">{passed ? '✓' : '✗'}</span>
+                  <span className="sr-only">{passed ? 'Passed: ' : 'Failed: '}</span>
+                  {titleCase(check)}
                 </li>
               ))}
             </ul>
           )}
-        </div>
+        </Step>
       )}
 
       {result && (
-        <div className="attempt-card__section">
-          <div className="attempt-card__section-title">Action taken</div>
-          <div>
-            {titleCase(result.action)} — {result.succeeded ? 'succeeded' : 'failed'}
-            {result.dry_run && <span className="tag tag--muted"> dry run</span>}
-            {' · '}
-            {formatDuration(result.duration_seconds)}
+        <Step title="Action taken">
+          <div className="cluster">
+            <strong>{titleCase(result.action)}</strong>
+            <Tag tone={result.succeeded ? 'ok' : 'bad'}>{result.succeeded ? 'Succeeded' : 'Failed'}</Tag>
+            {result.dry_run && <Tag title="Decided and authorised normally, but not applied to the cluster">Dry run</Tag>}
+            <span className="muted small num">{formatDuration(result.duration_seconds)}</span>
           </div>
           {result.detail && <p className="muted">{result.detail}</p>}
-        </div>
+        </Step>
       )}
 
       {validation && (
-        <div className="attempt-card__section">
-          <div className="attempt-card__section-title">Recovery validation</div>
-          <div
-            className={
-              validation.outcome === 'passed'
-                ? 'decision-tag decision-tag--allowed'
-                : 'decision-tag decision-tag--denied'
-            }
-          >
-            {titleCase(validation.outcome)}
-          </div>
+        <Step title="Recovery validation">
+          <Tag tone={validation.outcome === 'passed' ? 'ok' : 'bad'}>{titleCase(validation.outcome)}</Tag>
           {validation.failed_checks?.length > 0 && (
             <p className="muted">Failed checks: {validation.failed_checks.join(', ')}</p>
           )}
           {validation.detail && <p className="muted">{validation.detail}</p>}
-        </div>
+        </Step>
       )}
     </div>
   )
@@ -96,7 +96,7 @@ export default function DecisionActionPanel({ attempts }) {
     return <p className="muted">No remediation attempted yet.</p>
   }
   return (
-    <div className="attempt-list">
+    <div className="stack">
       {attempts.map((attempt, index) => (
         // eslint-disable-next-line react/no-array-index-key
         <AttemptCard key={index} attempt={attempt} index={index} />
