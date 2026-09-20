@@ -303,6 +303,7 @@ locals {
     gui_port             = 80
     prometheus_port      = var.prometheus_nodeport
     loki_port            = var.loki_nodeport
+    alertmanager_port    = var.alertmanager_nodeport
     token_param_name     = "/${var.project_name}/sentinel/k8s-token"
     ca_param_name        = "/${var.project_name}/sentinel/k8s-ca-cert-b64"
     extra_env_param_name = "/${var.project_name}/sentinel/extra-env"
@@ -358,5 +359,6 @@ resource "aws_instance" "sentinel" {
     aws_vpc_security_group_ingress_rule.k8s_api_from_sentinel,
     aws_vpc_security_group_ingress_rule.prometheus_from_sentinel,
     aws_vpc_security_group_ingress_rule.loki_from_sentinel,
+    aws_vpc_security_group_ingress_rule.alertmanager_from_sentinel,
   ]
 }

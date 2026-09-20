@@ -105,6 +105,11 @@ KUBERNETES_VERIFY_SSL=$VERIFY_SSL
 
 PROMETHEUS_URL=http://${k3s_private_ip}:${prometheus_port}
 LOKI_URL=http://${k3s_private_ip}:${loki_port}
+# Sentinel -> Alertmanager (connectivity/Live check). The setting's default,
+# http://alertmanager:9093, is the in-cluster Service name and does not resolve
+# from this instance. Reverse direction (Alertmanager -> Sentinel webhook) is
+# unrelated and unchanged: ${webhook_port} below.
+ALERTMANAGER_URL=http://${k3s_private_ip}:${alertmanager_port}
 
 CUSTOMER_ID=demo-customer
 ENVIRONMENT_ID=demo-env-remote

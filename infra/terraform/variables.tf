@@ -330,7 +330,7 @@ variable "enable_remote_sentinel" {
   description = <<-EOT
     Whether to create a second EC2 instance running Sentinel OUTSIDE the K3s
     cluster, plus the security-group rules that let it reach the K3s node's
-    Kubernetes API (6443) and the Prometheus/Loki NodePorts (30090/30100).
+    Kubernetes API (6443) and the Prometheus/Loki/Alertmanager NodePorts (30090/30100/30093).
     False by default: this is strictly additive infrastructure for
     validating the external-control-plane architecture, not a replacement
     for the in-cluster Sentinel Deployment, which keeps working either way.
@@ -394,4 +394,10 @@ variable "loki_nodeport" {
   description = "NodePort Loki is exposed on for a remote Sentinel — must match k8s/overlays/aws/observability-nodeport.yaml's loki-nodeport Service."
   type        = number
   default     = 30100
+}
+
+variable "alertmanager_nodeport" {
+  description = "NodePort Alertmanager is exposed on for a remote Sentinel — must match k8s/overlays/aws/patch-alertmanager-nodeport.yaml's alertmanager Service."
+  type        = number
+  default     = 30093
 }
