@@ -490,10 +490,38 @@ async def enrich_with_llm(
                 "root_cause": hypothesis.root_cause.value,
             },
         )
+        hypothesis.llm_status = "not_configured"
         hypothesis.llm_note = (
             "No LLM provider is configured, so this analysis is entirely "
             "rule-based. That is a fully supported mode: the LLM only ever "
             "enriches the narrative and can never choose an action."
+        )
+        return hypothesis
+
+    # Provider circuit breaker (reasoning/health.py). A provider that has
+    # failed repeatedly is skipped for a cooldown so no incident waits out its
+    # timeout, and the analysis proceeds rules-only. This is a CONDITION of the
+    # provider, not an incident and not a lifecycle state: nothing here can
+    # create, restart or re-route an incident.
+    health = getattr(reasoner, "health", None)
+    if health is not None and health.circuit_open():
+        snap = health.snapshot()
+        sentinel_llm_calls_total.labels(result="skipped").inc()
+        hypothesis.llm_status = "reasoner_unavailable"
+        hypothesis.llm_note = (
+            f"REASONER_UNAVAILABLE: {reasoner.label} failed "
+            f"{snap['consecutive_failures']} time(s) in a row (last: "
+            f"{snap['last_error']}); calls are paused for another "
+            f"{snap['retry_after_seconds']:.0f}s. This analysis is rule-based."
+        )
+        logger.warning(
+            "reasoner_unavailable_skipping_call",
+            extra={
+                "reasoner": reasoner.label,
+                "consecutive_failures": snap["consecutive_failures"],
+                "last_status_code": snap["last_status_code"],
+                "retry_after_seconds": round(snap["retry_after_seconds"]),
+            },
         )
         return hypothesis
 
@@ -502,13 +530,20 @@ async def enrich_with_llm(
     )
     if raw is None:
         sentinel_llm_calls_total.labels(result="error").inc()
+        detail = ""
+        if health is not None:
+            snap = health.snapshot()
+            detail = f" ({snap['last_error']})" if snap["last_error"] else ""
+        hypothesis.llm_status = "call_failed"
         hypothesis.llm_note = (
-            f"LLM call via {reasoner.label} failed or returned nothing; "
+            f"LLM call via {reasoner.label} failed or returned nothing{detail}; "
             "using rule-based analysis."
         )
         return hypothesis
 
-    return apply_llm_response(hypothesis, raw)
+    result = apply_llm_response(hypothesis, raw)
+    result.llm_status = "ok" if result.llm_used else (result.llm_status or "ok")
+    return result
 
 
 def apply_llm_response(hypothesis: Hypothesis, raw: str) -> Hypothesis:

@@ -66,12 +66,12 @@ router = APIRouter(
 # not a standing credential — see the module docstring.
 AUTHORIZATION_TTL_SECONDS = 15 * 60
 
-# Incident ids with an authorization currently executing. Mirrors
-# routers/alerts.py's `_in_flight` fingerprint set — prevents a double-click
-# from starting two concurrent remediation attempts against the same
-# incident. Process-local, matching this codebase's single-process design
-# (see app/core/events.py's own note on that same limitation).
-_in_flight: set[str] = set()
+# "An authorization is executing for this incident" is the IncidentManager's
+# single-writer lease (lifecycle/incident_manager.py), the same lease a running
+# lifecycle holds. One shared lease is what stops a double-click — or an
+# authorization racing an automatic re-check — from putting two writers on one
+# incident record. Process-local, matching this codebase's single-process
+# design (see app/core/events.py's own note on that same limitation).
 
 
 class AuthorizeRequest(BaseModel):
@@ -100,12 +100,14 @@ def _require_escalated_incident(request: Request, incident_id: str) -> dict[str,
 
 
 async def _run_authorization(orchestrator: Any, incident: Incident, action: RemediationAction,
-                              authorization_id: str, params: ActionParams | None, incident_id: str) -> None:
-    """Background wrapper — mirrors routers/alerts.py's `_run_lifecycle`."""
+                              authorization_id: str, params: ActionParams | None, incident_id: str,
+                              manager: Any) -> None:
+    """Background wrapper. Always releases the incident lease."""
     try:
         await orchestrator.authorize_and_remediate(incident, action, authorization_id, params)
     finally:
-        _in_flight.discard(incident_id)
+        if manager is not None:
+            manager.release(incident_id)
 
 
 @router.post("/{incident_id}/authorize", status_code=status.HTTP_202_ACCEPTED)
@@ -124,10 +126,13 @@ def authorize_incident(
 
     incident_dict = _require_escalated_incident(request, incident_id)
 
-    if incident_id in _in_flight:
+    from app.routers.alerts import get_incident_manager  # noqa: PLC0415
+
+    manager = get_incident_manager(request)
+    if manager is not None and manager.is_running(incident_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="an authorized remediation is already running for this incident",
+            detail="a lifecycle or authorized remediation is already running for this incident",
         )
 
     orchestrator = getattr(request.app.state, "orchestrator", None)
@@ -147,17 +152,31 @@ def authorize_incident(
             service=payload.service or incident_dict.get("app"),
         )
 
+    incident = Incident.from_dict(incident_dict)
+    if manager is not None and not manager.try_acquire(incident):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="a lifecycle or authorized remediation is already running for this incident",
+        )
+
     authorization_id = f"authz-{uuid.uuid4().hex[:12]}"
     now = time.time()
-    store.create_temporary_authorization(
-        authorization_id=authorization_id,
-        incident_id=incident_id,
-        action=payload.action.value,
-        params_json=json.dumps(params.to_dict() if params else {}),
-        granted_by=current_admin["id"],
-        granted_at=now,
-        expires_at=now + AUTHORIZATION_TTL_SECONDS,
-    )
+    try:
+        store.create_temporary_authorization(
+            authorization_id=authorization_id,
+            incident_id=incident_id,
+            action=payload.action.value,
+            params_json=json.dumps(params.to_dict() if params else {}),
+            granted_by=current_admin["id"],
+            granted_at=now,
+            expires_at=now + AUTHORIZATION_TTL_SECONDS,
+        )
+    except Exception:
+        # Never leave the lease held if the run was never scheduled: the
+        # incident would look "running" forever.
+        if manager is not None:
+            manager.release(incident_id)
+        raise
     logger.info(
         "temporary_authorization_granted",
         extra={
@@ -168,10 +187,9 @@ def authorize_incident(
         },
     )
 
-    incident = Incident.from_dict(incident_dict)
-    _in_flight.add(incident_id)
     background.add_task(
-        _run_authorization, orchestrator, incident, payload.action, authorization_id, params, incident_id
+        _run_authorization, orchestrator, incident, payload.action, authorization_id, params,
+        incident_id, manager,
     )
 
     return {

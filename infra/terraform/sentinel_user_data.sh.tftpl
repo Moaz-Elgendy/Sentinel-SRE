@@ -82,6 +82,18 @@ if [ "$K8S_CA_B64" = "unset" ] || [ -z "$K8S_CA_B64" ]; then
 fi
 
 mkdir -p /var/lib/sentinel
+# sentinel-ai runs as non-root (uid 1000, see sentinel-ai/Dockerfile) inside
+# the container. This host directory is bind-mounted straight into the
+# container at the same path (see the `docker run -v` below), and a plain
+# root-owned `mkdir -p` leaves it unwritable by that user. Without this
+# chown, SQLiteStore.connect() fails to open SENTINEL_DB_PATH below, logs
+# `sentinel_store_fallback_in_memory`, and silently runs on an in-memory
+# database instead — Sentinel works fine right up until the next restart,
+# when all incident history, feedback, and config-change audit trail is
+# gone. This was exactly that bug: fix is one chown, applied once here at
+# first boot, which is enough because the directory (and its ownership)
+# lives on the host and outlives every `docker rm -f` / container restart.
+chown -R 1000:1000 /var/lib/sentinel
 cat >/etc/sentinel-ai.env <<EOF
 # Generated at boot by sentinel_user_data.sh.tftpl — do not edit by hand,
 # edit the SSM parameters and re-run: sudo systemctl restart sentinel-ai
@@ -121,6 +133,11 @@ Restart=always
 RestartSec=5
 ExecStartPre=-/usr/bin/docker rm -f sentinel-ai
 ExecStartPre=-/usr/bin/docker network create sentinel-net
+# Self-healing belt-and-braces: re-assert ownership on every start (not
+# just first boot). Cheap, idempotent, and means a manually-recreated or
+# re-provisioned /var/lib/sentinel can never silently regress Sentinel back
+# to the in-memory-store fallback described above.
+ExecStartPre=-/bin/chown -R 1000:1000 /var/lib/sentinel
 ExecStart=/usr/bin/docker run --rm --name sentinel-ai \\
   --network sentinel-net --network-alias sentinel-ai \\
   --env-file /etc/sentinel-ai.env \\

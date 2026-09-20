@@ -56,6 +56,19 @@ class LokiClient:
         self.timeout = timeout
         self._headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
 
+    # ---- connectivity -----------------------------------------------------
+    async def ping(self) -> bool:
+        """Is Loki actually reachable right now? Same reasoning as
+        PrometheusClient.ping — hits Loki's own readiness endpoint rather
+        than inferring reachability from an empty query result, which is
+        also what "no matching log lines" looks like."""
+        try:
+            async with httpx.AsyncClient(timeout=min(self.timeout, 5.0)) as client:
+                resp = await client.get(f"{self.base_url}/ready", headers=self._headers)
+            return resp.status_code == 200
+        except httpx.HTTPError:
+            return False
+
     async def query_range(
         self,
         logql: str,

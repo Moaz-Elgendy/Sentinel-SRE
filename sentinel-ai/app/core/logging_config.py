@@ -19,6 +19,7 @@ Slack webhook URL must never reach a log line.
 import contextvars
 import logging
 import sys
+import time
 
 from pythonjsonlogger import jsonlogger
 
@@ -38,7 +39,20 @@ def get_incident_id() -> str | None:
     return _incident_id.get()
 
 
-def configure_logging(service_name: str) -> None:
+def configure_logging(
+    service_name: str,
+    log_dir: str | None = None,
+    log_max_bytes: int = 10_000_000,
+    log_backup_count: int = 5,
+):
+    """Install the stdout JSON handler (for `docker logs`/journald/Loki via
+    Alloy where reachable) and, when `log_dir` is given, ALSO a persistent,
+    redacted, rotating-file handler that backs the Sentinel Logs GUI page —
+    see app/core/log_capture.py's module docstring for why that page cannot
+    simply rely on Loki. Returns that second handler (or None if `log_dir`
+    was not given) so main.py can attach a live-tail EventBus to it once
+    that bus exists, without this function needing to know about buses.
+    """
     handler = logging.StreamHandler(sys.stdout)
     formatter = jsonlogger.JsonFormatter(
         "%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -46,16 +60,34 @@ def configure_logging(service_name: str) -> None:
     )
     handler.setFormatter(formatter)
 
+    handlers: list[logging.Handler] = [handler]
+
+    persistent_handler = None
+    if log_dir:
+        # Imported lazily to avoid a hard dependency for any caller (e.g.
+        # tests) that only wants the plain stdout handler.
+        from app.core.log_capture import PersistentLogHandler, RedactionFilter
+
+        persistent_handler = PersistentLogHandler(
+            log_dir=log_dir, max_bytes=log_max_bytes, backup_count=log_backup_count
+        )
+        persistent_handler.addFilter(RedactionFilter())
+        handlers.append(persistent_handler)
+
     root = logging.getLogger()
-    root.handlers = [handler]
+    root.handlers = handlers
     root.setLevel(logging.INFO)
 
-    # Tag every record with the originating service for easy Loki filtering.
+    # Tag every record with the originating service for easy Loki filtering,
+    # and a numeric epoch timestamp (the human `timestamp` field is a
+    # formatted string via `asctime`, not filterable/sortable as one) for
+    # the Sentinel Logs page's time-range filter — see log_capture.query_logs.
     old_factory = logging.getLogRecordFactory()
 
     def record_factory(*args, **kwargs):
         record = old_factory(*args, **kwargs)
         record.service = service_name
+        record.timestamp_epoch = time.time()
 
         incident_id = _incident_id.get()
         if incident_id:
@@ -73,3 +105,5 @@ def configure_logging(service_name: str) -> None:
     logging.getLogger("kubernetes").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    return persistent_handler

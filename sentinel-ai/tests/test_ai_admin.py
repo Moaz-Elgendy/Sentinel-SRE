@@ -39,6 +39,10 @@ def test_editable_fields_never_include_api_keys():
         "openai_base_url",
         "gemini_model",
         "gemini_timeout_seconds",
+        # Groq is a first-class provider behind the same Reasoner abstraction.
+        # Only model/timeout are editable; groq_api_key must never appear.
+        "groq_model",
+        "groq_timeout_seconds",
     }
 
 

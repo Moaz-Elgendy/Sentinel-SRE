@@ -108,6 +108,24 @@ class PrometheusClient:
         self.timeout = timeout
         self._headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
 
+    # ---- connectivity -----------------------------------------------------
+    async def ping(self) -> bool:
+        """Is Prometheus actually reachable right now?
+
+        Deliberately separate from `query`/`_get`, which swallow every
+        network error and return `[]` — that makes "no data" and
+        "unreachable" indistinguishable, which is fine for evidence
+        gathering but wrong for a GUI connectivity indicator (Sentinel
+        Live's "Watching" panel). This hits Prometheus's own health
+        endpoint, not a PromQL query, and reports exactly true/false.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=min(self.timeout, 5.0)) as client:
+                resp = await client.get(f"{self.base_url}/-/healthy", headers=self._headers)
+            return resp.status_code == 200
+        except httpx.HTTPError:
+            return False
+
     # ---- raw API --------------------------------------------------------
     async def query(self, promql: str) -> list[dict[str, Any]]:
         """Instant query. Returns the raw `result` array, or [] on any error."""

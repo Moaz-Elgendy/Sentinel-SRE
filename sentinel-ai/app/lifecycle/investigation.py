@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 # see what changed just before the alert started firing.
 LOOKBACK_SECONDS = 900
 
+# The app that emits `notification_deliveries_total` (its own delivery view)
+# and the app that emits `notification_dispatches_total` (the caller's view).
+NOTIFICATION_OWNER_APP = "notification-service"
+NOTIFICATION_CALLER_APP = "citizen-service"
+
 
 def _extract_sha_from_image(image: str) -> str | None:
     """"<registry>/<prefix>/<service>:<tag>" -> "<tag>".
@@ -92,9 +97,19 @@ async def investigate(
         "up": prom.up(app),
         "chaos_state": prom.chaos_state(app),
         "chaos_injections": prom.chaos_injections(app),
-        "notification_deliveries": prom.notification_deliveries(),
-        "notification_dispatch_failures": prom.notification_dispatch_failures(),
     }
+    # Evidence isolation between concurrent incidents. These two series are
+    # NOT scoped by `app` in Prometheus (the queries sum over the whole
+    # cluster), so collecting them for every incident let one incident's
+    # symptoms leak into another's evidence: a notification-service delivery
+    # failure would flip `notification_delivery_failing` on a simultaneous
+    # citizen-service HTTP-500 incident and RCA rule 7 would then blame a
+    # "downstream dependency". Each series is collected only by the service
+    # that owns it.
+    if app == NOTIFICATION_OWNER_APP:
+        metric_tasks["notification_deliveries"] = prom.notification_deliveries()
+    if app == NOTIFICATION_CALLER_APP:
+        metric_tasks["notification_dispatch_failures"] = prom.notification_dispatch_failures()
 
     # ---- log collectors -------------------------------------------------
     log_tasks: dict[str, Any] = {

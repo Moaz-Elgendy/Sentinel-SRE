@@ -60,9 +60,11 @@ EDITABLE_FIELDS: dict[str, str] = {
     "openai_base_url": "string",
     "gemini_model": "string",
     "gemini_timeout_seconds": "float",
+    "groq_model": "string",
+    "groq_timeout_seconds": "float",
 }
 
-PROVIDER_CHOICES: tuple[str, ...] = ("openai", "gemini")
+PROVIDER_CHOICES: tuple[str, ...] = ("openai", "gemini", "groq")
 
 # Same "backend is authoritative" bounds pattern as rca_admin.BOUNDS — a
 # timeout of 0 would mean every call fails instantly; anything past two
@@ -70,6 +72,7 @@ PROVIDER_CHOICES: tuple[str, ...] = ("openai", "gemini")
 TIMEOUT_BOUNDS: dict[str, tuple[float, float]] = {
     "openai_timeout_seconds": (1.0, 120.0),
     "gemini_timeout_seconds": (1.0, 120.0),
+    "groq_timeout_seconds": (1.0, 120.0),
 }
 
 
@@ -120,6 +123,7 @@ def read_only_summary(settings: Any) -> dict[str, Any]:
         "temperature_note": "Hardcoded to 0.0 in every Reasoner implementation, not configurable.",
         "openai_api_key_configured": bool(settings.openai_api_key.strip()),
         "gemini_api_key_configured": bool(settings.gemini_api_key.strip()),
+        "groq_api_key_configured": bool(settings.groq_api_key.strip()),
     }
 
 
@@ -127,7 +131,9 @@ def _validate_provider(settings: Any, new_value: Any) -> tuple[str | None, str |
     """Returns (error, warning) — at most one of which is non-None."""
     if not isinstance(new_value, str) or new_value not in PROVIDER_CHOICES:
         return f"llm_provider must be one of {list(PROVIDER_CHOICES)}.", None
-    key_field = "gemini_api_key" if new_value == "gemini" else "openai_api_key"
+    key_field = {"gemini": "gemini_api_key", "groq": "groq_api_key"}.get(
+        new_value, "openai_api_key"
+    )
     if not getattr(settings, key_field).strip():
         return None, (
             f"{key_field.upper()} is not set. Sentinel will fall back to rule-based-only "
@@ -143,7 +149,7 @@ def validate_changes(settings: Any, changes: dict[str, Any]) -> tuple[list[str],
 
     unknown = set(changes) - set(EDITABLE_FIELDS)
     for field in sorted(unknown):
-        if field in ("openai_api_key", "gemini_api_key"):
+        if field in ("openai_api_key", "gemini_api_key", "groq_api_key"):
             errors.append(
                 f"'{field}' can never be read or written through this API. Set it via a "
                 "server-side environment variable and restart Sentinel."
@@ -160,7 +166,7 @@ def validate_changes(settings: Any, changes: dict[str, Any]) -> tuple[list[str],
         else:
             diffs.append(FieldDiff("llm_provider", old_value, new_value, warning))
 
-    for field in ("openai_model", "gemini_model", "openai_base_url"):
+    for field in ("openai_model", "gemini_model", "groq_model", "openai_base_url"):
         if field in changes:
             new_value = changes[field]
             old_value = getattr(settings, field)
@@ -171,7 +177,7 @@ def validate_changes(settings: Any, changes: dict[str, Any]) -> tuple[list[str],
             else:
                 diffs.append(FieldDiff(field, old_value, new_value))
 
-    for field in ("openai_timeout_seconds", "gemini_timeout_seconds"):
+    for field in ("openai_timeout_seconds", "gemini_timeout_seconds", "groq_timeout_seconds"):
         if field in changes:
             new_value = changes[field]
             old_value = getattr(settings, field)

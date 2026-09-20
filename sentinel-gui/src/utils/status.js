@@ -13,6 +13,7 @@ const TONE_BY_STATUS = {
   // system / service health
   operational: 'ok',
   healthy: 'ok',
+  monitoring: 'ok',
   degraded: 'warn',
   critical: 'bad',
   down: 'bad',
@@ -54,6 +55,7 @@ const LABELS = {
   false: 'Unhealthy',
   null: 'Unknown',
   operational: 'Operational',
+  monitoring: 'Monitoring',
 }
 
 // States that mean "Sentinel (or a command) is working on this right now".

@@ -318,6 +318,84 @@ class SQLiteStore:
             ).fetchone()
         return json.loads(row["body"]) if row else None
 
+    def find_latest_by_fingerprint(self, fingerprint: str) -> dict[str, Any] | None:
+        """The NEWEST incident (any status) for a stable incident identity.
+
+        Correlation asks "what is the current state of this problem?", and
+        the answer is the status of its newest incident: live (open /
+        investigating / remediating / validating / escalated) means join it;
+        resolved / auto_resolved means the last occurrence is over and a new
+        firing is a new occurrence. Status filtering is deliberately NOT done
+        in SQL: the old `find_open_by_fingerprint` excluded 'escalated' there,
+        which is precisely how an escalated problem became invisible to dedup
+        and produced a fresh incident (and a fresh escalation) per repeat.
+        """
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                """
+                SELECT body FROM incidents
+                 WHERE fingerprint = ?
+                 ORDER BY created_at DESC LIMIT 1
+                """,
+                (fingerprint,),
+            ).fetchone()
+        return json.loads(row["body"]) if row else None
+
+    def list_by_statuses(self, statuses: tuple[str, ...]) -> list[dict[str, Any]]:
+        """Incidents in any of `statuses`, oldest first (startup recovery)."""
+        if not statuses:
+            return []
+        conn = self._require()
+        marks = ",".join("?" for _ in statuses)
+        with self._lock:
+            rows = conn.execute(
+                f"SELECT body FROM incidents WHERE status IN ({marks}) ORDER BY created_at ASC",
+                statuses,
+            ).fetchall()
+        return [json.loads(r["body"]) for r in rows]
+
+    def recent_executed_actions(
+        self, app: str | None, since: float, exclude_incident_id: str | None = None
+    ) -> dict[str, float]:
+        """`{target_key: newest started_at}` of remediation actions EXECUTED
+        against `app` by ANY incident since `since`.
+
+        Feeds the Policy Engine's cross-incident cooldown. The per-incident
+        cooldown only sees the incident's own attempts, so two incidents on
+        the same Deployment could each restart it back-to-back. Reads the
+        persisted incident bodies (source of truth), so it also holds across
+        a Sentinel restart.
+        """
+        if not app:
+            return {}
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT id, body FROM incidents WHERE app = ? AND updated_at >= ?",
+                (app, since),
+            ).fetchall()
+        latest: dict[str, float] = {}
+        for row in rows:
+            if exclude_incident_id and row["id"] == exclude_incident_id:
+                continue
+            body = json.loads(row["body"])
+            for attempt in body.get("attempts") or []:
+                result = attempt.get("result")
+                if not result:
+                    continue
+                started = result.get("started_at") or 0.0
+                if started < since:
+                    continue
+                plan = attempt.get("plan") or {}
+                params = plan.get("params") or {}
+                key = (
+                    f"{plan.get('action')}:{params.get('namespace')}/"
+                    f"{params.get('deployment') or params.get('service')}"
+                )
+                latest[key] = max(latest.get(key, 0.0), started)
+        return latest
+
     def count_open(self) -> int:
         conn = self._require()
         with self._lock:

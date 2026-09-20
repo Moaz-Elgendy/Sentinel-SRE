@@ -70,6 +70,8 @@ import logging
 import secrets
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,9 +83,11 @@ from app.core.logging_config import configure_logging
 from app.core.security import hash_password
 from app.domain.environment import Environment
 from app.lifecycle import ai_admin, policy_admin, rca_admin, remediation_admin
+from app.lifecycle.incident_manager import IncidentManager
 from app.lifecycle.orchestrator import Orchestrator, build_context
 from app.routers import (
     actions,
+    activity,
     alerts,
     auth,
     authorizations,
@@ -95,13 +99,78 @@ from app.routers import (
     feedback,
     health,
     incidents,
+    logs,
     meta,
     performance,
+    reinvestigate,
 )
 from app.store.sqlite_store import SQLiteStore
 
-configure_logging(service_name=settings.service_name)
+_persistent_log_handler = configure_logging(
+    service_name=settings.service_name,
+    log_dir=settings.sentinel_log_dir_resolved,
+    log_max_bytes=settings.sentinel_log_max_bytes,
+    log_backup_count=settings.sentinel_log_backup_count,
+)
 logger = logging.getLogger(__name__)
+
+
+def _load_or_create_persisted_jwt_secret(settings_obj: Any) -> str:
+    """Fallback for an unset SENTINEL_JWT_SECRET that survives a container
+    restart, not just this process's lifetime.
+
+    Setting SENTINEL_JWT_SECRET explicitly (e.g. via the EC2 topology's
+    `extra-env` SSM parameter, or the in-cluster `sentinel-secret` Secret)
+    is still the right thing to do for anything beyond a demo, and remains
+    fully respected — this only runs when that was left unset. Previously
+    an unset secret meant a fresh random value EVERY process start, which
+    logs every admin out on every restart even though the incident history
+    itself now correctly survives one (see SQLiteStore persistence).
+    Persisting the generated value next to the SQLite DB — same volume,
+    same lifetime, same "must survive a restart" property — closes that
+    gap without requiring any new configuration.
+
+    Falls back to a process-lifetime-only secret (the old behaviour) if the
+    volume is not writable for some reason, exactly like SQLiteStore's own
+    in-memory fallback: degrade loudly, never crash on this.
+    """
+    secret_path = Path(settings_obj.sentinel_db_path).parent / ".jwt_secret"
+    try:
+        if secret_path.exists():
+            existing = secret_path.read_text().strip()
+            if existing:
+                logger.info(
+                    "sentinel_jwt_secret_loaded_from_disk",
+                    extra={"detail": "Reusing the persisted JWT secret; existing GUI "
+                           "sessions remain valid across this restart."},
+                )
+                return existing
+
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+        generated = secrets.token_urlsafe(48)
+        secret_path.write_text(generated)
+        secret_path.chmod(0o600)
+        logger.warning(
+            "sentinel_jwt_secret_generated_and_persisted",
+            extra={
+                "detail": "SENTINEL_JWT_SECRET was not set; generated one and saved it "
+                "to the persistent volume so GUI sessions survive future restarts. Set "
+                "SENTINEL_JWT_SECRET explicitly instead for anything beyond a demo.",
+            },
+        )
+        return generated
+    except OSError as exc:
+        generated = secrets.token_urlsafe(48)
+        logger.warning(
+            "sentinel_jwt_secret_generated_process_only",
+            extra={
+                "detail": "SENTINEL_JWT_SECRET was not set and the persistent volume "
+                "was not writable, so this secret is process-lifetime only. Every GUI "
+                "session will be invalidated on the next restart.",
+                "error_detail": str(exc)[:200],
+            },
+        )
+        return generated
 
 
 @asynccontextmanager
@@ -141,6 +210,19 @@ async def lifespan(app: FastAPI):
     event_bus = EventBus()
     ctx = build_context(settings, store, environment, event_bus=event_bus)
     orchestrator = Orchestrator(ctx)
+
+    # Separate bus for log-line streaming (Sentinel Logs GUI page). Kept
+    # distinct from `event_bus` above deliberately: log volume is much
+    # higher and bursty (a busy lifecycle run can emit dozens of lines),
+    # and events.py's per-subscriber queue is sized/tuned for occasional
+    # incident-state signals, not a live log tail — mixing the two would
+    # mean either logs drowning out incident events in a shared queue, or
+    # incident events being dropped by a slow log-tail subscriber. Same
+    # EventBus class, same "simple in-process pub/sub, swappable later"
+    # design (see core/events.py), just a second instance.
+    log_bus = EventBus(max_queue_size=500)
+    if _persistent_log_handler is not None:
+        _persistent_log_handler.set_bus(log_bus)
 
     # ---- Sentinel Administration & Tuning Center: reload live policy -----
     # ---- overrides ---------------------------------------------------
@@ -215,16 +297,7 @@ async def lifespan(app: FastAPI):
     # generate one if the operator did not set one, and log it loudly so it
     # is impossible to miss on first boot but never written to a file.
     if not settings.sentinel_jwt_secret:
-        settings.sentinel_jwt_secret = secrets.token_urlsafe(48)
-        logger.warning(
-            "sentinel_jwt_secret_generated",
-            extra={
-                "detail": "SENTINEL_JWT_SECRET was not set; generated a random one for "
-                "this process only. Every GUI session will be invalidated on the next "
-                "restart. Set SENTINEL_JWT_SECRET explicitly for anything beyond a "
-                "local demo."
-            },
-        )
+        settings.sentinel_jwt_secret = _load_or_create_persisted_jwt_secret(settings)
 
     if store.count_admins() == 0:
         bootstrap_password = settings.sentinel_admin_password or secrets.token_urlsafe(16)
@@ -259,6 +332,12 @@ async def lifespan(app: FastAPI):
     app.state.context = ctx
     app.state.orchestrator = orchestrator
     app.state.event_bus = event_bus
+    app.state.log_bus = log_bus
+    incident_manager = IncidentManager(
+        store, settings, event_bus=event_bus, orchestrator=orchestrator
+    )
+    ctx.incident_manager = incident_manager
+    app.state.incident_manager = incident_manager
     health.register_runtime(store=store, k8s=ctx.k8s, remediation=ctx.remediation)
 
     logger.info(
@@ -315,9 +394,15 @@ async def lifespan(app: FastAPI):
             },
         )
 
+    # Incidents the previous process left mid-lifecycle are classified here
+    # (resume once if nothing irreversible happened, else ESCALATED as
+    # INTERRUPTED) — persisted state is the truth, nothing is silently lost.
+    incident_manager.recover_interrupted()
+
     try:
         yield
     finally:
+        await incident_manager.shutdown()
         store.close()
         logger.info("sentinel_stopped")
 
@@ -363,6 +448,9 @@ app.include_router(actions.router)
 app.include_router(performance.router)
 app.include_router(meta.router)
 app.include_router(events.router)
+app.include_router(logs.router)
+app.include_router(activity.router)
+app.include_router(reinvestigate.router)
 
 
 @app.get("/metrics")

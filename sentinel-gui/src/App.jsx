@@ -18,6 +18,8 @@ import PerformancePage from './pages/PerformancePage.jsx'
 import PoliciesPage from './pages/PoliciesPage.jsx'
 import RcaConfigPage from './pages/RcaConfigPage.jsx'
 import RemediationConfigPage from './pages/RemediationConfigPage.jsx'
+import SentinelLivePage from './pages/SentinelLivePage.jsx'
+import SentinelLogsPage from './pages/SentinelLogsPage.jsx'
 
 export default function App() {
   return (
@@ -31,6 +33,8 @@ export default function App() {
               <Route path="/" element={<DashboardPage />} />
               <Route path="/incidents" element={<IncidentsListPage />} />
               <Route path="/incidents/:incidentId" element={<IncidentDetailPage />} />
+              <Route path="/live" element={<SentinelLivePage />} />
+              <Route path="/logs" element={<SentinelLogsPage />} />
               <Route path="/environment" element={<EnvironmentPage />} />
               <Route path="/actions" element={<ActionHistoryPage />} />
               <Route path="/performance" element={<PerformancePage />} />

@@ -103,7 +103,16 @@ class Settings(BaseSettings):
     # business logic (rca.py) only ever talks to the `Reasoner` interface, so
     # switching provider never touches lifecycle code, and a future
     # `LocalSentinelReasoner` slots in the same way.
-    llm_provider: str = "openai"  # openai | gemini
+    llm_provider: str = "openai"  # openai | gemini | groq
+
+    # Groq, selected through the SAME Reasoner abstraction (GroqReasoner is a
+    # thin OpenAI-compatible subclass — see app/reasoning/groq_reasoner.py).
+    # It has its own key/model/timeout so switching LLM_PROVIDER back and
+    # forth between providers never requires re-typing another provider's
+    # settings. Nothing outside app/reasoning/ knows Groq exists.
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+    groq_timeout_seconds: float = 20.0
 
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
@@ -198,6 +207,18 @@ class Settings(BaseSettings):
     # ---- Persistence -----------------------------------------------------
     sentinel_db_path: str = "/data/sentinel.db"
 
+    # Directory Sentinel's own logs are persisted to (Sentinel Logs GUI
+    # page). Empty means "derive from sentinel_db_path" — a `logs/`
+    # subdirectory next to the SQLite file, so it lives on the exact same
+    # volume with the exact same persistence guarantees, no new mount
+    # needed. Only set this explicitly to put logs somewhere else.
+    sentinel_log_dir: str = ""
+    # Per-file cap before rotation, and how many rotated files to keep.
+    # 10MB x 5 is a bounded, generous amount of JSON-lines log history
+    # without ever growing unboundedly — see app/core/log_capture.py.
+    sentinel_log_max_bytes: int = 10_000_000
+    sentinel_log_backup_count: int = 5
+
     # ---- Sentinel SRE Control Center (GUI) admin auth --------------------
     # This is a SEPARATE identity system from citizen-service's citizen JWT
     # auth (different audience: SRE operators, not citizens) and from
@@ -238,6 +259,48 @@ class Settings(BaseSettings):
     # storm of duplicate incidents.
     incident_dedup_window_seconds: int = 3600
 
+    # ---- Incident engine bounds -----------------------------------------
+    # Nothing in the pre-existing configuration bounded these (MAX_LIFECYCLE_
+    # CYCLES in orchestrator.py bounds re-investigation cycles inside ONE run;
+    # max_actions_per_incident bounds cluster writes). They exist so that NO
+    # automated path can loop forever: every one of them ends in ESCALATED
+    # with an explicit reason. See docs/incident-engine.md.
+    #
+    # Wall-clock ceiling for one lifecycle run. Checked cooperatively at the
+    # top of each cycle (never by cancelling a task mid-remediation, which
+    # could interrupt a Kubernetes write). Sized as comfortably above one full
+    # cycle: settle (20s) + validation timeout (180s) + evidence collection.
+    max_lifecycle_seconds: int = 1800
+    # How many times an ESCALATED incident may be *automatically* reopened
+    # because materially new evidence arrived. A human-initiated re-run
+    # (POST /api/incidents/{id}/reinvestigate) is not counted: a person is
+    # accountable for that one.
+    max_incident_reopens: int = 3
+    # Minimum spacing between automatic re-checks of an escalated incident.
+    # Secondary safety only — the PRIMARY control is the evidence-signature
+    # comparison (lifecycle/evidence_signature.py), which ignores identical
+    # evidence no matter how often it arrives.
+    escalated_reconsider_min_interval_seconds: int = 600
+    # After an incident is RESOLVED / auto_resolved, a firing for the same
+    # problem inside this gap is the tail of the SAME occurrence (alert rules
+    # use rate[5m] and `for:` clauses, so they keep firing for minutes after
+    # the service has actually recovered) and is absorbed. A firing after the
+    # gap is a NEW occurrence: a new incident that links back to the previous
+    # one. Sized to cover the 5m rate window plus a `for: 5m` clause.
+    incident_recurrence_gap_seconds: int = 600
+    # Upper bound on lifecycles running at once in this process. Lifecycles
+    # are I/O-bound (HTTP + Kubernetes calls); the cap only protects the
+    # SQLite connection and the Kubernetes API from a burst.
+    max_concurrent_lifecycles: int = 4
+
+    # ---- Reasoner (LLM) failure containment -------------------------------
+    # After this many consecutive provider failures Sentinel stops calling the
+    # provider for `reasoner_cooldown_seconds` and runs rules-only (a fully
+    # supported mode). A dead provider must slow no incident down by
+    # `timeout * cycles`, and must never become an "incident" itself.
+    reasoner_failure_threshold: int = 3
+    reasoner_cooldown_seconds: int = 120
+
     # ---- Derived helpers -------------------------------------------------
     @property
     def allowed_namespaces_list(self) -> list[str]:
@@ -246,6 +309,14 @@ class Settings(BaseSettings):
     @property
     def allowed_deployments_list(self) -> list[str]:
         return [d.strip() for d in self.allowed_deployments.split(",") if d.strip()]
+
+    @property
+    def sentinel_log_dir_resolved(self) -> str:
+        if self.sentinel_log_dir:
+            return self.sentinel_log_dir
+        from pathlib import Path
+
+        return str(Path(self.sentinel_db_path).parent / "logs")
 
     @property
     def sentinel_gui_origins_list(self) -> list[str]:
@@ -266,6 +337,8 @@ class Settings(BaseSettings):
         """
         if self.llm_provider == "gemini":
             return bool(self.gemini_api_key.strip())
+        if self.llm_provider == "groq":
+            return bool(self.groq_api_key.strip())
         return bool(self.openai_api_key.strip())
 
     @property

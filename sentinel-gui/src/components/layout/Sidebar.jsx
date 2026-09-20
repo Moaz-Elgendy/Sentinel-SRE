@@ -6,6 +6,8 @@ import Icon, { BrandMark } from '../ui/Icon.jsx'
 const NAV_ITEMS = [
   { to: '/', label: 'Dashboard', icon: 'dashboard', end: true },
   { to: '/incidents', label: 'Incidents', icon: 'alertTriangle', badge: true },
+  { to: '/live', label: 'Sentinel Live', icon: 'radio' },
+  { to: '/logs', label: 'Sentinel Logs', icon: 'terminal' },
   { to: '/environment', label: 'Environment', icon: 'server' },
   { to: '/actions', label: 'Action History', icon: 'history' },
   { to: '/performance', label: 'Performance', icon: 'activity' },

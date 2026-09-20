@@ -32,6 +32,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+from app.reasoning.health import ReasonerHealth
+
 
 class Reasoner(ABC):
     """One method: given a system prompt and a user prompt, return the raw
@@ -46,6 +48,29 @@ class Reasoner(ABC):
     #: "gemini:gemini-2.0-flash". Never influences behaviour, human-readable
     #: only.
     label: str = "unconfigured"
+
+    # Provider health (see reasoning/health.py). Created lazily so a Reasoner
+    # subclass — including a test double — that never calls super().__init__()
+    # still works; the factory replaces it with one configured from Settings.
+    _health: ReasonerHealth | None = None
+
+    @property
+    def health(self) -> ReasonerHealth:
+        if self._health is None:
+            self._health = ReasonerHealth()
+        return self._health
+
+    @health.setter
+    def health(self, value: ReasonerHealth) -> None:
+        self._health = value
+
+    def report_failure(self, detail: str, status_code: int | None = None) -> None:
+        """Called by implementations wherever they return None because the
+        provider call failed. Never raises."""
+        self.health.record_failure(detail, status_code)
+
+    def report_success(self) -> None:
+        self.health.record_success()
 
     @abstractmethod
     async def complete_json(self, system_prompt: str, user_prompt: str) -> str | None:
