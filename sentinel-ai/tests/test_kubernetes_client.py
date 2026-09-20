@@ -157,3 +157,178 @@ async def test_get_container_logs_failure_is_structured_not_raised():
     assert result["available"] is False
     assert "pod not found" in result["error"]
     assert result["lines"] == []
+
+
+# ---------------------------------------------------------------------------
+# patch_deployment_template — rollback must never write a missing/malformed
+# container image, regardless of what produced the source template.
+# ---------------------------------------------------------------------------
+from app.clients.kubernetes_client import (  # noqa: E402
+    InvalidRollbackTemplate,
+    _looks_like_a_valid_image_reference,
+)
+
+
+class _FakeMeta:
+    def __init__(self, generation=7):
+        self.generation = generation
+
+
+class _FakeDeploymentResult:
+    def __init__(self, generation=7):
+        self.metadata = _FakeMeta(generation)
+
+
+class _FakeAppsV1:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def patch_namespaced_deployment(self, *, name, namespace, body):
+        self.calls.append({"name": name, "namespace": namespace, "body": body})
+        return _FakeDeploymentResult()
+
+
+def _client_with_fake_apps(apps: _FakeAppsV1) -> KubernetesClient:
+    client = KubernetesClient()
+    client._available = True  # noqa: SLF001
+    client._apps = apps  # noqa: SLF001
+    return client
+
+
+TAG_IMAGE = "123456789012.dkr.ecr.eu-west-1.amazonaws.com/sentinel-sre-demo/citizen-service:abc1234"
+DIGEST_IMAGE = (
+    "123456789012.dkr.ecr.eu-west-1.amazonaws.com/sentinel-sre-demo/citizen-service"
+    "@sha256:" + "a" * 64
+)
+
+
+def _template(containers, init_containers=None):
+    return {
+        "metadata": {"labels": {"app": "citizen-service", "pod-template-hash": "old123"}},
+        "spec": {
+            "containers": containers,
+            "initContainers": init_containers or [],
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_rollback_preserves_container_and_init_container_image_exactly():
+    apps = _FakeAppsV1()
+    client = _client_with_fake_apps(apps)
+    template = _template(
+        containers=[{"name": "citizen-service", "image": TAG_IMAGE}],
+        init_containers=[{"name": "migrate-and-seed", "image": TAG_IMAGE}],
+    )
+
+    await client.patch_deployment_template("citizen-portal", "citizen-service", template, 52)
+
+    patched_spec = apps.calls[0]["body"]["spec"]["template"]["spec"]
+    assert patched_spec["containers"][0]["image"] == TAG_IMAGE
+    assert patched_spec["initContainers"][0]["image"] == TAG_IMAGE
+
+
+@pytest.mark.asyncio
+async def test_rollback_preserves_digest_pinned_images():
+    apps = _FakeAppsV1()
+    client = _client_with_fake_apps(apps)
+    template = _template(
+        containers=[{"name": "citizen-service", "image": DIGEST_IMAGE}],
+        init_containers=[{"name": "migrate-and-seed", "image": DIGEST_IMAGE}],
+    )
+
+    await client.patch_deployment_template("citizen-portal", "citizen-service", template, 52)
+
+    patched_spec = apps.calls[0]["body"]["spec"]["template"]["spec"]
+    assert patched_spec["containers"][0]["image"] == DIGEST_IMAGE
+    assert patched_spec["initContainers"][0]["image"] == DIGEST_IMAGE
+
+
+@pytest.mark.asyncio
+async def test_rollback_preserves_each_image_across_multiple_containers():
+    apps = _FakeAppsV1()
+    client = _client_with_fake_apps(apps)
+    template = _template(
+        containers=[
+            {"name": "citizen-service", "image": TAG_IMAGE},
+            {"name": "sidecar-proxy", "image": "envoyproxy/envoy:v1.29.0"},
+        ],
+        init_containers=[
+            {"name": "migrate-and-seed", "image": TAG_IMAGE},
+            {"name": "wait-for-db", "image": "busybox:1.36"},
+        ],
+    )
+
+    await client.patch_deployment_template("citizen-portal", "citizen-service", template, 52)
+
+    patched_spec = apps.calls[0]["body"]["spec"]["template"]["spec"]
+    images_by_name = {
+        c["name"]: c["image"]
+        for c in patched_spec["containers"] + patched_spec["initContainers"]
+    }
+    assert images_by_name["citizen-service"] == TAG_IMAGE
+    assert images_by_name["sidecar-proxy"] == "envoyproxy/envoy:v1.29.0"
+    assert images_by_name["migrate-and-seed"] == TAG_IMAGE
+    assert images_by_name["wait-for-db"] == "busybox:1.36"
+
+
+@pytest.mark.asyncio
+async def test_rollback_refuses_a_template_with_a_missing_container_image():
+    """The core regression guard: a source template with no image must never
+    reach patch_namespaced_deployment — this is what would eventually surface
+    as InvalidImageName Pods."""
+    apps = _FakeAppsV1()
+    client = _client_with_fake_apps(apps)
+    template = _template(containers=[{"name": "citizen-service", "image": None}])
+
+    with pytest.raises(InvalidRollbackTemplate):
+        await client.patch_deployment_template("citizen-portal", "citizen-service", template, 52)
+    assert apps.calls == []  # never reached the API server
+
+
+@pytest.mark.asyncio
+async def test_rollback_refuses_a_stringified_object_as_an_image():
+    """Guards against exactly the class of bug the doc called out:
+    str(container)/repr(container)/None-as-string leaking into .image."""
+    apps = _FakeAppsV1()
+    client = _client_with_fake_apps(apps)
+    template = _template(containers=[{"name": "citizen-service", "image": "None"}])
+
+    with pytest.raises(InvalidRollbackTemplate):
+        await client.patch_deployment_template("citizen-portal", "citizen-service", template, 52)
+    assert apps.calls == []
+
+
+@pytest.mark.asyncio
+async def test_rollback_refuses_when_only_the_init_container_image_is_bad():
+    """Preserving containers[].image while forgetting initContainers[].image
+    is exactly the bug class called out — this proves BOTH lists are checked."""
+    apps = _FakeAppsV1()
+    client = _client_with_fake_apps(apps)
+    template = _template(
+        containers=[{"name": "citizen-service", "image": TAG_IMAGE}],
+        init_containers=[{"name": "migrate-and-seed", "image": ""}],
+    )
+
+    with pytest.raises(InvalidRollbackTemplate):
+        await client.patch_deployment_template("citizen-portal", "citizen-service", template, 52)
+    assert apps.calls == []
+
+
+@pytest.mark.parametrize(
+    "image,expected",
+    [
+        (TAG_IMAGE, True),
+        (DIGEST_IMAGE, True),
+        ("busybox:1.36", True),
+        (None, False),
+        ("", False),
+        ("   ", False),
+        ("None", False),
+        ("{}", False),
+        ("<V1Container object>", False),
+        ("has a space:latest", False),
+    ],
+)
+def test_looks_like_a_valid_image_reference(image, expected):
+    assert _looks_like_a_valid_image_reference(image) is expected

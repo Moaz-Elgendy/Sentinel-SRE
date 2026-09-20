@@ -367,10 +367,10 @@ def gui_client(tmp_path):
     settings_obj.openai_timeout_seconds = 20.0
     settings_obj.openai_base_url = ""
     settings_obj.gemini_api_key = ""
-    settings_obj.gemini_model = "gemini-2.0-flash"
+    settings_obj.gemini_model = "gemini-3.5-flash"
     settings_obj.gemini_timeout_seconds = 20.0
     settings_obj.groq_api_key = ""
-    settings_obj.groq_model = "llama-3.3-70b-versatile"
+    settings_obj.groq_model = "openai/gpt-oss-120b"
     settings_obj.groq_timeout_seconds = 20.0
 
     def login(client) -> dict[str, str]:

@@ -683,6 +683,16 @@ class KubernetesClient:
             labels.pop(owned, None)
         template_dict.setdefault("metadata", {})["labels"] = labels
 
+        # Defence-in-depth against InvalidImageName: whatever produced the
+        # source ReplicaSet's template, this patch must never write a
+        # container or init container with a missing/malformed image to the
+        # Deployment. This does not fix a bad *source* template — it refuses
+        # to apply one, converting a silent post-hoc Pod failure (which only
+        # shows up minutes later as Init:InvalidImageName) into an explicit,
+        # immediate, diagnosable RemediationResult failure naming exactly
+        # which container and what it contained.
+        _assert_valid_container_images(template_dict)
+
         # Record on the Deployment what we did and why. Anyone running
         # `kubectl describe deploy` after the fact sees Sentinel's fingerprint
         # instead of a mysterious template change.
@@ -755,6 +765,56 @@ class KubernetesClient:
             extra={"namespace": namespace, "deployment": name, "replicas": replicas},
         )
         return {"replicas": replicas, "generation": result.metadata.generation}
+
+
+class InvalidRollbackTemplate(ValueError):
+    """Raised by `_assert_valid_container_images` — caught by
+    RemediationEngine's generic `except Exception` and turned into a clean
+    `RemediationResult(succeeded=False, ...)`, never an uncaught crash or a
+    Deployment patch that goes on to produce InvalidImageName Pods."""
+
+
+def _looks_like_a_valid_image_reference(image: Any) -> bool:
+    """Cheap, deliberately permissive sanity check — this is a last-resort
+    guard, not a full Docker reference-format validator (that regex is
+    large and registries vary). It exists only to catch the failure modes
+    the corruption doc called out: a missing image, `None`, or a Python
+    object having been accidentally stringified (`str(container)`,
+    `repr(...)`, `"{...}"`) instead of the real image string.
+    """
+    if not isinstance(image, str):
+        return False
+    image = image.strip()
+    if not image:
+        return False
+    # Telltale signs of an object having been stringified instead of the
+    # real `.image` field being read.
+    if image in ("None", "null", "{}", "[]") or image.startswith(("{", "[", "<")):
+        return False
+    if any(ch.isspace() for ch in image):
+        return False
+    return True
+
+
+def _assert_valid_container_images(template_dict: dict[str, Any]) -> None:
+    """Walk BOTH `containers` and `initContainers` in a (sanitised) pod
+    template and refuse to proceed if any container's image is missing or
+    obviously malformed — before this template is ever sent to the API
+    server as a Deployment patch.
+    """
+    pod_spec = ((template_dict.get("spec") or {})) or {}
+    bad: list[str] = []
+    for field in ("containers", "initContainers"):
+        for container in pod_spec.get(field) or []:
+            name = container.get("name", "<unnamed>")
+            image = container.get("image")
+            if not _looks_like_a_valid_image_reference(image):
+                bad.append(f"{field}[{name}]=image:{image!r}")
+    if bad:
+        raise InvalidRollbackTemplate(
+            "refusing to patch Deployment: source template has invalid "
+            "container image(s): " + "; ".join(bad)
+        )
 
 
 def _to_dict(obj: Any) -> dict[str, Any]:
