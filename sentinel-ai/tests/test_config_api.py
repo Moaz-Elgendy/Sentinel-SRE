@@ -637,8 +637,9 @@ def test_get_ai_returns_current_values_bounds_and_read_only_info(gui_client):
     body = resp.json()
     assert body["current"]["llm_provider"] == "openai"
     assert body["current"]["openai_model"] == "gpt-4o-mini"
-    assert body["bounds"]["llm_provider"]["choices"] == ["openai", "gemini"]
+    assert body["bounds"]["llm_provider"]["choices"] == ["openai", "gemini", "groq"]
     assert body["read_only"]["temperature"] == 0.0
+    assert body["read_only"]["groq_api_key_configured"] is False
     assert body["read_only"]["openai_api_key_configured"] is False
     assert body["read_only"]["gemini_api_key_configured"] is False
 

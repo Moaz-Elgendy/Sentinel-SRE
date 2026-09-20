@@ -126,7 +126,7 @@ _CATEGORIES: dict[str, CategoryHandler] = {
         apply_diffs=ai_admin.apply_diffs,
         snapshot=ai_admin.snapshot,
         after_apply=ai_admin.rebuild_reasoner,
-        sensitive_fields=frozenset({"openai_api_key", "gemini_api_key"}),
+        sensitive_fields=frozenset({"openai_api_key", "gemini_api_key", "groq_api_key"}),
     ),
     "monitoring": CategoryHandler(
         get_live_object=lambda ctx: ctx,

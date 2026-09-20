@@ -44,6 +44,7 @@ from app.core.metrics import (
 )
 from app.domain.environment import Environment
 from app.lifecycle import correlation, documentation, investigation, learning, rca
+from app.lifecycle.evidence_signature import compute_signature, material_changes
 from app.lifecycle.decision import DecisionEngine
 from app.lifecycle.policy import PolicyConfig, PolicyContext, PolicyEngine
 from app.lifecycle.remediation import RemediationEngine, RemediationRefused
@@ -97,6 +98,10 @@ class SentinelContext:
     validator: RecoveryValidator
     decision: DecisionEngine
     event_bus: Any = None  # app.core.events.EventBus, optional (see main.py)
+    # app.lifecycle.incident_manager.IncidentManager, set by main.py after the
+    # orchestrator exists. Optional: the orchestrator works without it (tests,
+    # tools) — it is only used to publish activity events.
+    incident_manager: Any = None
 
 
 def build_context(
@@ -195,6 +200,60 @@ def build_context(
 class Orchestrator:
     def __init__(self, ctx: SentinelContext) -> None:
         self.ctx = ctx
+        # One asyncio.Lock per remediation target ("namespace/deployment").
+        # Two incidents may investigate the same Deployment concurrently, but
+        # only one at a time may execute + validate an action against it.
+        self._target_locks: dict[str, asyncio.Lock] = {}
+
+    # -- concurrency helpers ---------------------------------------------
+    def _target_lock(self, plan: ActionPlan) -> asyncio.Lock:
+        key = f"{plan.params.namespace}/{plan.params.deployment or plan.params.service}"
+        lock = self._target_locks.get(key)
+        if lock is None:
+            lock = self._target_locks[key] = asyncio.Lock()
+        return lock
+
+    def _target_acted_since(
+        self, incident: Incident, plan: ActionPlan, evidence: Evidence
+    ) -> bool:
+        """Did ANOTHER incident execute an action on this app after this
+        incident's evidence was collected? (Persisted state, so this also holds
+        across a restart.)"""
+        acted = self.ctx.store.recent_executed_actions(
+            incident.app, since=evidence.collected_at, exclude_incident_id=incident.id
+        )
+        return bool(acted)
+
+    def _emit(self, incident: Incident, message: str, kind: str) -> None:
+        """Real activity line for Sentinel Live (no timeline entry)."""
+        manager = getattr(self.ctx, "incident_manager", None)
+        if manager is not None:
+            manager.emit(incident, message, kind)
+            return
+        bus = self.ctx.event_bus
+        if bus is not None:
+            try:
+                bus.publish(
+                    {
+                        "type": "incident_updated",
+                        "incident_id": incident.id,
+                        "alertname": incident.alertname,
+                        "severity": incident.severity.value,
+                        "phase": incident.phase.value,
+                        "status": incident.status.value,
+                        "message": message,
+                        "event_kind": kind,
+                    }
+                )
+            except Exception:  # noqa: BLE001 - never affects processing
+                pass
+
+    def _save(self, incident: Incident) -> None:
+        """Persist WITHOUT publishing the (possibly stale) last timeline line."""
+        try:
+            self.ctx.store.upsert_incident(incident.to_dict())
+        except Exception as exc:  # noqa: BLE001
+            logger.error("incident_persist_failed", extra={"error_detail": str(exc)[:200]})
 
     # -- persistence helper ----------------------------------------------
     def _persist(self, incident: Incident) -> None:
@@ -220,12 +279,22 @@ class Orchestrator:
         # never cause a different outcome than a connected one.
         if self.ctx.event_bus is not None:
             try:
+                # `timeline[-1]` is the message `Incident.record()` just
+                # wrote for THIS phase transition — real, human-authored
+                # text from the actual lifecycle module that ran (rca.py,
+                # remediation.py, etc.), not a label invented here. This is
+                # what lets Sentinel Live show authentic "what is Sentinel
+                # doing" text without adding any new instrumentation.
+                last_entry = incident.timeline[-1] if incident.timeline else None
                 self.ctx.event_bus.publish(
                     {
                         "type": "incident_updated",
                         "incident_id": incident.id,
+                        "alertname": incident.alertname,
+                        "severity": incident.severity.value,
                         "phase": incident.phase.value,
                         "status": incident.status.value,
+                        "message": last_entry.message if last_entry else None,
                     }
                 )
             except Exception as exc:  # noqa: BLE001
@@ -497,7 +566,23 @@ class Orchestrator:
         ).inc()
 
         cycle = 0
+        started = time.time()
+        incident.lifecycle_started_at = started
+        max_seconds = float(getattr(self.ctx.settings, "max_lifecycle_seconds", 1800))
         while cycle < MAX_LIFECYCLE_CYCLES:
+            if cycle > 0 and time.time() - started > max_seconds:
+                # Cooperative wall-clock bound, checked between cycles and
+                # never by cancelling mid-remediation (which could interrupt a
+                # Kubernetes write half-way).
+                self._escalate(
+                    incident,
+                    EscalationReason.LIFECYCLE_TIMEOUT,
+                    f"This lifecycle has been running for {time.time() - started:.0f}s "
+                    f"(limit {max_seconds:.0f}s) without reaching a resolution. "
+                    "Sentinel stops rather than keep working on an incident that is "
+                    "not converging.",
+                )
+                break
             cycle += 1
             phase = (
                 LifecyclePhase.INVESTIGATION
@@ -552,20 +637,33 @@ class Orchestrator:
                 llm_used=hypothesis.llm_used,
                 llm_note=hypothesis.llm_note,
             )
+            if hypothesis.llm_status in ("call_failed", "reasoner_unavailable"):
+                # A provider problem is a CONDITION recorded on this analysis,
+                # not an incident and not a lifecycle state: the incident
+                # carries on rules-only, exactly as with no LLM configured.
+                incident.record(
+                    LifecyclePhase.ROOT_CAUSE_ANALYSIS,
+                    "REASONER_UNAVAILABLE: the LLM provider could not be used for this "
+                    "analysis; continuing with the deterministic rule-based result "
+                    "(confidence is NOT raised to compensate). " + hypothesis.llm_note,
+                    llm_status=hypothesis.llm_status,
+                )
             self._persist(incident)
 
             # ---- REMEDIATION DECISION ----------------------------------
             incident.status = IncidentStatus.REMEDIATING
-            self.ctx.decision.learning_bias = learning.load_bias(
-                hypothesis.root_cause, self.ctx.store
+            # Passed per call, not assigned onto the shared DecisionEngine:
+            # concurrent incidents must not share mutable decision state.
+            learning_bias = learning.load_bias(hypothesis.root_cause, self.ctx.store)
+            candidates = self.ctx.decision.candidates(
+                incident, hypothesis, findings, learning_bias=learning_bias
             )
-            candidates = self.ctx.decision.candidates(incident, hypothesis, findings)
             incident.record(
                 LifecyclePhase.REMEDIATION_DECISION,
                 f"{len(candidates)} candidate action(s): "
                 + (", ".join(c.action.value for c in candidates) or "none"),
                 candidates=[c.to_dict() for c in candidates],
-                learning_bias=self.ctx.decision.learning_bias,
+                learning_bias=learning_bias,
             )
             self._persist(incident)
 
@@ -588,142 +686,170 @@ class Orchestrator:
             # ---- POLICY CHECK -> EXECUTION -> VALIDATION ----------------
             executed_any = False
             resolved = False
+            stale_evidence = False
             for plan in candidates:
-                context = self._policy_context(incident, findings)
-                verdict = self.ctx.policy.evaluate(
-                    incident, plan, context, now=time.time()
-                )
-                incident.record(
-                    LifecyclePhase.POLICY_CHECK,
-                    f"{plan.action.value}: "
-                    + ("ALLOWED" if verdict.allowed else "DENIED")
-                    + f" — {verdict.detail}",
-                    action=plan.action.value,
-                    allowed=verdict.allowed,
-                    denial_reason=verdict.reason.value if verdict.reason else None,
-                    checks=verdict.checks,
-                )
-                if not verdict.allowed:
-                    # Record the denial as an attempt with no result, so the
-                    # incident document shows what was considered and refused.
-                    incident.attempts.append(
-                        AttemptRecord(plan=plan, verdict=verdict, result=None)
+                lock = self._target_lock(plan)
+                if lock.locked():
+                    incident.record(
+                        LifecyclePhase.AUTONOMOUS_EXECUTION,
+                        f"waiting for another incident's remediation of "
+                        f"{plan.params.namespace}/{plan.params.deployment or plan.params.service} "
+                        "to finish before acting (one remediation per Deployment at a time)",
                     )
                     self._persist(incident)
-                    continue
-
-                attempt = AttemptRecord(plan=plan, verdict=verdict)
-                incident.attempts.append(attempt)
-
-                # ---- AUTONOMOUS EXECUTION ---------------------------
-                incident.record(
-                    LifecyclePhase.AUTONOMOUS_EXECUTION,
-                    f"executing {plan.action.value}"
-                    + (" (DRY_RUN)" if self.ctx.remediation.dry_run else ""),  # live value, see ctx.remediation.dry_run
-                    params=(verdict.adjusted_params or plan.params).to_dict(),
-                )
-                try:
-                    result = await self.ctx.remediation.execute(plan, verdict)
-                except RemediationRefused as exc:
-                    # A refusal after an ALLOW means the two gates disagree,
-                    # which is a bug in Sentinel, not an operational failure.
-                    # Escalate immediately rather than trying anything else.
-                    logger.error(
-                        "remediation_refused_after_authorisation",
-                        extra={"action": plan.action.value, "error_detail": str(exc)[:200]},
+                async with lock:
+                    if self._target_acted_since(incident, plan, evidence):
+                        # Another incident acted on this Deployment after OUR
+                        # evidence was collected, so that evidence describes a
+                        # system that no longer exists. Deciding from it would
+                        # be acting on a stale picture: look again instead.
+                        incident.record(
+                            LifecyclePhase.RE_INVESTIGATION,
+                            "another incident remediated this Deployment while this one "
+                            "waited; refreshing evidence before deciding",
+                        )
+                        self._persist(incident)
+                        stale_evidence = True
+                        break
+                    context = self._policy_context(incident, findings)
+                    verdict = self.ctx.policy.evaluate(
+                        incident, plan, context, now=time.time()
                     )
-                    self._escalate(
-                        incident,
-                        EscalationReason.REMEDIATION_ERROR,
-                        f"The Remediation Engine refused an action the Policy Engine "
-                        f"authorised: {exc}. This is an internal inconsistency in "
-                        "Sentinel and must be investigated before it is trusted again.",
+                    incident.record(
+                        LifecyclePhase.POLICY_CHECK,
+                        f"{plan.action.value}: "
+                        + ("ALLOWED" if verdict.allowed else "DENIED")
+                        + f" — {verdict.detail}",
+                        action=plan.action.value,
+                        allowed=verdict.allowed,
+                        denial_reason=verdict.reason.value if verdict.reason else None,
+                        checks=verdict.checks,
+                    )
+                    if not verdict.allowed:
+                        # Record the denial as an attempt with no result, so the
+                        # incident document shows what was considered and refused.
+                        incident.attempts.append(
+                            AttemptRecord(plan=plan, verdict=verdict, result=None)
+                        )
+                        self._persist(incident)
+                        continue
+
+                    attempt = AttemptRecord(plan=plan, verdict=verdict)
+                    incident.attempts.append(attempt)
+
+                    # ---- AUTONOMOUS EXECUTION ---------------------------
+                    incident.record(
+                        LifecyclePhase.AUTONOMOUS_EXECUTION,
+                        f"executing {plan.action.value}"
+                        + (" (DRY_RUN)" if self.ctx.remediation.dry_run else ""),  # live value, see ctx.remediation.dry_run
+                        params=(verdict.adjusted_params or plan.params).to_dict(),
+                    )
+                    try:
+                        result = await self.ctx.remediation.execute(plan, verdict)
+                    except RemediationRefused as exc:
+                        # A refusal after an ALLOW means the two gates disagree,
+                        # which is a bug in Sentinel, not an operational failure.
+                        # Escalate immediately rather than trying anything else.
+                        logger.error(
+                            "remediation_refused_after_authorisation",
+                            extra={"action": plan.action.value, "error_detail": str(exc)[:200]},
+                        )
+                        self._escalate(
+                            incident,
+                            EscalationReason.REMEDIATION_ERROR,
+                            f"The Remediation Engine refused an action the Policy Engine "
+                            f"authorised: {exc}. This is an internal inconsistency in "
+                            "Sentinel and must be investigated before it is trusted again.",
+                        )
+                        self._persist(incident)
+                        return await self._finish(incident)
+
+                    attempt.result = result
+                    executed_any = True
+                    incident.record(
+                        LifecyclePhase.AUTONOMOUS_EXECUTION,
+                        f"{plan.action.value} "
+                        + ("succeeded" if result.succeeded else "FAILED")
+                        + f": {result.detail}",
+                        succeeded=result.succeeded,
+                        dry_run=result.dry_run,
+                        duration_seconds=result.duration_seconds,
                     )
                     self._persist(incident)
-                    return await self._finish(incident)
 
-                attempt.result = result
-                executed_any = True
-                incident.record(
-                    LifecyclePhase.AUTONOMOUS_EXECUTION,
-                    f"{plan.action.value} "
-                    + ("succeeded" if result.succeeded else "FAILED")
-                    + f": {result.detail}",
-                    succeeded=result.succeeded,
-                    dry_run=result.dry_run,
-                    duration_seconds=result.duration_seconds,
-                )
-                self._persist(incident)
+                    if not result.succeeded:
+                        # Execution itself failed. Do not validate — there is
+                        # nothing to validate. Fall through to the next candidate
+                        # in this cycle.
+                        continue
 
-                if not result.succeeded:
-                    # Execution itself failed. Do not validate — there is
-                    # nothing to validate. Fall through to the next candidate
-                    # in this cycle.
-                    continue
-
-                # ---- RECOVERY VALIDATION ----------------------------
-                incident.status = IncidentStatus.VALIDATING
-                incident.record(
-                    LifecyclePhase.RECOVERY_VALIDATION,
-                    "waiting for the settle period, then polling until recovery or "
-                    f"timeout ({self.ctx.validator.thresholds.timeout_seconds}s)",  # live value, see ctx.validator.thresholds
-                )
-                report = await self.ctx.validator.validate(
-                    incident,
-                    verdict.adjusted_params or plan.params,
-                    baseline_error_rate=evidence.error_rate,
-                )
-                attempt.validation = report
-                sentinel_validation_result_total.labels(result=report.outcome.value).inc()
-                incident.record(
-                    LifecyclePhase.RECOVERY_VALIDATION,
-                    f"validation {report.outcome.value}: {report.detail}",
-                    outcome=report.outcome.value,
-                    failed_checks=report.failed_checks,
-                    skipped_checks=report.skipped_checks,
-                    elapsed_seconds=report.elapsed_seconds,
-                )
-                self._persist(incident)
-
-                if report.outcome is ValidationOutcome.PASSED:
-                    incident.status = IncidentStatus.RESOLVED
-                    incident.resolved_at = time.time()
-                    resolved = True
-                    break
-
-                if report.outcome is ValidationOutcome.DEGRADED:
-                    # Partial recovery: the target is healthy, a downstream is
-                    # not. We resolve *this* incident because the thing we were
-                    # asked to fix is fixed, and we say so loudly rather than
-                    # burning more actions on a service that is not the
-                    # problem. Chaining remediation into a downstream service
-                    # on our own initiative would be Sentinel deciding to widen
-                    # its own scope mid-incident.
-                    incident.status = IncidentStatus.RESOLVED
-                    incident.resolved_at = time.time()
+                    # ---- RECOVERY VALIDATION ----------------------------
+                    incident.status = IncidentStatus.VALIDATING
                     incident.record(
                         LifecyclePhase.RECOVERY_VALIDATION,
-                        "resolved with a caveat: the target service recovered but "
-                        "/readyz still reports status=degraded, so a downstream "
-                        "dependency remains unreachable. Sentinel does not "
-                        "autonomously remediate a different service than the one "
-                        "the alert named; a separate alert would be needed.",
+                        "waiting for the settle period, then polling until recovery or "
+                        f"timeout ({self.ctx.validator.thresholds.timeout_seconds}s)",  # live value, see ctx.validator.thresholds
                     )
-                    resolved = True
-                    break
+                    report = await self.ctx.validator.validate(
+                        incident,
+                        verdict.adjusted_params or plan.params,
+                        baseline_error_rate=evidence.error_rate,
+                    )
+                    attempt.validation = report
+                    sentinel_validation_result_total.labels(result=report.outcome.value).inc()
+                    incident.record(
+                        LifecyclePhase.RECOVERY_VALIDATION,
+                        f"validation {report.outcome.value}: {report.detail}",
+                        outcome=report.outcome.value,
+                        failed_checks=report.failed_checks,
+                        skipped_checks=report.skipped_checks,
+                        elapsed_seconds=report.elapsed_seconds,
+                    )
+                    self._persist(incident)
 
-                # Validation failed or timed out -> break out of the candidate
-                # loop and go round the lifecycle again with fresh evidence.
-                incident.record(
-                    LifecyclePhase.RE_INVESTIGATION,
-                    "remediation did not restore service; re-investigating with "
-                    "fresh evidence before choosing the next action",
-                )
-                break
+                    if report.outcome is ValidationOutcome.PASSED:
+                        incident.status = IncidentStatus.RESOLVED
+                        incident.resolved_at = time.time()
+                        resolved = True
+                        break
+
+                    if report.outcome is ValidationOutcome.DEGRADED:
+                        # Partial recovery: the target is healthy, a downstream is
+                        # not. We resolve *this* incident because the thing we were
+                        # asked to fix is fixed, and we say so loudly rather than
+                        # burning more actions on a service that is not the
+                        # problem. Chaining remediation into a downstream service
+                        # on our own initiative would be Sentinel deciding to widen
+                        # its own scope mid-incident.
+                        incident.status = IncidentStatus.RESOLVED
+                        incident.resolved_at = time.time()
+                        incident.record(
+                            LifecyclePhase.RECOVERY_VALIDATION,
+                            "resolved with a caveat: the target service recovered but "
+                            "/readyz still reports status=degraded, so a downstream "
+                            "dependency remains unreachable. Sentinel does not "
+                            "autonomously remediate a different service than the one "
+                            "the alert named; a separate alert would be needed.",
+                        )
+                        resolved = True
+                        break
+
+                    # Validation failed or timed out -> break out of the candidate
+                    # loop and go round the lifecycle again with fresh evidence.
+                    incident.record(
+                        LifecyclePhase.RE_INVESTIGATION,
+                        "remediation did not restore service; re-investigating with "
+                        "fresh evidence before choosing the next action",
+                    )
+                    break
 
             self._persist(incident)
             if resolved:
                 break
+
+            if stale_evidence:
+                # Bounded: each pass costs one of MAX_LIFECYCLE_CYCLES.
+                continue
 
             if not executed_any:
                 # Every candidate in this cycle was denied by policy. Going
@@ -776,6 +902,7 @@ class Orchestrator:
     ) -> Evidence:
         incident.record(phase, "gathering evidence from Prometheus, Loki and the "
                                "Kubernetes API in parallel")
+        self._emit(incident, "Investigation started: gathering Prometheus, Loki and Kubernetes evidence", "investigation_started")
         evidence = await investigation.investigate(
             incident=incident,
             prom=self.ctx.prom,
@@ -792,6 +919,26 @@ class Orchestrator:
             p95_latency_seconds=evidence.p95_latency_seconds,
             up=evidence.up,
             collector_errors=evidence.errors,
+        )
+        # What each source actually returned — real values, not a script.
+        self._emit(
+            incident,
+            f"Prometheus evidence gathered (error_rate={evidence.error_rate}, "
+            f"p95={evidence.p95_latency_seconds}, up={evidence.up})",
+            "evidence_prometheus",
+        )
+        self._emit(
+            incident,
+            f"Loki queried: {evidence.log_error_count} error log line(s)",
+            "evidence_loki",
+        )
+        self._emit(
+            incident,
+            f"Kubernetes state inspected: {len(evidence.pods)} pod(s), "
+            f"{len(evidence.k8s_events)} event(s), restarts={evidence.restart_count_total}"
+            if self.ctx.k8s.available
+            else "Kubernetes API unavailable; no cluster evidence",
+            "evidence_kubernetes",
         )
         return evidence
 
@@ -845,7 +992,13 @@ class Orchestrator:
             and target != "frontend"
         )
 
+        cooldown = float(self.ctx.policy.config.action_cooldown_seconds)
+        other_actions = self.ctx.store.recent_executed_actions(
+            incident.app, since=time.time() - cooldown, exclude_incident_id=incident.id
+        )
+
         return PolicyContext(
+            other_incident_actions=other_actions,
             previous_revision_exists=findings.previous_revision is not None,
             deployment_history_count=findings.revision_count,
             last_deploy_age_seconds=findings.recent_deployment_age_seconds,
@@ -863,16 +1016,185 @@ class Orchestrator:
     def _escalate(
         self, incident: Incident, reason: EscalationReason, detail: str
     ) -> None:
+        """Enter ESCALATED — a controlled terminal state, not "try again".
+
+        Records everything a human (or a later reconsideration) needs: why,
+        the RCA and its confidence, every action policy rejected with the
+        reason and the confidence it needed, and a coarse signature of the
+        evidence used. Repeat alerts are compared against that signature;
+        identical evidence never re-runs anything (see
+        lifecycle/incident_manager.py and evidence_signature.py).
+        """
+        now = time.time()
         incident.escalated = True
         incident.escalation_reason = reason
         incident.escalation_detail = detail
         incident.status = IncidentStatus.ESCALATED
+
+        hypothesis = incident.hypothesis
+        rejected: list[dict[str, Any]] = []
+        since = incident.lifecycle_started_at or 0.0
+        for attempt in incident.attempts:
+            if attempt.at < since or attempt.result is not None:
+                continue
+            verdict = attempt.verdict
+            if verdict is None or verdict.allowed:
+                continue
+            try:
+                required = self.ctx.policy.config.threshold_for(attempt.plan.action)
+            except Exception:  # noqa: BLE001
+                required = None
+            rejected.append(
+                {
+                    "action": attempt.plan.action.value,
+                    "confidence": attempt.plan.confidence,
+                    "required_confidence": required,
+                    "denial_reason": verdict.reason.value if verdict.reason else None,
+                    "policy_detail": verdict.detail,
+                }
+            )
+        signature = compute_signature(incident.evidence)
+        evidence = incident.evidence
+        if incident.escalation_record:
+            # A previous escalation (before a reopen) is history, never lost.
+            pass
+        incident.escalation_record = {
+            "incident_id": incident.id,
+            "at": now,
+            "at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "reason": reason.value,
+            "detail": detail,
+            "root_cause": hypothesis.root_cause.value if hypothesis else None,
+            "confidence": hypothesis.confidence if hypothesis else None,
+            "recommended_action": hypothesis.recommended_action.value if hypothesis else None,
+            "llm_status": hypothesis.llm_status if hypothesis else None,
+            "rejected_actions": rejected,
+            "policy_reasons": sorted({r["denial_reason"] for r in rejected if r["denial_reason"]}),
+            "evidence_signature": signature,
+            "evidence_used": (
+                {
+                    "collected_at": evidence.collected_at,
+                    "error_rate": evidence.error_rate,
+                    "p95_latency_seconds": evidence.p95_latency_seconds,
+                    "memory_bytes": evidence.memory_bytes,
+                    "up": evidence.up,
+                    "restart_count_total": evidence.restart_count_total,
+                    "health_status": evidence.health_status,
+                    "log_error_count": evidence.log_error_count,
+                    "collector_errors": evidence.errors,
+                }
+                if evidence
+                else None
+            ),
+            "reopen_count": incident.reopen_count,
+        }
+        # The baseline future repeats are compared against.
+        incident.evidence_baseline = signature
         incident.record(LifecyclePhase.ESCALATION, detail, reason=reason.value)
         sentinel_escalations_total.labels(reason=reason.value).inc()
         logger.warning(
             "incident_escalated",
-            extra={"escalation_reason": reason.value, "alertname": incident.alertname},
+            extra={
+                "escalation_reason": reason.value,
+                "alertname": incident.alertname,
+                "root_cause": hypothesis.root_cause.value if hypothesis else None,
+                "confidence": hypothesis.confidence if hypothesis else None,
+                "policy_reasons": incident.escalation_record["policy_reasons"],
+            },
         )
+
+    # -- reconsideration of an ESCALATED incident --------------------------
+    async def reconsider(
+        self, incident: Incident, forced: bool = False, actor: str | None = None
+    ) -> str:
+        """Look at an ESCALATED incident again, but only for a reason.
+
+        `forced=False` (automatic, triggered by a repeat alert): collect fresh
+        evidence, compare its signature to the one recorded at escalation, and
+        reopen ONLY if it changed materially (evidence_signature.py) and the
+        reopen budget allows. Identical evidence -> nothing runs: no RCA, no
+        LLM call, no policy check, no notification. Returns the outcome:
+        "no_change" | "baseline_recorded" | "reopened" | "not_escalated".
+
+        `forced=True` (an admin asked): skip the comparison — a person asking
+        Sentinel to look again does not need the evidence to have moved — and
+        do not spend the automatic reopen budget. The lifecycle it starts is
+        the ordinary one: RCA -> Decision -> Policy -> Remediation. It is not a
+        second path to the cluster.
+
+        Never raises.
+        """
+        set_incident_id(incident.id)
+        try:
+            if incident.status is not IncidentStatus.ESCALATED:
+                return "not_escalated"
+            now = time.time()
+            reasons: list[str]
+            if forced:
+                reasons = [f"manual re-investigation requested by {actor or 'an administrator'}"]
+                self._emit(incident, reasons[0][0].upper() + reasons[0][1:], "reinvestigation_manual")
+            else:
+                self._emit(incident, "Re-checking evidence for escalated incident", "reconsider_started")
+                evidence = await investigation.investigate(
+                    incident=incident,
+                    prom=self.ctx.prom,
+                    loki=self.ctx.loki,
+                    k8s=self.ctx.k8s,
+                    health_probe=self._health_probe,
+                    github=self.ctx.github,
+                )
+                signature = compute_signature(evidence)
+                incident.last_reconsidered_at = now
+                if incident.evidence_baseline is None:
+                    # Nothing to compare against: record the baseline and stop.
+                    # Guessing "changed" here is how loops start.
+                    incident.evidence_baseline = signature
+                    self._save(incident)
+                    self._emit(incident, "Recorded evidence baseline; incident remains ESCALATED", "reconsider_baseline")
+                    return "baseline_recorded"
+                reasons = material_changes(incident.evidence_baseline, signature)
+                if not reasons:
+                    self._save(incident)
+                    self._emit(
+                        incident,
+                        "Evidence unchanged since escalation; incident remains ESCALATED "
+                        "(no new investigation, decision or notification)",
+                        "reconsider_no_change",
+                    )
+                    return "no_change"
+                incident.reopen_count += 1
+
+            # ---- reopen -------------------------------------------------
+            if incident.escalation_record:
+                incident.escalation_history.append(incident.escalation_record)
+            incident.escalated = False
+            incident.escalation_reason = None
+            incident.escalation_detail = ""
+            incident.status = IncidentStatus.INVESTIGATING
+            incident.record(
+                LifecyclePhase.RE_INVESTIGATION,
+                "incident reopened for re-investigation: " + "; ".join(reasons),
+                reasons=reasons,
+                forced=forced,
+                reopen_count=incident.reopen_count,
+            )
+            self._persist(incident)
+            self._emit(incident, "Incident reopened: " + reasons[0], "reopened")
+            await self.run(incident)
+            return "reopened"
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("reconsideration_error")
+            if incident.status is not IncidentStatus.ESCALATED:
+                self._escalate(
+                    incident,
+                    EscalationReason.INTERNAL_ERROR,
+                    f"Sentinel hit an internal error during reconsideration: "
+                    f"{type(exc).__name__}: {str(exc)[:300]}. A human must take over.",
+                )
+                self._save(incident)
+            return "error"
+        finally:
+            set_incident_id(None)
 
     # -- terminal phases --------------------------------------------------
     async def _finish(self, incident: Incident) -> Incident:

@@ -194,6 +194,32 @@ class EscalationReason(str, Enum):
     LOW_CONFIDENCE = "low_confidence"
     UNKNOWN_ALERT = "unknown_alert"
     INTERNAL_ERROR = "internal_error"
+    # Bounded-loop terminators. Every automated retry/re-investigation path
+    # ends in one of these (or ACTION_CAP_REACHED / VALIDATION_FAILED above)
+    # with an explicit reason — see docs/incident-engine.md.
+    LIFECYCLE_TIMEOUT = "lifecycle_timeout"
+    RETRY_LIMIT_REACHED = "retry_limit_reached"
+    # Sentinel restarted while this incident was mid-lifecycle. Remediation
+    # may or may not have been applied; a human must look rather than
+    # Sentinel blindly re-running a possibly half-finished action.
+    INTERRUPTED = "interrupted_by_restart"
+
+
+# Escalation reasons for which NEW EVIDENCE could plausibly change the
+# outcome, so an escalated incident may be automatically reconsidered when
+# the evidence materially changes (lifecycle/incident_manager.py). Every
+# other reason means Sentinel exhausted what it is allowed to do, or hit an
+# internal fault: those wait for a human (temporary authorization or an
+# explicit re-run) and are never reopened automatically. Independently, an
+# incident on which Sentinel has already EXECUTED an action is never reopened
+# automatically either (see IncidentManager._join_escalated).
+AUTO_RECONSIDERABLE_REASONS: frozenset[EscalationReason] = frozenset(
+    {
+        EscalationReason.NO_SAFE_ACTION,
+        EscalationReason.LOW_CONFIDENCE,
+        EscalationReason.UNKNOWN_ALERT,
+    }
+)
 
 
 class ValidationOutcome(str, Enum):
@@ -492,6 +518,12 @@ class Hypothesis:
     llm_note: str = ""
     rule_confidence: float | None = None  # pre-LLM value, for comparison
     supporting: list[str] = field(default_factory=list)
+    # What happened with the LLM for THIS analysis: "" (not recorded),
+    # "not_configured", "ok", "call_failed", or "reasoner_unavailable" (the
+    # provider's circuit is open, so the call was skipped). Anything other
+    # than "ok" means the hypothesis is rules-only. It is a fact about the
+    # provider, never a lifecycle state — see reasoning/health.py.
+    llm_status: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -504,6 +536,7 @@ class Hypothesis:
             "llm_note": self.llm_note,
             "rule_confidence": self.rule_confidence,
             "supporting": self.supporting,
+            "llm_status": self.llm_status,
         }
 
     @classmethod
@@ -520,6 +553,7 @@ class Hypothesis:
             llm_note=data.get("llm_note", ""),
             rule_confidence=data.get("rule_confidence"),
             supporting=data.get("supporting") or [],
+            llm_status=data.get("llm_status", ""),
         )
 
 
@@ -712,6 +746,34 @@ class Incident:
     # How many distinct alert firings folded into this incident.
     firing_count: int = 1
 
+    # ---- Incident identity & correlation (lifecycle/incident_manager.py) ---
+    # `fingerprint` (above) is Sentinel's own STABLE incident identity, see
+    # compute_incident_key(). It is NOT Alertmanager's alert fingerprint: that
+    # one hashes every label including the pod name, so it changes whenever a
+    # pod is replaced — i.e. exactly when Sentinel's own remediation restarts
+    # something. The raw Alertmanager fingerprints seen are kept for audit.
+    failure_class: str | None = None
+    alert_fingerprints: list[str] = field(default_factory=list)
+    # Last time ANY firing for this identity was seen (dedup staleness is
+    # measured from this, not from updated_at which the lifecycle also bumps).
+    last_seen_at: float = field(default_factory=time.time)
+    # Repeat firings absorbed without doing any work (no lifecycle, no RCA).
+    suppressed_repeats: int = 0
+    # Nth occurrence of this identity (a recurrence after RESOLVED is a NEW
+    # incident with occurrence+1 and a link back, never a reopen of history).
+    occurrence: int = 1
+    previous_incident_id: str | None = None
+
+    # ---- Bounded retry bookkeeping ----------------------------------------
+    lifecycle_started_at: float | None = None
+    # Automatic reopens of an ESCALATED incident on materially new evidence.
+    reopen_count: int = 0
+    last_reconsidered_at: float | None = None
+    # Coarse evidence signature at the last decision point (escalation or
+    # reopen). Repeat evidence is compared against THIS — see
+    # lifecycle/evidence_signature.py for exactly what counts as "material".
+    evidence_baseline: dict[str, Any] | None = None
+
     evidence: Evidence | None = None
     hypothesis: Hypothesis | None = None
     attempts: list[AttemptRecord] = field(default_factory=list)
@@ -720,6 +782,12 @@ class Incident:
     escalated: bool = False
     escalation_reason: EscalationReason | None = None
     escalation_detail: str = ""
+    # Structured escalation audit (why, RCA, confidence, rejected action,
+    # policy reason, evidence used, timestamp, incident id). The CURRENT
+    # escalation; earlier ones (before an automatic/manual reopen) are kept in
+    # `escalation_history` so a reopened incident never loses its past.
+    escalation_record: dict[str, Any] = field(default_factory=dict)
+    escalation_history: list[dict[str, Any]] = field(default_factory=list)
 
     documentation: dict[str, Any] = field(default_factory=dict)
     notifications: dict[str, Any] = field(default_factory=dict)
@@ -782,12 +850,24 @@ class Incident:
             "resolved_at": self.resolved_at,
             "resolved_at_iso": iso(self.resolved_at) if self.resolved_at else None,
             "firing_count": self.firing_count,
+            "failure_class": self.failure_class,
+            "alert_fingerprints": self.alert_fingerprints,
+            "last_seen_at": self.last_seen_at,
+            "suppressed_repeats": self.suppressed_repeats,
+            "occurrence": self.occurrence,
+            "previous_incident_id": self.previous_incident_id,
+            "lifecycle_started_at": self.lifecycle_started_at,
+            "reopen_count": self.reopen_count,
+            "last_reconsidered_at": self.last_reconsidered_at,
+            "evidence_baseline": self.evidence_baseline,
             "hypothesis": self.hypothesis.to_dict() if self.hypothesis else None,
             "attempts": [a.to_dict() for a in self.attempts],
             "timeline": [e.to_dict() for e in self.timeline],
             "escalated": self.escalated,
             "escalation_reason": self.escalation_reason.value if self.escalation_reason else None,
             "escalation_detail": self.escalation_detail,
+            "escalation_record": self.escalation_record,
+            "escalation_history": self.escalation_history,
             "documentation": self.documentation,
             "notifications": self.notifications,
         }
@@ -838,6 +918,18 @@ class Incident:
             updated_at=data["updated_at"],
             resolved_at=data.get("resolved_at"),
             firing_count=data.get("firing_count", 1),
+            # Records written before the incident engine work lack these keys;
+            # every default below is the neutral "never happened" value.
+            failure_class=data.get("failure_class"),
+            alert_fingerprints=list(data.get("alert_fingerprints") or []),
+            last_seen_at=data.get("last_seen_at", data["updated_at"]),
+            suppressed_repeats=data.get("suppressed_repeats", 0),
+            occurrence=data.get("occurrence", 1),
+            previous_incident_id=data.get("previous_incident_id"),
+            lifecycle_started_at=data.get("lifecycle_started_at"),
+            reopen_count=data.get("reopen_count", 0),
+            last_reconsidered_at=data.get("last_reconsidered_at"),
+            evidence_baseline=data.get("evidence_baseline"),
             evidence=Evidence.from_dict(data.get("evidence")),
             hypothesis=Hypothesis.from_dict(data.get("hypothesis")),
             attempts=[AttemptRecord.from_dict(a) for a in data.get("attempts") or []],
@@ -849,6 +941,8 @@ class Incident:
                 else None
             ),
             escalation_detail=data.get("escalation_detail", ""),
+            escalation_record=data.get("escalation_record") or {},
+            escalation_history=list(data.get("escalation_history") or []),
             documentation=data.get("documentation") or {},
             notifications=data.get("notifications") or {},
             # `started_at_raw` is intentionally never in to_dict()'s output
@@ -885,3 +979,41 @@ def compute_fingerprint(alertname: str, app: str | None, pod: str | None = None)
     """
     raw = f"{alertname}|{app or ''}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_incident_key(
+    *,
+    environment_id: str | None,
+    application_id: str | None,
+    namespace: str | None,
+    app: str | None,
+    failure_class: str,
+) -> str:
+    """Stable INCIDENT identity: "same underlying problem -> same key".
+
+    Inputs are only things that stay true for the life of one problem:
+    which environment/application, which namespace/workload, and what CLASS
+    of failure (see detection.failure_class_for). Deliberately excluded:
+
+      * timestamps, `startsAt`, metric values, severity — all volatile;
+      * the pod name — a restart (Sentinel's own remediation!) renames it;
+      * the Alertmanager fingerprint — it hashes every label, pod included;
+      * the alertname — two rules describing the same symptom
+        (HighHTTPErrorRate + ChaosForcedHTTPFailures) are ONE problem;
+      * the RCA category — it is an OUTPUT of the lifecycle (and of an LLM),
+        and using it would let a model's opinion decide incident identity.
+
+    Different app => different key, so a citizen-service HTTP 500 and a
+    notification-service memory leak can never merge however close in time.
+    """
+    raw = "|".join(
+        [
+            environment_id or "",
+            application_id or "",
+            namespace or "",
+            app or "",
+            failure_class,
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+

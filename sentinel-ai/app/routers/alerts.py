@@ -5,23 +5,20 @@ Two properties this endpoint must have:
 
 1. **It returns promptly.** Alertmanager has a short HTTP timeout and retries
    on a slow response. A full lifecycle run takes minutes (settle period plus
-   validation polling), so processing inline would guarantee retries, and each
-   retry would look like a fresh firing. The lifecycle therefore runs in a
-   FastAPI BackgroundTask and the handler returns immediately with what it
-   decided to do.
+   validation polling), so nothing is processed inline: the handler asks the
+   IncidentManager what to do with each alert and returns immediately.
 
-2. **It is idempotent enough.** Alertmanager re-sends firing alerts on its
-   `repeat_interval`, and retries on any timeout. Dedup by fingerprint means a
-   repeat joins the existing open incident instead of starting a second
-   lifecycle against the same service. Without that, two concurrent
-   lifecycles would each restart the same Deployment — the per-incident action
-   cap does not help, because each duplicate incident has its own cap.
+2. **Correlation is decided by the IncidentManager, not here.** This module
+   only translates Alertmanager's payload into decisions and a response. The
+   rules (stable incident identity, joining a running incident, the escalated
+   incident that must not re-escalate, recurrence after resolution) live in
+   `app/lifecycle/incident_manager.py`.
 
-   The dedup guard is an in-process set of fingerprints currently being
-   processed, plus the SQLite lookup for incidents that are open but not
-   actively running. In-process is sufficient because Sentinel runs as a
-   single replica; if it were ever scaled to two, this would need a lock in
-   the store and that is called out here rather than left as a surprise.
+   Each NEW incident runs as its own asyncio task, so alerts in one payload
+   (or arriving together) progress concurrently and independently. They used
+   to be queued as FastAPI BackgroundTasks, which Starlette runs one after
+   another: the second alert in a payload waited for the first incident's
+   whole lifecycle.
 
 No authentication on this endpoint. It is a ClusterIP Service reachable only
 from inside the cluster, matching how the app services' /metrics endpoints are
@@ -33,36 +30,62 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Request
+from fastapi import APIRouter, Request
 
 from app.lifecycle import detection
-from app.models.incident import AlertmanagerWebhook, IncidentStatus, LifecyclePhase
+from app.lifecycle.incident_manager import IncidentManager
+from app.models.incident import AlertmanagerWebhook
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
-# Fingerprints with a lifecycle currently running in this process.
-_in_flight: set[str] = set()
+
+def get_incident_manager(request: Request) -> IncidentManager | None:
+    """The app-wide IncidentManager, bound to the CURRENT orchestrator.
+
+    Rebinding on every call keeps it correct when an environment registration
+    swaps `app.state.orchestrator` (routers/environments.py) without that
+    router needing to know the manager exists.
+    """
+    state = request.app.state
+    orchestrator = getattr(state, "orchestrator", None)
+    store = getattr(state, "store", None)
+    if orchestrator is None or store is None:
+        return None
+    manager = getattr(state, "incident_manager", None)
+    if manager is None:
+        manager = IncidentManager(
+            store,
+            getattr(state, "settings", None),
+            event_bus=getattr(state, "event_bus", None),
+            orchestrator=orchestrator,
+        )
+        state.incident_manager = manager
+    manager.orchestrator = orchestrator
+    return manager
 
 
 @router.post("/webhook")
 async def alertmanager_webhook(
     payload: AlertmanagerWebhook,
-    background: BackgroundTasks,
     request: Request,
 ) -> dict[str, Any]:
-    """Accept an Alertmanager v4 payload and schedule lifecycle runs."""
-    orchestrator = getattr(request.app.state, "orchestrator", None)
-    store = getattr(request.app.state, "store", None)
-    settings_obj = getattr(request.app.state, "settings", None)
+    """Accept an Alertmanager v4 payload and hand each alert to the manager."""
+    manager = get_incident_manager(request)
 
-    if orchestrator is None or store is None:
+    if manager is None:
         # Startup has not finished. 200 with an explanatory body rather than
         # 503: a 503 makes Alertmanager retry, and a retry storm during
         # Sentinel's own startup is not useful.
         logger.warning("webhook_received_before_startup_complete")
         return {"accepted": 0, "detail": "Sentinel is still starting up"}
+
+    # Phase 1: exactly one environment is registered, so this is simply "the"
+    # environment for this Sentinel process (main.py:lifespan sets it). See
+    # Environment's docstring for why routing an inbound webhook to ONE of
+    # several environments is deliberately not built yet.
+    environment = getattr(request.app.state, "environment", None)
 
     accepted: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -72,8 +95,7 @@ async def alertmanager_webhook(
 
         # ---- resolved alerts -------------------------------------------
         if normalised["status"] == "resolved":
-            result = _handle_resolved(normalised, store)
-            skipped.append(result)
+            skipped.append(manager.handle_resolved(normalised, environment))
             continue
 
         actionable, reason = detection.is_actionable(normalised)
@@ -82,92 +104,30 @@ async def alertmanager_webhook(
                 "alert_not_actionable",
                 extra={"alertname": normalised["alertname"], "skip_reason": reason},
             )
-            skipped.append(
-                {"alertname": normalised["alertname"], "reason": reason}
-            )
+            skipped.append({"alertname": normalised["alertname"], "reason": reason})
             continue
 
-        # ---- dedup ------------------------------------------------------
-        fingerprint = normalised["fingerprint"] or None
-        incident = detection.build_incident(normalised)
-        fingerprint = incident.fingerprint
-
-        # Stamp which Environment this incident belongs to (spec section 6).
-        # Phase 1: exactly one environment is registered, so this is simply
-        # "the" environment for this Sentinel process — see
-        # main.py:lifespan for where app.state.environment is set. See
-        # Environment's docstring for why routing an inbound webhook to ONE
-        # of several environments is deliberately not built yet.
-        environment = getattr(request.app.state, "environment", None)
-        if environment is not None:
-            incident.customer_id = environment.customer_id
-            incident.environment_id = environment.id
-            incident.application_id = environment.application.id
-
-        if fingerprint in _in_flight:
-            skipped.append(
+        decision = manager.handle_alert(normalised, environment)
+        if decision.created:
+            incident = decision.incident
+            accepted.append(
                 {
+                    "incident_id": incident.id,
                     "alertname": incident.alertname,
-                    "reason": "a lifecycle for this fingerprint is already running; "
-                    "this repeat firing was folded into it",
+                    "app": incident.app,
+                    "severity": incident.severity.value,
+                    "occurrence": incident.occurrence,
                 }
             )
-            logger.info(
-                "duplicate_firing_in_flight",
-                extra={"alertname": incident.alertname, "fingerprint": fingerprint},
-            )
-            continue
-
-        window = getattr(settings_obj, "incident_dedup_window_seconds", 3600)
-        existing = store.find_open_by_fingerprint(fingerprint, window)
-        if existing is not None:
-            # An open incident exists but nothing is running for it (e.g.
-            # Sentinel restarted mid-incident). Bump the firing count and
-            # leave it alone rather than starting a competing lifecycle. A
-            # human looking at /api/incidents sees a stuck incident, which is
-            # the honest signal.
-            existing["firing_count"] = int(existing.get("firing_count", 1)) + 1
-            existing["updated_at"] = incident.created_at
-            store.upsert_incident(existing)
+        else:
             skipped.append(
                 {
-                    "alertname": incident.alertname,
-                    "incident_id": existing.get("id"),
-                    "reason": "joined an existing open incident (deduplicated by "
-                    "fingerprint); no second lifecycle was started",
+                    "alertname": normalised["alertname"],
+                    "incident_id": decision.incident_id,
+                    "correlation": decision.kind.value,
+                    "reason": decision.reason,
                 }
             )
-            logger.info(
-                "alert_deduplicated",
-                extra={
-                    "alertname": incident.alertname,
-                    "existing_incident_id": existing.get("id"),
-                    "firing_count": existing["firing_count"],
-                },
-            )
-            continue
-
-        # ---- schedule the lifecycle ------------------------------------
-        store.upsert_incident(incident.to_dict())
-        _in_flight.add(fingerprint)
-        background.add_task(_run_lifecycle, orchestrator, incident, fingerprint)
-        accepted.append(
-            {
-                "incident_id": incident.id,
-                "alertname": incident.alertname,
-                "app": incident.app,
-                "severity": incident.severity.value,
-            }
-        )
-        logger.info(
-            "incident_opened",
-            extra={
-                "incident_id": incident.id,
-                "alertname": incident.alertname,
-                "app": incident.app,
-                "severity": incident.severity.value,
-            },
-        )
 
     return {
         "accepted": len(accepted),
@@ -178,57 +138,3 @@ async def alertmanager_webhook(
         "detail": "lifecycle runs are processed in the background; poll "
         "GET /api/incidents/{id} for progress",
     }
-
-
-def _handle_resolved(normalised: dict[str, Any], store) -> dict[str, Any]:
-    """Alertmanager says the condition cleared.
-
-    If we have a matching open incident, mark it auto_resolved and record
-    that the resolution was NOT Sentinel's doing. That distinction matters:
-    counting self-healing blips as successful remediations would make
-    Sentinel's effectiveness metrics — and its learning bias — a lie.
-    """
-    from app.models.incident import compute_fingerprint  # noqa: PLC0415
-
-    fingerprint = normalised["fingerprint"] or compute_fingerprint(
-        normalised["alertname"], normalised["app"], normalised["pod"]
-    )
-    existing = store.find_open_by_fingerprint(fingerprint, 24 * 3600)
-    if existing is None:
-        return {
-            "alertname": normalised["alertname"],
-            "reason": "resolved notification with no matching open incident",
-        }
-
-    existing["status"] = IncidentStatus.AUTO_RESOLVED.value
-    existing["resolved_at"] = existing.get("updated_at")
-    existing.setdefault("timeline", []).append(
-        {
-            "phase": LifecyclePhase.DETECTION.value,
-            "message": "Alertmanager reported the alert as resolved. The incident "
-            "is closed as auto_resolved: the condition cleared on its own or by "
-            "someone else's action, NOT as a verified result of a Sentinel "
-            "remediation. Counting this as a Sentinel success would corrupt both "
-            "the effectiveness metrics and the learning bias.",
-            "at": existing.get("updated_at"),
-            "detail": {},
-        }
-    )
-    store.upsert_incident(existing)
-    logger.info(
-        "incident_auto_resolved",
-        extra={"incident_id": existing.get("id"), "alertname": normalised["alertname"]},
-    )
-    return {
-        "alertname": normalised["alertname"],
-        "incident_id": existing.get("id"),
-        "reason": "marked auto_resolved from an Alertmanager resolved notification",
-    }
-
-
-async def _run_lifecycle(orchestrator, incident, fingerprint: str) -> None:
-    """Background wrapper. Always clears the in-flight marker."""
-    try:
-        await orchestrator.run(incident)
-    finally:
-        _in_flight.discard(fingerprint)

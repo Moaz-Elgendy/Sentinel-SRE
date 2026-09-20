@@ -148,6 +148,14 @@ class PolicyContext:
     # the name-based deny-list so that a future stateful service (a Redis, a
     # queue) can be excluded without editing the frozen list.
     target_is_stateful: bool = False
+    # `{target_key: newest started_at}` for actions EXECUTED against this same
+    # target by OTHER incidents (populated from the persisted incident bodies
+    # by the orchestrator). Only ever adds cooldown — it can make a denial
+    # more likely, never less — so a second incident on the same Deployment
+    # cannot fire the same action right after the first one did. Empty by
+    # default: a caller that does not supply it gets the previous
+    # (per-incident) behaviour.
+    other_incident_actions: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -302,7 +310,7 @@ class PolicyEngine:
             )
         checks["action_cap"] = True
 
-        cooldown_remaining = self._cooldown_remaining(incident, plan, now)
+        cooldown_remaining = self._cooldown_remaining(incident, plan, now, context)
         if cooldown_remaining > 0:
             checks["cooldown"] = False
             return self._deny(
@@ -570,7 +578,11 @@ class PolicyEngine:
 
     # -- helpers ----------------------------------------------------------
     def _cooldown_remaining(
-        self, incident: Incident, plan: ActionPlan, now: float
+        self,
+        incident: Incident,
+        plan: ActionPlan,
+        now: float,
+        context: PolicyContext | None = None,
     ) -> float:
         """Seconds of cooldown left for this (action, target) pair.
 
@@ -586,6 +598,9 @@ class PolicyEngine:
             if attempt.plan.target_key != plan.target_key:
                 continue
             latest = max(latest, attempt.result.started_at)
+        if context is not None:
+            # Same (action, target) executed by a DIFFERENT incident.
+            latest = max(latest, context.other_incident_actions.get(plan.target_key, 0.0))
         if latest == 0.0:
             return 0.0
         elapsed = now - latest

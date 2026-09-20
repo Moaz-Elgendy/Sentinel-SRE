@@ -904,3 +904,187 @@
   gap: var(--space-4);
   margin-top: var(--space-3);
 }
+
+/* ==========================================================================
+   Sentinel Live
+   ========================================================================== */
+.sentinel-live__status .card__body {
+  padding: var(--space-6) var(--space-5);
+}
+
+.sentinel-live__headline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.sentinel-live__headline-icon {
+  font-size: 32px;
+  line-height: 1;
+}
+
+.sentinel-live__headline-title {
+  font-size: var(--text-xl);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.sentinel-live__headline-sub {
+  margin-top: 2px;
+  color: var(--text-2);
+  font-size: var(--text-base);
+}
+
+.sentinel-live__last-activity {
+  margin: var(--space-3) 0 0;
+  color: var(--text-3);
+  font-size: var(--text-sm);
+}
+
+.watcher-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.watcher-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+}
+
+.watcher-row__name {
+  flex: 1;
+  font-weight: 500;
+}
+
+.watcher-row__state {
+  color: var(--ok);
+  font-size: var(--text-sm);
+}
+
+.watcher-row__state--down {
+  color: var(--bad);
+}
+
+/* Live activity feed — same grid rhythm as .audit (the incident timeline)
+   so the two visually read as the same kind of thing, since they are: real
+   lifecycle events, just scoped differently (one incident vs "right now"). */
+.activity-feed {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.activity-feed__row {
+  display: grid;
+  grid-template-columns: 84px 28px minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--text-base);
+}
+
+.activity-feed__row:last-child {
+  border-bottom: 0;
+}
+
+.activity-feed__time {
+  color: var(--text-3);
+  font-size: var(--text-sm);
+  padding-top: 2px;
+}
+
+.activity-feed__icon {
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.activity-feed__body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.activity-feed__phase {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: var(--text-sm);
+}
+
+.activity-feed__message {
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 640px) {
+  .activity-feed__row {
+    grid-template-columns: 20px minmax(0, 1fr);
+  }
+  .activity-feed__time {
+    display: none;
+  }
+}
+
+/* ==========================================================================
+   Sentinel Logs
+   ========================================================================== */
+.log-feed {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: 92px 84px 200px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 7px var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--text-sm);
+}
+
+.log-row:last-child {
+  border-bottom: 0;
+}
+
+.log-row__time {
+  color: var(--text-3);
+}
+
+.log-row__source {
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-row__message {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.log-row__incident {
+  color: var(--accent);
+  font-size: var(--text-xs);
+}
+
+@media (max-width: 900px) {
+  .log-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+    padding: var(--space-2) var(--space-4);
+  }
+}

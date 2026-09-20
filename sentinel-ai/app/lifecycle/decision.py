@@ -118,8 +118,15 @@ class DecisionEngine:
         incident: Incident,
         hypothesis: Hypothesis,
         findings: CorrelationFindings,
+        learning_bias: dict[str, float] | None = None,
     ) -> list[ActionPlan]:
         """Ordered candidate actions for this incident.
+
+        `learning_bias` is passed per call by the orchestrator instead of
+        being assigned onto this shared engine: several incidents run
+        concurrently against ONE DecisionEngine, and "set shared attribute,
+        then read it" is only correct until someone adds an `await` between
+        the two. When omitted, the constructor-supplied bias is used.
 
         Actions already attempted in this incident are filtered out here so
         the orchestrator's loop cannot retry the same thing forever. The
@@ -127,6 +134,7 @@ class DecisionEngine:
         the principle that the last gate before the cluster should not trust
         the caller.
         """
+        bias = self.learning_bias if learning_bias is None else learning_bias
         target = incident.target_deployment
         if hypothesis.recommended_action is RemediationAction.ESCALATE:
             return []
@@ -163,7 +171,7 @@ class DecisionEngine:
             if action in attempted:
                 continue
             confidence = hypothesis.confidence - (FALLBACK_DISCOUNT * index)
-            confidence *= self.learning_bias.get(action.value, 1.0)
+            confidence *= bias.get(action.value, 1.0)
             confidence = max(0.0, min(1.0, confidence))
             params = self._params_for(action, incident, findings)
             if params is None:

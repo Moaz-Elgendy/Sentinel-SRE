@@ -30,6 +30,7 @@ class OpenAIReasoner(Reasoner):
         self.timeout = timeout
         self.base_url = base_url
         self.label = f"openai:{model}"
+        self.provider_name = "openai"
 
     async def complete_json(self, system_prompt: str, user_prompt: str) -> str | None:
         try:
@@ -54,7 +55,30 @@ class OpenAIReasoner(Reasoner):
                 response_format={"type": "json_object"},
                 max_tokens=600,
             )
-            return (response.choices[0].message.content or "").strip()
+            text = (response.choices[0].message.content or "").strip()
+            if not text:
+                self.report_failure("provider returned an empty completion")
+                return None
+            self.report_success()
+            return text
         except Exception as exc:  # noqa: BLE001 - openai raises many types
-            logger.warning("openai_call_failed", extra={"error_detail": str(exc)[:200]})
+            # `status_code` exists on openai.APIStatusError (4xx/5xx) and is
+            # absent on connection/timeout errors — both are logged the same
+            # way, with the endpoint and model that were actually used, so a
+            # provider problem is diagnosable from this one line.
+            status_code = getattr(exc, "status_code", None)
+            detail = f"{type(exc).__name__}: {str(exc)[:200]}"
+            logger.warning(
+                "openai_call_failed",
+                extra={
+                    "provider": self.provider_name,
+                    "endpoint": self.base_url or "https://api.openai.com/v1",
+                    "model": self.model,
+                    "status_code": status_code,
+                    "error_detail": detail.replace(self.api_key, "***") if self.api_key else detail,
+                },
+            )
+            self.report_failure(
+                detail.replace(self.api_key, "***") if self.api_key else detail, status_code
+            )
             return None

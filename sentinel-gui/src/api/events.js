@@ -14,16 +14,16 @@ const baseURL = import.meta.env.VITE_API_BASE_URL || window.location.origin
  * module docstring for why this is safe (same JWT, same secret, same
  * expiry, just a different transport for this one endpoint).
  *
- * `onIncidentEvent(incidentId)` is called for every `incident_updated`
- * event — it receives ONLY the incident id, never incident state, because
- * the event is a signal to re-fetch the real record via the existing
- * `GET /api/incidents/{id}`, not a payload to trust as-is (see
- * usePolling.js and IncidentDetailPage.jsx, which is Phase A's mechanism
- * for turning that signal into an actual update).
- *
- * Returns a cleanup function. If there is no token (signed out) this is a
- * no-op that returns a no-op cleanup, rather than opening an unauthenticated
- * connection that will just 401 forever.
+ * `onIncidentEvent(incidentId, payload)` is called for every `incident_updated`
+ * event. `incidentId` is the only part any existing caller should treat as
+ * a signal to re-fetch the real record via `GET /api/incidents/{id}` — see
+ * usePolling.js and IncidentDetailPage.jsx. `payload` is the full published
+ * event (see orchestrator.py's `_persist`) and additionally carries the
+ * real `message` just recorded for that phase transition, `alertname`,
+ * `severity`, `phase` and `status` — useful for a live feed (Sentinel Live)
+ * that wants to render something immediately without waiting for the
+ * incident to be re-fetched, while still never being the ONLY source of
+ * truth for that incident's state.
  */
 export function subscribeToIncidentEvents(onIncidentEvent) {
   const token = getToken()
@@ -35,7 +35,7 @@ export function subscribeToIncidentEvents(onIncidentEvent) {
   source.addEventListener('incident_updated', (event) => {
     try {
       const payload = JSON.parse(event.data)
-      if (payload.incident_id) onIncidentEvent(payload.incident_id)
+      if (payload.incident_id) onIncidentEvent(payload.incident_id, payload)
     } catch {
       // Malformed event — ignore it; the next poll still catches up.
     }
