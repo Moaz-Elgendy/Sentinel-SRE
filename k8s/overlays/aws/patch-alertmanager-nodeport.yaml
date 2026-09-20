@@ -1,0 +1,47 @@
+# Expose Alertmanager to the EXTERNAL Sentinel control plane.
+#
+# Sentinel runs on its own EC2 instance, outside the cluster's pod network
+# (see infra/terraform/sentinel_remote.tf). Its Live/Watching panel and
+# connectivity check query Alertmanager (GET /-/healthy on ALERTMANAGER_URL),
+# and a ClusterIP Service is unreachable from outside the cluster no matter
+# what security-group rule exists. This is the same reasoning, and the same
+# fixed-nodePort approach, as observability-nodeport.yaml for Prometheus and
+# Loki.
+#
+# It is a patch on the existing `alertmanager` Service rather than a second
+# Service: the selector, name and 9093/9093 port mapping are unchanged, and
+# in-cluster clients (Prometheus' alerting config, Loki's ruler) keep using
+# http://alertmanager:9093 exactly as before — a NodePort Service still has a
+# ClusterIP. Only `type` changes and a fixed nodePort is added. The base
+# (k8s/base) stays ClusterIP, so local development is unaffected.
+#
+# `protocol` is deliberately NOT written in the port entry: the base's port has
+# none (Kubernetes defaults it to TCP), and Kustomize matches Service ports on
+# (port, protocol) — a patch entry that says `protocol: TCP` does not match the
+# base entry and its nodePort is silently dropped from the rendered output
+# (verified with kustomize v5.4.3). Left implicit, the entry merges on `port`
+# and the live Service is still TCP.
+#
+# The nodePort is FIXED (not auto-assigned) so this file and
+# infra/terraform/variables.tf's `alertmanager_nodeport` (the security-group
+# rule) cannot silently disagree. Keep them equal.
+#
+# Reachability is decided by the security group, not by Kubernetes: the K3s
+# node's SG allows this port ONLY from the Sentinel instance's security group
+# (infra/terraform/security.tf, alertmanager_from_sentinel) — never
+# 0.0.0.0/0.
+#
+# Direction, for the avoidance of doubt: this is Sentinel -> Alertmanager.
+# The Alertmanager -> Sentinel webhook (patch-monitoring.yaml) is unrelated
+# and unchanged.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: citizen-portal
+spec:
+  type: NodePort
+  ports:
+    - port: 9093
+      targetPort: 9093
+      nodePort: 30093
