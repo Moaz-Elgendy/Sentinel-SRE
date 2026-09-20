@@ -114,9 +114,10 @@ resource "aws_vpc_security_group_egress_rule" "all" {
 
 # ---------------------------------------------------------------------------
 # External control plane: let ONLY the Sentinel instance reach the
-# Kubernetes API and the observability NodePorts. See sentinel_remote.tf.
+# Kubernetes API and the observability NodePorts (Prometheus, Loki,
+# Alertmanager). See sentinel_remote.tf.
 #
-# Both rules are sourced from the Sentinel security group specifically
+# Every rule below is sourced from the Sentinel security group specifically
 # (`referenced_security_group_id`), never a CIDR — so even though these
 # ports are now open at the security-group layer, nothing on the public
 # internet, and nothing else in the VPC, can reach them. Only traffic that
@@ -167,6 +168,21 @@ resource "aws_vpc_security_group_ingress_rule" "loki_from_sentinel" {
 
   tags = {
     Name = "${var.project_name}-ingress-loki-from-sentinel"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "alertmanager_from_sentinel" {
+  count = var.enable_remote_sentinel ? 1 : 0
+
+  security_group_id            = aws_security_group.k3s_node.id
+  description                  = "Alertmanager NodePort, from the external Sentinel instance only"
+  referenced_security_group_id = aws_security_group.sentinel[0].id
+  from_port                    = var.alertmanager_nodeport
+  to_port                      = var.alertmanager_nodeport
+  ip_protocol                  = "tcp"
+
+  tags = {
+    Name = "${var.project_name}-ingress-alertmanager-from-sentinel"
   }
 }
 
