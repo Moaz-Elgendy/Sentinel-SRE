@@ -493,7 +493,7 @@ def test_groq_is_selected_through_the_same_factory():
     s = Settings(llm_provider="groq", groq_api_key="k")
     r = build_reasoner(s)
     assert isinstance(r, GroqReasoner) and isinstance(r, Reasoner)
-    assert r.label == "groq:llama-3.3-70b-versatile" and "api.groq.com" in r.base_url
+    assert r.label == "groq:openai/gpt-oss-120b" and "api.groq.com" in r.base_url
     assert s.llm_enabled
     assert build_reasoner(Settings(llm_provider="groq", groq_api_key="")) is None
     assert isinstance(build_reasoner(Settings(llm_provider="openai", openai_api_key="k")), OpenAIReasoner)
