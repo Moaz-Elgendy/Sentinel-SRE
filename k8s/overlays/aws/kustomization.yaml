@@ -41,7 +41,8 @@ resources:
   # observability stack.
   #
   # Prometheus/Loki remain reachable by the external Sentinel through
-  # the restricted NodePorts below.
+  # the restricted NodePorts below (Alertmanager's NodePort is set by
+  # patch-alertmanager-nodeport.yaml).
   - observability-nodeport.yaml
 
 # ---------------------------------------------------------------------------
@@ -133,3 +134,6 @@ patches:
   - path: patch-replicas.yaml
   # Alertmanager -> Sentinel webhook, plus the missing alert rules.
   - path: patch-monitoring.yaml
+  # Alertmanager Service -> NodePort 30093, so the external Sentinel can
+  # reach it (Sentinel -> Alertmanager). Independent of the webhook above.
+  - path: patch-alertmanager-nodeport.yaml
