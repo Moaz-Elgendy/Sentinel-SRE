@@ -80,6 +80,9 @@ class CorrelationFindings:
         self.latency_spike: bool = False
         self.service_down: bool = False
         self.crash_looping: bool = False
+        self.init_container_failing: bool = False
+        self.init_container_name: str | None = None
+        self.init_container_exit_reason: str | None = None
         self.memory_growth_suspicious: bool = False
         self.cpu_saturated: bool = False
         self.replicas_unavailable: bool = False
@@ -225,6 +228,28 @@ def correlate(
                     f"pod {pod.get('name')} container {container.get('name')} was "
                     "previously OOMKilled"
                 )
+            # An init container failure is recorded as its own finding,
+            # separate from `crash_looping`, because it answers a different
+            # question for RCA: not "is something restart-looping" but
+            # specifically "did the new pod template's *startup* work at
+            # all" — which is exactly what distinguishes a bad deployment
+            # from an ordinary runtime crash.
+            if container.get("is_init") and not f.init_container_failing:
+                exit_reason = waiting or container.get("terminated_reason")
+                is_failure = waiting in CRASHLOOP_WAITING_REASONS or (
+                    container.get("terminated_reason") is not None
+                    and container.get("terminated_reason") != "Completed"
+                )
+                if is_failure:
+                    f.init_container_failing = True
+                    f.init_container_name = container.get("name")
+                    f.init_container_exit_reason = exit_reason
+                    evidence.correlations.append(
+                        f"pod {pod.get('name')} init container "
+                        f"{container.get('name')} is failing "
+                        f"({exit_reason or 'unknown reason'}), so the pod's main "
+                        "container never starts"
+                    )
 
     if (
         evidence.memory_growth_bytes is not None

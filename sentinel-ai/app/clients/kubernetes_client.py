@@ -252,6 +252,50 @@ class KubernetesClient:
             ],
         }
 
+    @staticmethod
+    def _container_state_dict(cs: Any, is_init: bool) -> dict[str, Any]:
+        """Shared shape for both `container_statuses` and
+        `init_container_statuses` entries.
+
+        Same fields either way so the correlation layer can treat "a
+        container is crash-looping" identically regardless of which list it
+        came from, and tell them apart with a single `is_init` flag rather
+        than two differently-shaped dicts.
+        """
+        waiting = cs.state.waiting if cs.state else None
+        terminated = cs.state.terminated if cs.state else None
+        last_terminated = cs.last_state.terminated if cs.last_state else None
+        return {
+            "name": cs.name,
+            "image": cs.image,
+            "ready": cs.ready,
+            "restart_count": cs.restart_count or 0,
+            # waiting.reason is where CrashLoopBackOff and ImagePullBackOff
+            # actually live — for an init container this is where
+            # "Init:CrashLoopBackOff" shows up.
+            "waiting_reason": waiting.reason if waiting else None,
+            "terminated_reason": terminated.reason if terminated else None,
+            "last_terminated_reason": (
+                last_terminated.reason if last_terminated else None
+            ),
+            "exit_code": (
+                terminated.exit_code
+                if terminated is not None
+                else (last_terminated.exit_code if last_terminated is not None else None)
+            ),
+            "started_at": (
+                terminated.started_at.timestamp()
+                if terminated is not None and terminated.started_at
+                else None
+            ),
+            "finished_at": (
+                terminated.finished_at.timestamp()
+                if terminated is not None and terminated.finished_at
+                else None
+            ),
+            "is_init": is_init,
+        }
+
     # RBAC: core/pods: list
     async def list_pods(
         self, namespace: str, label_selector: str | None = None
@@ -262,6 +306,14 @@ class KubernetesClient:
         kube-state-metrics in this cluster, this API read is the *only* way
         Sentinel can see crash-loop behaviour — there is no
         `kube_pod_container_status_restarts_total` to query.
+
+        `container_states` now includes BOTH the pod's regular containers
+        AND its init containers (each tagged `is_init`). This matters
+        because a pod stuck on a failing init container never starts its
+        app container at all — `container_statuses` for the app container is
+        empty in that case, so without `init_container_statuses` Sentinel
+        would see nothing wrong with a pod that is actually
+        `Init:CrashLoopBackOff`.
         """
         self._require()
 
@@ -282,6 +334,7 @@ class KubernetesClient:
         out: list[dict[str, Any]] = []
         for pod in pods.items:
             statuses = pod.status.container_statuses or []
+            init_statuses = pod.status.init_container_statuses or []
             ready_conditions = [
                 c for c in (pod.status.conditions or []) if c.type == "Ready"
             ]
@@ -292,28 +345,11 @@ class KubernetesClient:
                     "ready": bool(ready_conditions and ready_conditions[0].status == "True"),
                     "restart_count": sum(cs.restart_count or 0 for cs in statuses),
                     "container_states": [
-                        {
-                            "name": cs.name,
-                            "ready": cs.ready,
-                            # waiting.reason is where CrashLoopBackOff and
-                            # ImagePullBackOff actually live.
-                            "waiting_reason": (
-                                cs.state.waiting.reason
-                                if cs.state and cs.state.waiting
-                                else None
-                            ),
-                            "terminated_reason": (
-                                cs.state.terminated.reason
-                                if cs.state and cs.state.terminated
-                                else None
-                            ),
-                            "last_terminated_reason": (
-                                cs.last_state.terminated.reason
-                                if cs.last_state and cs.last_state.terminated
-                                else None
-                            ),
-                        }
-                        for cs in statuses
+                        self._container_state_dict(cs, is_init=False) for cs in statuses
+                    ]
+                    + [
+                        self._container_state_dict(cs, is_init=True)
+                        for cs in init_statuses
                     ],
                     "start_time": (
                         pod.status.start_time.timestamp() if pod.status.start_time else None
@@ -321,6 +357,91 @@ class KubernetesClient:
                 }
             )
         return out
+
+    # Hard ceiling on tail_lines, independent of whatever a caller asks for.
+    # This is an evidence collector, not a log viewer: Sentinel only ever
+    # needs enough lines to see the failure reason (a traceback, a
+    # connection-refused line), not a full log dump, and an unbounded read
+    # against a noisy container would be a needless cost/latency risk on
+    # every investigation that touches it.
+    MAX_LOG_TAIL_LINES = 200
+    LOG_FETCH_TIMEOUT_SECONDS = 10.0
+
+    # RBAC: core/pods/log: get
+    async def get_container_logs(
+        self,
+        namespace: str,
+        pod: str,
+        container: str,
+        *,
+        tail_lines: int = 100,
+        previous: bool = False,
+    ) -> dict[str, Any]:
+        """Bounded tail of ONE explicitly named container's logs.
+
+        This is the only log-retrieval path in KubernetesClient, and it is
+        deliberately narrow: no shell, no `kubectl exec`, no "give me every
+        container in the namespace" mode. The caller (investigation.py) must
+        already know which pod and which container it wants — this method
+        never discovers that on its own — which keeps "the LLM can read any
+        log it likes" structurally impossible; only the deterministic
+        investigation layer decides what gets fetched.
+
+        `previous=True` reads the *last terminated* instance of the
+        container rather than the current one. For a container stuck in
+        CrashLoopBackOff, the running attempt is typically mid-backoff with
+        no output yet, so the previous attempt's log is usually the one that
+        actually explains the failure.
+
+        Returns a structured result rather than raising, because a log fetch
+        failing (RBAC, container not started yet, log already rotated) is
+        evidence-collection noise, not an incident.
+        """
+        self._require()
+        bounded_tail = max(1, min(tail_lines, self.MAX_LOG_TAIL_LINES))
+
+        def _call() -> Any:
+            return self._core.read_namespaced_pod_log(
+                name=pod,
+                namespace=namespace,
+                container=container,
+                tail_lines=bounded_tail,
+                previous=previous,
+                timestamps=True,
+                _request_timeout=self.LOG_FETCH_TIMEOUT_SECONDS,
+            )
+
+        try:
+            raw = await asyncio.to_thread(_call)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "k8s_get_container_logs_failed",
+                extra={
+                    "namespace": namespace,
+                    "pod": pod,
+                    "container": container,
+                    "previous": previous,
+                    "error_detail": str(exc)[:300],
+                },
+            )
+            return {
+                "pod": pod,
+                "container": container,
+                "previous": previous,
+                "available": False,
+                "error": str(exc)[:300],
+                "lines": [],
+            }
+
+        lines = (raw or "").splitlines()[-bounded_tail:]
+        return {
+            "pod": pod,
+            "container": container,
+            "previous": previous,
+            "available": True,
+            "error": None,
+            "lines": lines,
+        }
 
     # RBAC: core/events: list
     async def list_events(
@@ -565,6 +686,19 @@ class KubernetesClient:
         # Record on the Deployment what we did and why. Anyone running
         # `kubectl describe deploy` after the fact sees Sentinel's fingerprint
         # instead of a mysterious template change.
+        #
+        # IMPORTANT: this annotation is NOT the same counter as
+        # `deployment.kubernetes.io/revision`. `sentinel.sre/rolled-back-to`
+        # records the *source* ReplicaSet/revision whose pod template was
+        # restored — a historical, backward-looking number. The Deployment's
+        # own `deployment.kubernetes.io/revision` keeps moving forward: this
+        # very patch creates a brand-new revision (Kubernetes never reuses a
+        # revision number — see this method's docstring), and any later
+        # restart/rollback advances it further still. So it is expected and
+        # correct for these two numbers to diverge, e.g. `rolled-back-to: 52`
+        # sitting next to a Deployment now on revision 63 — they answer
+        # different questions ("whose template did we restore" vs. "how many
+        # template changes has this Deployment seen"), not the same one.
         template_dict["metadata"].setdefault("annotations", {})
         template_dict["metadata"]["annotations"]["sentinel.sre/rolled-back-to"] = str(
             target_revision
@@ -689,6 +823,7 @@ def find_previous_revision(
 # ClusterRole.
 REQUIRED_RBAC: tuple[dict[str, Any], ...] = (
     {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]},
+    {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
     {"apiGroups": [""], "resources": ["events"], "verbs": ["get", "list"]},
     {"apiGroups": [""], "resources": ["services"], "verbs": ["get", "list"]},
     {"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get", "list", "patch"]},

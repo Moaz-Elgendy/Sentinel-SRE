@@ -87,6 +87,86 @@ def test_bad_deployment_with_image_change_clears_the_rollback_gate(incident):
     assert h.confidence >= 0.95, "must clear the rollback threshold"
 
 
+# ---------------------------------------------------------------------------
+# Test 4 / Test 5 — the citizen-service regression: a bad deployment whose
+# image did NOT change (a bad env var / init-container config change) must
+# still clear the rollback gate when the init container itself is failing.
+# ---------------------------------------------------------------------------
+def test_bad_deployment_with_failing_init_container_clears_rollback_gate_even_without_image_change(
+    incident,
+):
+    """Test 4. This is the exact bug report: image_changed=False used to cap
+    confidence at 0.90, below the 0.95 rollback threshold, so the Policy
+    Engine denied the rollback and the action ladder fell through to a
+    restart that cannot fix a broken init container in the new ReplicaSet."""
+    h = analyse(
+        incident,
+        Evidence(),
+        findings(
+            deploy_correlates_with_onset=True,
+            previous_revision=52,
+            current_revision=53,
+            revision_count=2,
+            image_changed=False,
+            new_replicaset_unhealthy=True,
+            init_container_failing=True,
+            init_container_name="migrate-and-seed",
+            init_container_exit_reason="CrashLoopBackOff",
+        ),
+    )
+    assert h.root_cause is RootCause.BAD_DEPLOYMENT
+    assert h.recommended_action is RemediationAction.ROLLBACK_DEPLOYMENT
+    assert h.confidence >= 0.95, "must clear the rollback threshold without an image change"
+    assert "migrate-and-seed" in h.reasoning
+    assert "CrashLoopBackOff" in h.reasoning
+
+
+def test_bad_deployment_image_unchanged_without_init_failure_still_stays_below_gate(
+    incident,
+):
+    """Test 5 (no-regression check). Plain rollout-restart shape (image
+    unchanged, nothing else wrong) must still be held below the rollback
+    threshold exactly as before — this refinement only fires when
+    new_replicaset_unhealthy AND init_container_failing are BOTH true."""
+    h = analyse(
+        incident,
+        Evidence(),
+        findings(
+            deploy_correlates_with_onset=True,
+            previous_revision=2,
+            current_revision=3,
+            revision_count=3,
+            image_changed=False,
+            error_spike=True,
+        ),
+    )
+    assert h.root_cause is RootCause.BAD_DEPLOYMENT
+    assert h.confidence == 0.90
+    assert h.confidence < 0.95
+
+
+def test_init_container_failing_alone_does_not_authorise_bad_deployment_without_correlation(
+    incident,
+):
+    """Test 8. A failing init container by itself — with no recent deployment
+    correlating to it — must NOT become BAD_DEPLOYMENT. The existing
+    deployment-correlation precondition (branch order in rca.py) still gates
+    this refinement exactly as it gates the image-change path."""
+    h = analyse(
+        incident,
+        Evidence(),
+        findings(
+            deploy_correlates_with_onset=False,
+            new_replicaset_unhealthy=True,
+            init_container_failing=True,
+            init_container_name="migrate-and-seed",
+            init_container_exit_reason="CrashLoopBackOff",
+        ),
+    )
+    assert h.root_cause is not RootCause.BAD_DEPLOYMENT
+    assert h.recommended_action is not RemediationAction.ROLLBACK_DEPLOYMENT
+
+
 def test_bad_deployment_reasoning_includes_github_commit_when_available(incident):
     """GitHub correlation enriches the narrative but must NOT move confidence.
 

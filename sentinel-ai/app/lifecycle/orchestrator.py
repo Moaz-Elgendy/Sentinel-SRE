@@ -940,6 +940,27 @@ class Orchestrator:
             else "Kubernetes API unavailable; no cluster evidence",
             "evidence_kubernetes",
         )
+        # Only emitted when investigation.py actually identified and fetched
+        # a failing init container's logs — real evidence, not a scripted
+        # line, so a normal incident with no init-container involvement
+        # emits nothing here.
+        for log in evidence.init_container_logs:
+            if log.get("available"):
+                self._emit(
+                    incident,
+                    f"Init container {log.get('container')} on pod "
+                    f"{log.get('pod')} is failing; retrieved "
+                    f"{len(log.get('lines') or [])} log line(s)",
+                    "evidence_init_container",
+                )
+            else:
+                self._emit(
+                    incident,
+                    f"Init container {log.get('container')} on pod "
+                    f"{log.get('pod')} is failing; log retrieval failed "
+                    f"({log.get('error')})",
+                    "evidence_init_container",
+                )
         return evidence
 
     async def _health_probe(self, deployment: str) -> dict[str, Any]:

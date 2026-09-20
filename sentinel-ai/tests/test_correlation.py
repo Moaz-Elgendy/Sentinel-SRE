@@ -155,6 +155,88 @@ def test_no_previous_revision_does_not_crash_and_does_not_flag():
     assert findings.deploy_correlates_with_onset is False
 
 
+# ---------------------------------------------------------------------------
+# init_container_failing — the real citizen-service scenario: a healthy
+# ReplicaSet rollout whose new pod never gets past `migrate-and-seed`.
+# ---------------------------------------------------------------------------
+def _pod_with_container(
+    *,
+    name="citizen-service-79c68cbcf5-lwzwk",
+    container_name="migrate-and-seed",
+    is_init=True,
+    waiting_reason=None,
+    terminated_reason=None,
+    restart_count=3,
+):
+    return {
+        "name": name,
+        "phase": "Pending",
+        "ready": False,
+        "restart_count": restart_count,
+        "container_states": [
+            {
+                "name": container_name,
+                "image": "citizen-service:v2",
+                "ready": False,
+                "restart_count": restart_count,
+                "waiting_reason": waiting_reason,
+                "terminated_reason": terminated_reason,
+                "last_terminated_reason": "Error",
+                "exit_code": 1,
+                "started_at": None,
+                "finished_at": None,
+                "is_init": is_init,
+            }
+        ],
+    }
+
+
+def test_failing_init_container_is_detected_as_its_own_finding():
+    """Test 1: an init container waiting with CrashLoopBackOff sets
+    init_container_failing, distinct from (and in addition to) crash_looping."""
+    pods = [_pod_with_container(waiting_reason="CrashLoopBackOff")]
+    evidence = _surge_stuck_rollout_evidence(pods=pods)
+    findings = _correlate(evidence)
+
+    assert findings.init_container_failing is True
+    assert findings.init_container_name == "migrate-and-seed"
+    assert findings.init_container_exit_reason == "CrashLoopBackOff"
+    # new_replicaset_unhealthy is computed purely from ReplicaSet-level
+    # ready counts and must be unaffected by this change.
+    assert findings.new_replicaset_unhealthy is True
+
+
+def test_healthy_init_container_is_not_flagged():
+    """Test 7: a successfully completed init container is not a failure."""
+    pods = [
+        _pod_with_container(
+            waiting_reason=None, terminated_reason="Completed", restart_count=0
+        )
+    ]
+    evidence = _surge_stuck_rollout_evidence(pods=pods)
+    findings = _correlate(evidence)
+
+    assert findings.init_container_failing is False
+    assert findings.init_container_name is None
+
+
+def test_normal_container_crash_loop_does_not_set_init_container_failing():
+    """Test 6: an ordinary (non-init) container crash loop keeps working
+    exactly as before and is never mistaken for an init-container failure."""
+    pods = [
+        _pod_with_container(
+            container_name="citizen-service",
+            is_init=False,
+            waiting_reason="CrashLoopBackOff",
+        )
+    ]
+    evidence = _surge_stuck_rollout_evidence(pods=pods)
+    findings = _correlate(evidence)
+
+    assert findings.crash_looping is True
+    assert findings.init_container_failing is False
+
+
 def test_replicas_unavailable_path_still_works_independently():
     """Sanity check that the pre-existing aggregate-based signal is untouched."""
     evidence = _surge_stuck_rollout_evidence()
