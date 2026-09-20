@@ -137,17 +137,44 @@ def analyse(
     # Requires the deployment/onset correlation from CORRELATION, not just
     # "a deploy happened". The Policy Engine re-checks this independently.
     if findings.deploy_correlates_with_onset and findings.previous_revision is not None:
-        confidence = 0.96 if findings.image_changed else 0.90
-        image_note = (
-            "The container image changed between the previous and current "
-            "revision, so rolling back will genuinely change the running code."
-            if findings.image_changed
-            else "The image did NOT change between revisions, so the new "
-            "ReplicaSet is probably an annotation-only change such as a "
-            "rollout restart. Rolling back may therefore not change what is "
-            "running, which is why confidence is held below the rollback "
-            "threshold."
+        # An image change is the strongest single signal that a rollback
+        # would change what is running — but it is not the ONLY one. A new
+        # ReplicaSet whose init container fails on every attempt while the
+        # previous ReplicaSet still has a ready pod (`new_replicaset_unhealthy`,
+        # which already requires that) is equally strong evidence that THIS
+        # revision — not just its image — is what broke: the deployment can
+        # just as easily have changed an env var, a ConfigMap/Secret
+        # reference, a command/arg, or a volume, none of which show up as an
+        # image diff but all of which are still "what changed" a rollback
+        # would undo.
+        non_image_evidence = (
+            findings.new_replicaset_unhealthy and findings.init_container_failing
         )
+        confidence = 0.96 if (findings.image_changed or non_image_evidence) else 0.90
+        if findings.image_changed:
+            image_note = (
+                "The container image changed between the previous and current "
+                "revision, so rolling back will genuinely change the running "
+                "code."
+            )
+        elif non_image_evidence:
+            image_note = (
+                "The image did not change, but the new ReplicaSet's init "
+                f"container ({findings.init_container_name}) is failing with "
+                f"{findings.init_container_exit_reason or 'an unknown reason'} "
+                "while the previous ReplicaSet still has a ready pod — the "
+                "new revision itself never starts, regardless of the image, "
+                "which is direct evidence a rollback would fix this "
+                "independent of the image-diff check."
+            )
+        else:
+            image_note = (
+                "The image did NOT change between revisions, so the new "
+                "ReplicaSet is probably an annotation-only change such as a "
+                "rollout restart. Rolling back may therefore not change what is "
+                "running, which is why confidence is held below the rollback "
+                "threshold."
+            )
         commit_note = _commit_reasoning(evidence.deploy_commit)
         return _hypothesis(
             RootCause.BAD_DEPLOYMENT,
