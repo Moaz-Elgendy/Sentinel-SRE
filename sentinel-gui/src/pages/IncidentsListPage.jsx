@@ -1,232 +1,290 @@
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { listIncidents } from '../api/incidents.js'
-import { extractErrorMessage } from '../api/client.js'
-import AlertBanner from '../components/ui/AlertBanner.jsx'
-import Button from '../components/ui/Button.jsx'
-import Card from '../components/ui/Card.jsx'
-import EmptyState, { ErrorState } from '../components/ui/EmptyState.jsx'
-import Icon from '../components/ui/Icon.jsx'
-import LastUpdated from '../components/ui/LastUpdated.jsx'
-import { TableSkeleton } from '../components/ui/Loading.jsx'
-import PageHeader from '../components/ui/PageHeader.jsx'
-import Pagination from '../components/ui/Pagination.jsx'
-import SeverityBadge from '../components/ui/SeverityBadge.jsx'
-import StatusPill from '../components/ui/StatusPill.jsx'
-import Timestamp from '../components/ui/Timestamp.jsx'
-import { usePageTitle } from '../hooks/usePageTitle.js'
-import { usePolling } from '../hooks/usePolling.js'
-import { titleCase } from '../utils/format.js'
-import { effectiveIncidentStatus } from '../utils/status.js'
-
-const STATUS_FILTERS = [
-  { value: '', label: 'All statuses' },
-  { value: 'open', label: 'Open' },
-  { value: 'investigating', label: 'Investigating' },
-  { value: 'remediating', label: 'Remediating' },
-  { value: 'validating', label: 'Validating' },
-  { value: 'resolved', label: 'Resolved' },
-  { value: 'escalated', label: 'Escalated' },
-  { value: 'auto_resolved', label: 'Auto-resolved' },
-]
-
-const SEVERITY_FILTERS = [
-  { value: '', label: 'All severities' },
-  { value: 'critical', label: 'Critical' },
-  { value: 'warning', label: 'Warning' },
-  { value: 'info', label: 'Info' },
-]
+import { ArrowDownUp, CircleCheck, Hand, ListFilter, LoaderCircle, RefreshCw, Siren, TriangleAlert } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { FilterSelect, SearchInput } from '@/components/sentinel/FilterBar'
+import { IncidentCard } from '@/components/sentinel/IncidentCard'
+import { LifecycleRail } from '@/components/sentinel/LifecycleRail'
+import { Pager } from '@/components/sentinel/Pager'
+import { PageHeader } from '@/components/sentinel/PageHeader'
+import { EmptyState, ErrorState, SkeletonRows } from '@/components/sentinel/States'
+import { SeverityBadge } from '@/components/sentinel/SeverityBadge'
+import { StatusBadge } from '@/components/sentinel/StatusBadge'
+import { Timestamp } from '@/components/sentinel/Timestamp'
+import { TONE_TEXT } from '@/components/sentinel/tone'
+import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useNow } from '@/hooks/useNow'
+import { usePage } from '@/hooks/usePage'
+import { useIncidentList } from '@/hooks/useIncidentList'
+import { usePageTitle } from '@/hooks/usePageTitle'
+import { cn } from '@/lib/utils'
+import { formatSpan } from '@/utils/format'
+import {
+  actionSummary,
+  incidentDuration,
+  incidentHeadline,
+  incidentStatus,
+  isActiveIncident,
+  isAwaitingHuman,
+  isDiagnosed,
+  isResolvedIncident,
+  rootCauseLabel,
+} from '@/utils/incident'
 
 const PAGE_SIZE = 25
+
+const VIEWS = [
+  { value: 'all', label: 'All', test: () => true },
+  { value: 'active', label: 'In progress', test: isActiveIncident },
+  { value: 'attention', label: 'Needs you', test: isAwaitingHuman },
+  { value: 'resolved', label: 'Resolved', test: isResolvedIncident },
+]
+
+const SEVERITY_ORDER = { critical: 0, warning: 1, info: 2 }
+const SORTS = {
+  newest: { label: 'Newest first', cmp: (a, b) => b.created_at - a.created_at },
+  oldest: { label: 'Oldest first', cmp: (a, b) => a.created_at - b.created_at },
+  severity: { label: 'Severity', cmp: (a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9) || b.created_at - a.created_at },
+  longest: { label: 'Longest duration', cmp: (a, b) => incidentDuration(b) - incidentDuration(a) },
+}
+
+function ActionCell({ incident }) {
+  const summary = actionSummary(incident)
+  if (!summary) {
+    return <span className="text-muted-foreground">{isAwaitingHuman(incident) ? 'No action taken' : '—'}</span>
+  }
+  if (summary.kind === 'blocked') {
+    return (
+      <span className={cn('inline-flex items-center gap-1.5', TONE_TEXT.warn)} title={`${summary.label} was blocked by policy`}>
+        <TriangleAlert aria-hidden="true" className="size-3.5" /> Blocked: {summary.label.toLowerCase()}
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      {summary.ok ? <CircleCheck aria-label="Succeeded" className={cn('size-3.5', TONE_TEXT.ok)} /> : <TriangleAlert aria-label="Did not succeed" className={cn('size-3.5', TONE_TEXT.bad)} />}
+      {summary.label}
+      {summary.human && <span className="rounded border px-1 text-[11px] text-muted-foreground">SRE</span>}
+      {summary.dryRun && <span className="rounded border px-1 text-[11px] text-muted-foreground">Dry run</span>}
+    </span>
+  )
+}
+
+function Duration({ incident }) {
+  const active = isActiveIncident(incident)
+  const now = useNow(active ? 1000 : 60000)
+  return <span className="tnum">{formatSpan(incidentDuration(incident, now / 1000))}</span>
+}
 
 export default function IncidentsListPage() {
   usePageTitle('Incidents')
   const navigate = useNavigate()
-
-  // Filters live in the URL, so opening an incident and pressing Back returns
-  // to exactly the same filtered, paged view.
   const [params, setParams] = useSearchParams()
-  const status = params.get('status') ?? ''
-  const severity = params.get('severity') ?? ''
-  const query = params.get('q') ?? ''
-  const offset = Number(params.get('offset') ?? 0) || 0
+  const { incidents, loading, error, refetch, canLoadOlder, loadOlder, loadingOlder, olderError } = useIncidentList()
 
-  function updateParams(changes) {
-    const next = new URLSearchParams(params)
-    for (const [key, value] of Object.entries(changes)) {
-      if (value === '' || value == null || value === 0) next.delete(key)
-      else next.set(key, String(value))
-    }
-    setParams(next, { replace: true })
-  }
+  const view = VIEWS.some((v) => v.value === params.get('view')) ? params.get('view') : 'all'
+  const [query, setQuery] = useState('')
+  const [severity, setSeverity] = useState('all')
+  const [service, setService] = useState('all')
+  const [sort, setSort] = useState('newest')
+  const [page, setPage] = usePage(`${view}|${query}|${severity}|${service}|${sort}`)
 
-  const { data, error, loading, busy, updatedAt, refetch } = usePolling(
-    () => listIncidents({ status: status || null, limit: PAGE_SIZE, offset }),
-    { intervalMs: 6000, resetKey: `${status}|${offset}` }
-  )
+  const services = useMemo(() => [...new Set(incidents.map((i) => i.app).filter(Boolean))].sort(), [incidents])
 
-  if (loading && !data) return <TableSkeleton label="Loading incidents…" />
-  if (!data) {
-    return (
-      <ErrorState
-        title="Couldn't load incidents"
-        message={extractErrorMessage(error, 'Sentinel did not respond.')}
-        onRetry={refetch}
-      />
-    )
-  }
+  const counts = useMemo(() => Object.fromEntries(VIEWS.map((v) => [v.value, incidents.filter(v.test).length])), [incidents])
 
-  // Severity and text search refine the page already loaded; status and paging
-  // are handled by the server. The count line says so.
-  const needle = query.trim().toLowerCase()
-  const rows = data.incidents.filter((incident) => {
-    if (severity && incident.severity !== severity) return false
-    if (!needle) return true
-    return [incident.id, incident.app, incident.phase, incident.status]
-      .filter(Boolean)
-      .some((value) => String(value).toLowerCase().includes(needle))
-  })
-  const isRefining = Boolean(severity || needle)
-  const hasAnyFilter = Boolean(status || isRefining)
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    const test = VIEWS.find((v) => v.value === view).test
+    return incidents
+      .filter(test)
+      .filter((i) => severity === 'all' || i.severity === severity)
+      .filter((i) => service === 'all' || i.app === service)
+      .filter((i) => {
+        if (!q) return true
+        const haystack = [i.id, i.alertname, i.app, i.namespace, i.summary, i.hypothesis?.root_cause && rootCauseLabel(i.hypothesis.root_cause)]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+        return haystack.includes(q)
+      })
+      .sort(SORTS[sort].cmp)
+  }, [incidents, view, query, severity, service, sort])
 
-  function clearFilters() {
-    setParams(new URLSearchParams(), { replace: true })
+  const pageRows = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+  const hasFilters = query || severity !== 'all' || service !== 'all'
+
+  function setView(next) {
+    const copy = new URLSearchParams(params)
+    if (next === 'all') copy.delete('view')
+    else copy.set('view', next)
+    setParams(copy, { replace: true })
   }
 
   return (
-    <div className="page">
+    <div className="space-y-4">
       <PageHeader
         title="Incidents"
-        subtitle="Every incident Sentinel has detected, newest first."
-        actions={<LastUpdated updatedAt={updatedAt} stale={Boolean(error)} busy={busy} />}
+        description="Every incident Sentinel has detected: what it found, what it did, and how it ended."
+        actions={
+          <Button variant="outline" size="sm" onClick={refetch}>
+            <RefreshCw /> Refresh
+          </Button>
+        }
       />
 
-      {error && (
-        <AlertBanner tone="warn" title="Showing the last data received">
-          {extractErrorMessage(error, 'Could not refresh incidents.')} Retrying automatically.
-        </AlertBanner>
-      )}
+      <Tabs value={view} onValueChange={setView}>
+        <TabsList variant="line" className="h-9 w-full justify-start border-b px-0">
+          {VIEWS.map((v) => (
+            <TabsTrigger key={v.value} value={v.value} className="flex-none px-3">
+              {v.value === 'attention' && <Hand />}
+              {v.label}
+              <span className={cn('tnum rounded px-1 text-[11px]', v.value === 'attention' && counts.attention > 0 ? 'bg-warn-tint text-warn' : 'bg-muted text-muted-foreground')}>{counts[v.value]}</span>
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </Tabs>
 
-      <Card flush>
-        <div className="toolbar" role="search">
-          <div className="input-group toolbar__search">
-            <Icon name="search" size={14} />
-            <input
-              type="search"
-              className="input"
-              placeholder="Filter this page by ID, app or phase"
-              aria-label="Filter incidents on this page by ID, application or phase"
-              value={query}
-              onChange={(e) => updateParams({ q: e.target.value })}
-            />
-          </div>
-          <label className="toolbar__filter">
-            <span className="sr-only">Status</span>
-            <select
-              className="select"
-              value={status}
-              onChange={(e) => updateParams({ status: e.target.value, offset: 0 })}
-              aria-label="Status"
-            >
-              {STATUS_FILTERS.map((f) => (
-                <option key={f.value} value={f.value}>
-                  {f.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="toolbar__filter">
-            <span className="sr-only">Severity</span>
-            <select
-              className="select"
-              value={severity}
-              onChange={(e) => updateParams({ severity: e.target.value })}
-              aria-label="Severity"
-            >
-              {SEVERITY_FILTERS.map((f) => (
-                <option key={f.value} value={f.value}>
-                  {f.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          {hasAnyFilter && (
-            <Button variant="ghost" size="sm" onClick={clearFilters}>
-              Clear filters
-            </Button>
-          )}
-          <span className="toolbar__spacer" />
-          <span className="toolbar__count" aria-live="polite">
-            {isRefining ? `${rows.length} of ${data.incidents.length} on this page match` : `${data.count} total`}
-          </span>
-        </div>
-
-        {rows.length === 0 ? (
-          hasAnyFilter ? (
-            <EmptyState
-              icon="search"
-              title="No incidents match these filters"
-              description={
-                isRefining && data.incidents.length > 0
-                  ? 'Severity and search only apply to the incidents on this page. Try clearing them, or move to another page.'
-                  : 'Try a different status, or clear the filters.'
-              }
-              action={<Button onClick={clearFilters}>Clear filters</Button>}
-            />
-          ) : (
-            <EmptyState
-              title="No incidents recorded yet"
-              description="Sentinel hasn't detected an incident. When it does, it appears here with its full timeline."
-            />
-          )
-        ) : (
-          <div className="table-wrap" aria-busy={busy || undefined}>
-            <table className="table table--interactive table--pin-first">
-              <caption className="sr-only">Incidents, newest first</caption>
-              <thead>
-                <tr>
-                  <th scope="col">Incident</th>
-                  <th scope="col">Application</th>
-                  <th scope="col">Severity</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Phase</th>
-                  <th scope="col">Started</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((incident) => (
-                  <tr key={incident.id} onClick={() => navigate(`/incidents/${incident.id}`)}>
-                    <td>
-                      <Link to={`/incidents/${incident.id}`} className="link link--mono" onClick={(e) => e.stopPropagation()}>
-                        {incident.id}
-                      </Link>
-                    </td>
-                    <td>{incident.app}</td>
-                    <td>
-                      <SeverityBadge severity={incident.severity} />
-                    </td>
-                    <td>
-                      <StatusPill status={effectiveIncidentStatus(incident)} />
-                    </td>
-                    <td className="muted">{titleCase(incident.phase)}</td>
-                    <td className="muted">
-                      <Timestamp epoch={incident.created_at} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        <Pagination
-          offset={offset}
-          pageSize={PAGE_SIZE}
-          total={data.count}
-          onChange={(next) => updateParams({ offset: next })}
-          previousLabel="Newer"
-          nextLabel="Older"
+      <div className="flex flex-wrap items-center gap-2">
+        <SearchInput value={query} onChange={setQuery} placeholder="Search by ID, alert, service or diagnosis" className="w-full sm:w-80" label="Search incidents" />
+        <FilterSelect
+          label="Severity"
+          value={severity}
+          onChange={setSeverity}
+          width="w-40"
+          options={[
+            { value: 'all', label: 'All' },
+            { value: 'critical', label: 'Critical' },
+            { value: 'warning', label: 'Warning' },
+            { value: 'info', label: 'Info' },
+          ]}
         />
+        <FilterSelect label="Service" value={service} onChange={setService} width="w-52" options={[{ value: 'all', label: 'All' }, ...services.map((s) => ({ value: s, label: s }))]} />
+        <FilterSelect label="Sort" value={sort} onChange={setSort} width="w-52" options={Object.entries(SORTS).map(([value, s]) => ({ value, label: s.label }))} />
+        {hasFilters && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setQuery('')
+              setSeverity('all')
+              setService('all')
+            }}
+          >
+            Clear filters
+          </Button>
+        )}
+        <div className="ml-auto">
+          <Pager page={page} pageSize={PAGE_SIZE} total={filtered.length} onPageChange={setPage} noun="incidents" />
+        </div>
+      </div>
+
+      <Card className="gap-0 overflow-hidden">
+        {loading ? (
+          <SkeletonRows rows={8} />
+        ) : error ? (
+          <ErrorState title="Could not load incidents" onRetry={refetch} />
+        ) : filtered.length === 0 ? (
+          <EmptyState
+            icon={hasFilters ? ListFilter : Siren}
+            title={hasFilters ? 'No incidents match these filters' : view === 'attention' ? 'Nothing is waiting on you' : 'No incidents yet'}
+            description={
+              hasFilters
+                ? 'Try a broader search or clear the filters.'
+                : view === 'attention'
+                  ? 'Every incident Sentinel escalated has been decided.'
+                  : 'When Alertmanager fires an alert, Sentinel opens an incident here and works it end to end.'
+            }
+          />
+        ) : (
+          <>
+            {/* Phones get the same incident cards as the command center: a table would clip status and time. */}
+            <ul className="divide-y md:hidden">
+              {pageRows.map((incident) => (
+                <li key={incident.id}>
+                  <IncidentCard incident={incident} />
+                </li>
+              ))}
+            </ul>
+          <Table className="hidden md:table">
+            <TableHeader>
+              <TableRow className="hover:bg-transparent">
+                <TableHead>Incident</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead className="hidden xl:table-cell">Lifecycle</TableHead>
+                <TableHead className="hidden lg:table-cell">Diagnosis and action</TableHead>
+                <TableHead className="hidden md:table-cell">
+                  <span className="inline-flex items-center gap-1">
+                    <ArrowDownUp aria-hidden="true" className="size-3" /> Duration
+                  </span>
+                </TableHead>
+                <TableHead className="text-right">Started</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {pageRows.map((incident) => (
+                <TableRow
+                  key={incident.id}
+                  tabIndex={0}
+                  onClick={() => navigate(`/incidents/${incident.id}`)}
+                  onKeyDown={(e) => e.key === 'Enter' && navigate(`/incidents/${incident.id}`)}
+                  className="cursor-pointer focus-visible:bg-muted/60 focus-visible:outline-none"
+                >
+                  <TableCell className="max-w-96 whitespace-normal">
+                    <div className="flex items-center gap-2">
+                      <SeverityBadge severity={incident.severity} iconOnly />
+                      <span className="truncate font-medium">{incident.alertname}</span>
+                      <span className="truncate text-muted-foreground">on {incident.app ?? '—'}</span>
+                    </div>
+                    <p className="mt-0.5 truncate text-xs text-muted-foreground">
+                      <span className="font-mono">{incident.id}</span> <span className="ml-1">{incidentHeadline(incident)}</span>
+                    </p>
+                  </TableCell>
+                  <TableCell>
+                    <StatusBadge status={incidentStatus(incident)} />
+                  </TableCell>
+                  <TableCell className="hidden w-44 xl:table-cell">
+                    <LifecycleRail incident={incident} variant="mini" />
+                  </TableCell>
+                  <TableCell className="hidden lg:table-cell">
+                    {isDiagnosed(incident) ? (
+                      <p>
+                        {rootCauseLabel(incident.hypothesis.root_cause)} <span className="tnum text-xs text-muted-foreground">{Math.round(incident.hypothesis.confidence * 100)}%</span>
+                      </p>
+                    ) : (
+                      <p className="text-muted-foreground">{isActiveIncident(incident) ? 'Diagnosing…' : 'Not diagnosed'}</p>
+                    )}
+                    <div className="mt-0.5 text-xs">
+                      <ActionCell incident={incident} />
+                    </div>
+                  </TableCell>
+                  <TableCell className="hidden md:table-cell">
+                    <Duration incident={incident} />
+                  </TableCell>
+                  <TableCell className="text-right text-muted-foreground">
+                    <Timestamp value={incident.created_at} />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          </>
+        )}
       </Card>
+
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs text-muted-foreground">
+          {canLoadOlder ? `Showing the newest ${incidents.length} incidents.` : `${incidents.length} incident${incidents.length === 1 ? '' : 's'} loaded.`}
+          {olderError && <span className={cn('ml-2', TONE_TEXT.bad)}>{olderError}</span>}
+        </p>
+        {canLoadOlder && (
+          <Button variant="outline" size="sm" onClick={loadOlder} disabled={loadingOlder}>
+            {loadingOlder && <LoaderCircle className="animate-spin" />} Load older incidents
+          </Button>
+        )}
+      </div>
     </div>
   )
 }

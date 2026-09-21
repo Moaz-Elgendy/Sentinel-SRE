@@ -14,6 +14,15 @@ export function getIncident(incidentId) {
 // else in the GUI API, so a plain <a href> can't be used - a browser
 // navigation can't carry the Authorization header. Fetch it as a blob
 // through the authenticated client instead and open it in a new tab.
+/**
+ * Asks Sentinel to run a fresh investigation of an escalated incident
+ * (POST /api/incidents/{id}/reinvestigate — sentinel-ai/app/routers/reinvestigate.py).
+ * The backend endpoint already existed; the console simply never exposed it.
+ */
+export function reinvestigateIncident(incidentId) {
+  return client.post(`/api/incidents/${incidentId}/reinvestigate`).then((r) => r.data)
+}
+
 export async function openIncidentDocument(incidentId) {
   const response = await client.get(`/api/incidents/${incidentId}/document`, {
     responseType: 'blob',

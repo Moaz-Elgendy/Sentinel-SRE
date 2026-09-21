@@ -1,256 +1,198 @@
-import { useCallback, useEffect, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
-import { extractErrorMessage } from '../api/client.js'
-import { listIncidentFeedback, submitDiagnosisFeedback, submitRemediationFeedback } from '../api/feedback.js'
-import { openIncidentDocument } from '../api/incidents.js'
-import { getLifecyclePhases, listActionTypes, listRootCauses } from '../api/meta.js'
-import AuditTimeline from '../components/incident/AuditTimeline.jsx'
-import AuthorizationPanel from '../components/incident/AuthorizationPanel.jsx'
-import DecisionActionPanel from '../components/incident/DecisionActionPanel.jsx'
-import EvidencePanel from '../components/incident/EvidencePanel.jsx'
-import FeedbackForm from '../components/incident/FeedbackForm.jsx'
-import LiveFlowDiagram from '../components/incident/LiveFlowDiagram.jsx'
-import ReasoningPanel from '../components/incident/ReasoningPanel.jsx'
-import AlertBanner from '../components/ui/AlertBanner.jsx'
-import Button from '../components/ui/Button.jsx'
-import Card from '../components/ui/Card.jsx'
-import CopyButton from '../components/ui/CopyButton.jsx'
-import EmptyState from '../components/ui/EmptyState.jsx'
-import { DetailSkeleton } from '../components/ui/Loading.jsx'
-import LiveBadge from '../components/ui/LiveBadge.jsx'
-import PageHeader from '../components/ui/PageHeader.jsx'
-import SeverityBadge from '../components/ui/SeverityBadge.jsx'
-import StatusPill from '../components/ui/StatusPill.jsx'
-import Timestamp from '../components/ui/Timestamp.jsx'
-import { useToast } from '../components/ui/Toast.jsx'
-import { useLiveIncident } from '../hooks/useLiveIncident.js'
-import { usePageTitle } from '../hooks/usePageTitle.js'
-import { formatDuration, formatPercent, formatTimestamp, titleCase } from '../utils/format.js'
-import { effectiveIncidentStatus } from '../utils/status.js'
+import { FileText, LoaderCircle, SearchX } from 'lucide-react'
+import { useState } from 'react'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { extractErrorMessage } from '@/api/client'
+import { openIncidentDocument } from '@/api/incidents'
+import { AttentionPanel } from '@/components/incident/AttentionPanel'
+import { DecisionSection } from '@/components/incident/DecisionSection'
+import { DiagnosisSection } from '@/components/incident/DiagnosisSection'
+import { EvidenceTab } from '@/components/incident/EvidenceTab'
+import { FactsPanel } from '@/components/incident/FactsPanel'
+import { FeedbackTab } from '@/components/incident/FeedbackTab'
+import { ObservedSection } from '@/components/incident/ObservedSection'
+import { TimelineTab } from '@/components/incident/TimelineTab'
+import { LogViewer } from '@/components/logs/LogViewer'
+import { CopyButton } from '@/components/sentinel/CopyButton'
+import { LifecycleRail } from '@/components/sentinel/LifecycleRail'
+import { Panel } from '@/components/sentinel/Panel'
+import { EmptyState, ErrorState, SkeletonRows } from '@/components/sentinel/States'
+import { SeverityBadge } from '@/components/sentinel/SeverityBadge'
+import { LiveDot, StatusBadge } from '@/components/sentinel/StatusBadge'
+import { Timestamp } from '@/components/sentinel/Timestamp'
+import { TONE_SURFACE, TONE_TEXT } from '@/components/sentinel/tone'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useLiveIncident } from '@/hooks/useLiveIncident'
+import { useNow } from '@/hooks/useNow'
+import { usePageTitle } from '@/hooks/usePageTitle'
+import { useRcaThresholds } from '@/hooks/useRcaThresholds'
+import { notify } from '@/lib/notify'
+import { cn } from '@/lib/utils'
+import { formatSpan } from '@/utils/format'
+import { durationLabel, incidentDuration, incidentHeadline, incidentOutcome, incidentStatus, isActiveIncident, isAwaitingHuman } from '@/utils/incident'
 
-const TERMINAL_STATUSES = new Set(['resolved', 'escalated', 'auto_resolved'])
+const TABS = ['investigation', 'evidence', 'timeline', 'logs', 'feedback']
 
-function SummaryItem({ label, children }) {
+function OutcomeStrip({ incident, now }) {
+  const outcome = incidentOutcome(incident, now / 1000)
+  if (outcome.kind === 'awaiting') return null // the attention panel owns this state
   return (
-    <div className="summary__item">
-      <div className="eyebrow">{label}</div>
-      <div className="summary__value">{children}</div>
+    <div className={cn('mt-4 flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded-md border px-3.5 py-2.5', TONE_SURFACE[outcome.tone])}>
+      <p className={cn('text-sm font-semibold', TONE_TEXT[outcome.tone])}>{outcome.title}</p>
+      {outcome.kind !== 'in_progress' && outcome.duration != null && <p className="tnum text-sm">in {formatSpan(outcome.duration)}</p>}
+      {outcome.detail && <p className="min-w-0 text-sm text-muted-foreground">{outcome.detail}</p>}
     </div>
   )
-}
-
-function outcomeText(incident) {
-  if (incident.status === 'escalated') return 'Waiting for an SRE'
-  if ((incident.status === 'resolved' || incident.status === 'auto_resolved') && incident.resolved_at != null) {
-    return `Recovered in ${formatDuration(incident.resolved_at - incident.created_at)}`
-  }
-  if (TERMINAL_STATUSES.has(incident.status)) return titleCase(incident.status)
-  return `Phase: ${titleCase(incident.phase)}`
 }
 
 export default function IncidentDetailPage() {
   const { incidentId } = useParams()
   usePageTitle(incidentId)
-  const toast = useToast()
-  const [phaseMeta, setPhaseMeta] = useState(null)
-  const [rootCauses, setRootCauses] = useState([])
-  const [actionTypes, setActionTypes] = useState([])
-  const [feedback, setFeedback] = useState([])
-  const [openingReport, setOpeningReport] = useState(false)
-
-  useEffect(() => {
-    getLifecyclePhases()
-      .then(setPhaseMeta)
-      .catch(() => setPhaseMeta(null))
-    listRootCauses()
-      .then(setRootCauses)
-      .catch(() => setRootCauses([]))
-    listActionTypes()
-      .then(setActionTypes)
-      .catch(() => setActionTypes([]))
-  }, [])
-
-  const refreshFeedback = useCallback(() => {
-    listIncidentFeedback(incidentId)
-      .then(setFeedback)
-      .catch(() => setFeedback([]))
-  }, [incidentId])
-
-  useEffect(() => {
-    refreshFeedback()
-  }, [refreshFeedback])
-
-  // useLiveIncident (Phase B): instant re-fetch on a real SSE event for
-  // this incident, plus a slow fallback poll — see hooks/useLiveIncident.js.
+  const [params, setParams] = useSearchParams()
   const { incident, error, loading } = useLiveIncident(incidentId)
+  const limits = useRcaThresholds()
+  const [openingReport, setOpeningReport] = useState(false)
+  const active = incident ? isActiveIncident(incident) : false
+  const now = useNow(active ? 1000 : 30000)
+  const [refreshKey, setRefreshKey] = useState(0)
 
-  async function handleOpenReport() {
+  const tab = TABS.includes(params.get('tab')) ? params.get('tab') : 'investigation'
+
+  async function openReport() {
     setOpeningReport(true)
     try {
       await openIncidentDocument(incidentId)
     } catch (err) {
-      toast(extractErrorMessage(err, 'Could not open the incident report.'), { tone: 'error' })
+      notify.error(extractErrorMessage(err, 'Could not open the incident report.'))
     } finally {
       setOpeningReport(false)
     }
   }
 
-  if (loading && !incident) return <DetailSkeleton label="Loading incident…" />
-
-  if (!incident) {
+  if (loading && !incident) {
     return (
-      <div className="page">
-        <PageHeader title={<span className="mono">{incidentId}</span>} breadcrumb={[{ to: '/incidents', label: 'Incidents' }]} />
-        <Card>
-          <EmptyState
-            icon="alertCircle"
-            title="Couldn't load this incident"
-            description={extractErrorMessage(error, 'It may not exist, or Sentinel may be unreachable.')}
-            action={
-              <Link to="/incidents" className="button">
-                Back to incidents
-              </Link>
-            }
-          />
-        </Card>
+      <div className="space-y-4" aria-busy="true">
+        <SkeletonRows rows={2} className="p-0" />
+        <SkeletonRows rows={5} className="p-0" />
       </div>
     )
   }
 
-  const isTerminal = TERMINAL_STATUSES.has(incident.status)
-  const hypothesis = incident.hypothesis
-  const diagnosisFeedback = feedback.filter((f) => f.kind === 'diagnosis')
-  const remediationFeedback = feedback.filter((f) => f.kind === 'remediation')
-  const showFeedback = Boolean(hypothesis) || incident.attempts?.length > 0
+  if (!incident) {
+    const notFound = error?.response?.status === 404
+    return (
+      <div className="rounded-lg border bg-card">
+        {notFound ? (
+          <EmptyState
+            icon={SearchX}
+            title="Incident not found"
+            description={`There is no incident with ID ${incidentId}. It may have been mistyped, or belong to another environment.`}
+            action={
+              <Button asChild variant="outline">
+                <Link to="/incidents">Back to incidents</Link>
+              </Button>
+            }
+          />
+        ) : (
+          <ErrorState title="Couldn’t load this incident" message={extractErrorMessage(error, 'Sentinel may be unreachable.')} onRetry={() => window.location.reload()} />
+        )}
+      </div>
+    )
+  }
+
+  const awaiting = isAwaitingHuman(incident)
+  const hasReport = Boolean(incident.documentation?.markdown)
+  const showFeedback = Boolean(incident.hypothesis) || (incident.attempts?.length ?? 0) > 0
 
   return (
-    <div className="page">
-      <PageHeader
-        breadcrumb={[{ to: '/incidents', label: 'Incidents' }]}
-        title={<span className="mono">{incident.id}</span>}
-        titleExtra={
-          <>
-            <CopyButton value={incident.id} label="Copy incident ID" />
-            <StatusPill size="lg" status={effectiveIncidentStatus(incident)} />
-            <SeverityBadge severity={incident.severity} />
-            {!isTerminal && <LiveBadge />}
-          </>
-        }
-        subtitle={
-          <>
-            {incident.app} · {incident.namespace} · <span className="mono">{incident.alertname}</span>
-          </>
-        }
-        actions={
-          isTerminal && (
-            <Button icon="externalLink" onClick={handleOpenReport} busy={openingReport} busyLabel="Opening…">
-              Open incident report
-            </Button>
-          )
-        }
-      />
-
-      {error && (
-        <AlertBanner tone="warn" title="Showing the last data received">
-          {extractErrorMessage(error, 'Could not refresh this incident.')} Retrying automatically.
-        </AlertBanner>
-      )}
-
-      {/* What happened, at a glance — every value here comes from the record. */}
-      <section className="card summary" aria-label="Incident summary">
-        <SummaryItem label="Outcome">{outcomeText(incident)}</SummaryItem>
-        <SummaryItem label="Started">
-          <Timestamp epoch={incident.created_at} />
-          <span className="summary__sub">{formatTimestamp(incident.created_at)}</span>
-        </SummaryItem>
-        <SummaryItem label="Diagnosis">
-          {hypothesis ? (
-            <>
-              {titleCase(hypothesis.root_cause)}
-              <span className="summary__sub">{formatPercent(hypothesis.confidence)} confidence</span>
-            </>
-          ) : (
-            <span className="muted">Pending</span>
-          )}
-        </SummaryItem>
-        <SummaryItem label="Recommended action">
-          {hypothesis ? titleCase(hypothesis.recommended_action) : <span className="muted">Pending</span>}
-        </SummaryItem>
-      </section>
-
-      {/* When Sentinel has escalated, the one thing that needs a human comes first. */}
-      {incident.status === 'escalated' && (
-        <Card
-          tone="warn"
-          title="Action required — temporary human authorization"
-          description="Sentinel couldn't act safely on its own. You can authorize one action for this incident."
-        >
-          <AuthorizationPanel incident={incident} actionTypes={actionTypes} />
-        </Card>
-      )}
-
-      <div className="incident-layout">
-        <aside className="incident-layout__rail" aria-label="Sentinel operations">
-          <Card title="Sentinel operations">
-            <LiveFlowDiagram incident={incident} phaseMeta={phaseMeta} />
-          </Card>
-        </aside>
-
-        <div className="incident-layout__main stack">
-          <Card title="Diagnosis & reasoning" description="Sentinel's interpretation of the evidence.">
-            <ReasoningPanel hypothesis={hypothesis} />
-          </Card>
-
-          <Card title="Decision & remediation" description="What Sentinel planned, whether policy allowed it, and what happened.">
-            <DecisionActionPanel attempts={incident.attempts} />
-          </Card>
-
-          <Card title="Evidence" description="Facts collected from the system — no interpretation.">
-            <EvidencePanel evidence={incident.evidence} />
-          </Card>
-
-          {showFeedback && (
-            <Card
-              title="Feedback"
-              description="Records how accurate Sentinel was. Submitting feedback does not change Sentinel's behavior."
-            >
-              <div className="stack stack--lg">
-                {hypothesis && (
-                  <FeedbackForm
-                    question="Was the diagnosis correct?"
-                    correctionLabel="What was the actual root cause?"
-                    options={rootCauses}
-                    history={diagnosisFeedback}
-                    onSubmit={({ answer, correction, note }) =>
-                      submitDiagnosisFeedback(incident.id, { correct: answer, actualRootCause: correction, note }).then(
-                        refreshFeedback
-                      )
-                    }
-                  />
-                )}
-                {hypothesis && incident.attempts?.length > 0 && <hr className="divider" />}
-                {incident.attempts?.length > 0 && (
-                  <FeedbackForm
-                    question="Was the remediation useful?"
-                    correctionLabel="What should Sentinel have done instead?"
-                    options={actionTypes}
-                    history={remediationFeedback}
-                    onSubmit={({ answer, correction, note }) =>
-                      submitRemediationFeedback(incident.id, { useful: answer, suggestedAction: correction, note }).then(
-                        refreshFeedback
-                      )
-                    }
-                  />
-                )}
-              </div>
-            </Card>
-          )}
-
-          <Card title="Audit timeline" description="Every recorded event, oldest first.">
-            <AuditTimeline timeline={incident.timeline} />
-          </Card>
+    <div className="space-y-4">
+      <header className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <h1 className="flex min-w-0 items-center gap-2 text-xl leading-7 font-semibold tracking-tight">
+              <SeverityBadge severity={incident.severity} iconOnly />
+              <span className="truncate">{incident.alertname}</span>
+              <span className="font-normal text-muted-foreground">on {incident.app ?? 'unknown'}</span>
+            </h1>
+            <StatusBadge status={incidentStatus(incident)} />
+            {(incident.occurrence ?? 1) > 1 && <Badge variant="outline">Occurrence #{incident.occurrence}</Badge>}
+          </div>
+          <p className="mt-1.5 max-w-3xl text-sm text-muted-foreground">{incidentHeadline(incident)}</p>
+          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-0.5 font-mono">
+              {incident.id}
+              <CopyButton value={incident.id} label="Copy incident ID" className="size-6" />
+            </span>
+            <span>
+              Started <Timestamp value={incident.created_at} />
+            </span>
+            <span className="tnum">{durationLabel(incident)} {formatSpan(incidentDuration(incident, now / 1000))}</span>
+            {active && (
+              <span className={cn('inline-flex items-center gap-1.5 font-medium', TONE_TEXT.info)}>
+                <LiveDot /> Updating live
+              </span>
+            )}
+          </div>
         </div>
-      </div>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span tabIndex={hasReport ? -1 : 0}>
+              <Button variant="outline" size="sm" onClick={openReport} disabled={!hasReport || openingReport}>
+                {openingReport ? <LoaderCircle className="animate-spin" /> : <FileText />} Open incident report
+              </Button>
+            </span>
+          </TooltipTrigger>
+          <TooltipContent>{hasReport ? 'The post-mortem Sentinel generated, in a new tab' : 'Sentinel writes the report at the end of the lifecycle'}</TooltipContent>
+        </Tooltip>
+      </header>
+
+      <Panel title="Lifecycle" description="Where this incident is, and where time went">
+        <LifecycleRail incident={incident} variant="full" />
+        <OutcomeStrip incident={incident} now={now} />
+      </Panel>
+
+      {awaiting && <AttentionPanel incident={incident} onChanged={() => setRefreshKey((k) => k + 1)} key={`${incident.id}-${refreshKey}`} />}
+
+      <Tabs value={tab} onValueChange={(next) => { const copy = new URLSearchParams(params); if (next === 'investigation') copy.delete('tab'); else copy.set('tab', next); setParams(copy, { replace: true }) }}>
+        <TabsList variant="line" className="h-9 w-full justify-start border-b px-0">
+          <TabsTrigger value="investigation" className="flex-none px-3">Investigation</TabsTrigger>
+          <TabsTrigger value="evidence" className="flex-none px-3">Evidence</TabsTrigger>
+          <TabsTrigger value="timeline" className="flex-none px-3">
+            Timeline <span className="tnum rounded bg-muted px-1 text-[11px] text-muted-foreground">{incident.timeline?.length ?? 0}</span>
+          </TabsTrigger>
+          <TabsTrigger value="logs" className="flex-none px-3">Sentinel logs</TabsTrigger>
+          {showFeedback && <TabsTrigger value="feedback" className="flex-none px-3">Feedback</TabsTrigger>}
+        </TabsList>
+
+        <TabsContent value="investigation" className="pt-4">
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_20rem]">
+            <div className="min-w-0 space-y-4">
+              <ObservedSection incident={incident} limits={limits} />
+              <DiagnosisSection incident={incident} />
+              <DecisionSection incident={incident} />
+            </div>
+            <aside className="min-w-0 xl:sticky xl:top-16 xl:self-start" aria-label="Incident facts">
+              <FactsPanel incident={incident} now={now} />
+            </aside>
+          </div>
+        </TabsContent>
+        <TabsContent value="evidence" className="pt-4">
+          <EvidenceTab incident={incident} />
+        </TabsContent>
+        <TabsContent value="timeline" className="pt-4">
+          <TimelineTab incident={incident} />
+        </TabsContent>
+        <TabsContent value="logs" className="pt-4">
+          {tab === 'logs' && <LogViewer incidentId={incident.id} height="h-[28rem]" />}
+        </TabsContent>
+        {showFeedback && (
+          <TabsContent value="feedback" className="pt-4">
+            <FeedbackTab incident={incident} />
+          </TabsContent>
+        )}
+      </Tabs>
     </div>
   )
 }

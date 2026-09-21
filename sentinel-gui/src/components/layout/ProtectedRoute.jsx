@@ -1,6 +1,6 @@
+import { LoaderCircle } from 'lucide-react'
 import { Navigate, Outlet, useLocation } from 'react-router-dom'
-import { useAuth } from '../../context/AuthContext.jsx'
-import { PageSkeleton } from '../ui/Loading.jsx'
+import { useAuth } from '@/context/AuthContext'
 
 export default function ProtectedRoute() {
   const { isAuthenticated, isLoading } = useAuth()
@@ -8,8 +8,10 @@ export default function ProtectedRoute() {
 
   if (isLoading) {
     return (
-      <div className="app-shell__content">
-        <PageSkeleton label="Checking your session…" cards={1} />
+      <div role="status" className="grid min-h-svh place-items-center text-sm text-muted-foreground">
+        <span className="inline-flex items-center gap-2">
+          <LoaderCircle className="size-4 animate-spin" /> Checking your session…
+        </span>
       </div>
     )
   }

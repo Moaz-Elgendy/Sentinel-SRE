@@ -22,13 +22,10 @@ on every incident.
 """
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from app.reasoning.base import Reasoner
 from app.reasoning.health import ReasonerHealth
-
-logger = logging.getLogger(__name__)
 
 
 def build_reasoner(settings_obj: Any) -> Reasoner | None:
@@ -37,50 +34,27 @@ def build_reasoner(settings_obj: Any) -> Reasoner | None:
 
     if s.llm_provider == "gemini":
         if not s.gemini_api_key.strip():
-            logger.warning(
-                "reasoner_not_configured",
-                extra={"provider": "gemini", "reason": "GEMINI_API_KEY not set"},
-            )
             return None
-        from app.reasoning.gemini_reasoner import (  # noqa: PLC0415
-            GEMINI_API_BASE,
-            GeminiReasoner,
-        )
+        from app.reasoning.gemini_reasoner import GeminiReasoner  # noqa: PLC0415
 
         reasoner = GeminiReasoner(
             api_key=s.gemini_api_key,
             model=s.gemini_model,
             timeout=s.gemini_timeout_seconds,
         )
-        logger.info(
-            "reasoner_configured",
-            extra={"provider": "gemini", "model": s.gemini_model, "base_url": GEMINI_API_BASE},
-        )
     elif s.llm_provider == "groq":
         if not s.groq_api_key.strip():
-            logger.warning(
-                "reasoner_not_configured",
-                extra={"provider": "groq", "reason": "GROQ_API_KEY not set"},
-            )
             return None
-        from app.reasoning.groq_reasoner import GROQ_BASE_URL, GroqReasoner  # noqa: PLC0415
+        from app.reasoning.groq_reasoner import GroqReasoner  # noqa: PLC0415
 
         reasoner = GroqReasoner(
             api_key=s.groq_api_key,
             model=s.groq_model,
             timeout=s.groq_timeout_seconds,
         )
-        logger.info(
-            "reasoner_configured",
-            extra={"provider": "groq", "model": s.groq_model, "base_url": GROQ_BASE_URL},
-        )
     else:
         # default: openai (also covers OpenRouter/etc via openai_base_url)
         if not s.openai_api_key.strip():
-            logger.warning(
-                "reasoner_not_configured",
-                extra={"provider": "openai", "reason": "OPENAI_API_KEY not set"},
-            )
             return None
         from app.reasoning.openai_reasoner import OpenAIReasoner  # noqa: PLC0415
 
@@ -89,14 +63,6 @@ def build_reasoner(settings_obj: Any) -> Reasoner | None:
             model=s.openai_model,
             timeout=s.openai_timeout_seconds,
             base_url=s.openai_base_url,
-        )
-        logger.info(
-            "reasoner_configured",
-            extra={
-                "provider": "openai",
-                "model": s.openai_model,
-                "base_url": s.openai_base_url or "https://api.openai.com/v1",
-            },
         )
 
     reasoner.health = ReasonerHealth(

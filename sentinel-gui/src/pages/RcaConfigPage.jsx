@@ -1,154 +1,94 @@
 import { Link } from 'react-router-dom'
-import { applyRcaChange, getRcaConfig, previewRcaChange } from '../api/config.js'
-import { ChangeReview, ConfigActionBar, LastChanged, ReadOnlyCard } from '../components/config/ConfigParts.jsx'
-import AlertBanner from '../components/ui/AlertBanner.jsx'
-import Card from '../components/ui/Card.jsx'
-import { ErrorState } from '../components/ui/EmptyState.jsx'
-import Field from '../components/ui/Field.jsx'
-import { PageSkeleton } from '../components/ui/Loading.jsx'
-import PageHeader from '../components/ui/PageHeader.jsx'
-import Tag from '../components/ui/Tag.jsx'
-import { useConfigEditor } from '../hooks/useConfigEditor.js'
-import { usePageTitle } from '../hooks/usePageTitle.js'
-import { titleCase } from '../utils/format.js'
+import { applyRcaChange, getRcaConfig, previewRcaChange } from '@/api/config'
+import { ConfigPage, ReadOnlyPanel, SettingsSection } from '@/components/config/ConfigShell'
+import { NumberSetting } from '@/components/config/SettingFields'
+import { Badge } from '@/components/ui/badge'
+import { useConfigEditor } from '@/hooks/useConfigEditor'
+import { usePageTitle } from '@/hooks/usePageTitle'
+import { formatBytes } from '@/utils/format'
+import { rootCauseLabel } from '@/utils/incident'
 
-const FIELDS = [
-  { field: 'max_error_rate', label: 'Max error rate (correlation + validation)' },
-  { field: 'max_p95_seconds', label: 'Max P95 latency (seconds)' },
-  { field: 'max_cpu_cores', label: 'Max CPU (cores)' },
-  { field: 'max_memory_bytes', label: 'Max memory (bytes)' },
-  { field: 'settle_seconds', label: 'Settle period before validating (seconds)' },
-  { field: 'timeout_seconds', label: 'Validation timeout (seconds)' },
+const THRESHOLDS = [
+  { field: 'max_error_rate', label: 'Max error rate', step: '0.01', hint: 'A fraction: 0.05 is 5%. Used to correlate evidence and to judge recovery.' },
+  { field: 'max_p95_seconds', label: 'Max p95 latency (seconds)', step: '0.1' },
+  { field: 'max_cpu_cores', label: 'Max CPU (cores)', step: '0.1' },
+  { field: 'max_memory_bytes', label: 'Max memory (bytes)', step: '1000000' },
+]
+const TIMING = [
+  { field: 'settle_seconds', label: 'Settle period before validating (seconds)', hint: 'How long to wait after an action before checking recovery.' },
+  { field: 'timeout_seconds', label: 'Validation timeout (seconds)', hint: 'Give up on confirming recovery after this long.' },
   { field: 'poll_interval_seconds', label: 'Validation poll interval (seconds)' },
 ]
+const FIELDS = [...THRESHOLDS, ...TIMING]
 
-function makeDraft(current) {
-  return Object.fromEntries(FIELDS.map(({ field }) => [field, current[field]]))
-}
-
+const makeDraft = (current) => Object.fromEntries(FIELDS.map(({ field }) => [field, current[field]]))
 function diffChanges(current, draft) {
   const changes = {}
   for (const { field } of FIELDS) {
-    const draftValue = Number(draft[field])
-    if (!Number.isNaN(draftValue) && draftValue !== current[field]) {
-      changes[field] = draftValue
-    }
+    const value = Number(draft[field])
+    if (draft[field] !== '' && !Number.isNaN(value) && value !== current[field]) changes[field] = value
   }
   return changes
 }
 
 export default function RcaConfigPage() {
-  usePageTitle('RCA & Diagnosis')
-  const editor = useConfigEditor({
-    load: getRcaConfig,
-    previewChange: previewRcaChange,
-    applyChange: applyRcaChange,
-    makeDraft,
-    diffChanges,
-    loadErrorMessage: 'Could not load RCA configuration.',
-  })
-  const { data, draft, changes, preview } = editor
-
-  if (editor.loading) return <PageSkeleton label="Loading RCA configuration…" cards={2} />
-  if (editor.loadError) {
-    return <ErrorState title="Couldn't load RCA configuration" message={editor.loadError} onRetry={editor.retryLoad} />
-  }
-  if (!data || !draft) return null
-
-  const readOnly = data.read_only
-
+  usePageTitle('Diagnosis configuration')
+  const editor = useConfigEditor({ load: getRcaConfig, previewChange: previewRcaChange, applyChange: applyRcaChange, makeDraft, diffChanges, loadErrorMessage: 'Could not load diagnosis configuration.' })
+  const readOnly = editor.data?.read_only
   return (
-    <div className="page">
-      <PageHeader
-        title="RCA & Diagnosis"
-        subtitle={
-          <>
-            Evidence and recovery-validation thresholds — live on Sentinel's real correlation and validation steps.
-            <LastChanged at={data.last_changed_at} by={data.last_changed_by} />
-          </>
-        }
-      />
-
-      {editor.justApplied && !preview && (
-        <AlertBanner tone="success">Configuration applied — Sentinel is using the new values now.</AlertBanner>
-      )}
-      {editor.actionError && <AlertBanner>{editor.actionError}</AlertBanner>}
-
-      {preview ? (
-        <ChangeReview
-          preview={preview}
-          reason={editor.reason}
-          onReasonChange={editor.setReason}
-          applying={editor.applying}
-          onApply={editor.apply}
-          onCancel={editor.cancelReview}
-        />
-      ) : (
+    <ConfigPage editor={editor} description="Evidence and recovery-validation thresholds, live on Sentinel’s real correlation and validation steps. The incident page shows evidence against these same limits.">
+      {editor.data && (
         <>
-          <Card title="Evidence & validation thresholds">
-            <div className="form-grid">
-              {FIELDS.map(({ field, label }) => (
-                <Field
-                  key={field}
-                  label={label}
-                  hint={`Allowed range ${data.bounds[field].min}–${data.bounds[field].max}`}
-                  modified={field in changes}
-                >
-                  <input
-                    type="number"
-                    step={field === 'max_error_rate' ? '0.01' : '1'}
-                    min={data.bounds[field].min}
-                    max={data.bounds[field].max}
-                    className="input"
-                    value={draft[field]}
-                    onChange={(e) => editor.setField(field, e.target.value)}
-                  />
-                </Field>
+          <SettingsSection title="Evidence and validation thresholds" description="A reading past one of these is treated as unhealthy, both when diagnosing and when checking that a fix worked.">
+            {THRESHOLDS.map((f) => (
+              <NumberSetting
+                key={f.field}
+                editor={editor}
+                {...f}
+                extra={f.field === 'max_memory_bytes' && Number(editor.draft.max_memory_bytes) > 0 ? <p className="mt-1 text-xs text-muted-foreground">= {formatBytes(Number(editor.draft.max_memory_bytes))}</p> : null}
+              />
+            ))}
+          </SettingsSection>
+          <SettingsSection title="Validation timing" description="How Sentinel waits for, and polls, recovery after acting.">
+            {TIMING.map((f) => (
+              <NumberSetting key={f.field} editor={editor} {...f} />
+            ))}
+          </SettingsSection>
+          <ReadOnlyPanel title="What controls Sentinel’s diagnosis" description={readOnly.rule_based_detection.description}>
+            <dl className="divide-y text-sm">
+              {[
+                ['LLM confidence ceiling', readOnly.rule_based_detection.llm_confidence_ceiling],
+                ['LLM confidence delta cap', readOnly.rule_based_detection.llm_confidence_delta_cap],
+                ['Rule confidence max', readOnly.rule_based_detection.rule_confidence_max],
+              ].map(([label, value]) => (
+                <div key={label} className="flex justify-between gap-4 py-2 first:pt-0">
+                  <dt className="text-muted-foreground">{label}</dt>
+                  <dd className="tnum font-mono">{value}</dd>
+                </div>
               ))}
-            </div>
-          </Card>
-
-          <ConfigActionBar
-            changeCount={editor.changeCount}
-            reviewing={editor.reviewing}
-            onReview={() => editor.review()}
-            onDiscard={editor.discard}
-          />
-
-          <ReadOnlyCard title="What controls Sentinel's diagnosis" description={readOnly.rule_based_detection.description}>
-            <dl>
-              <div className="dl__row">
-                <dt>LLM confidence ceiling</dt>
-                <dd className="num">{readOnly.rule_based_detection.llm_confidence_ceiling}</dd>
-              </div>
-              <div className="dl__row">
-                <dt>LLM confidence delta cap</dt>
-                <dd className="num">{readOnly.rule_based_detection.llm_confidence_delta_cap}</dd>
-              </div>
-              <div className="dl__row">
-                <dt>Rule confidence max</dt>
-                <dd className="num">{readOnly.rule_based_detection.rule_confidence_max}</dd>
-              </div>
-              <div className="dl__row">
-                <dt>Deployment correlation window</dt>
+              <div className="flex justify-between gap-4 py-2 last:pb-0">
+                <dt className="text-muted-foreground">Deployment correlation window</dt>
                 <dd>
-                  {readOnly.deployment_correlation_window_minutes.value} min — edit via{' '}
-                  <Link to="/policies" className="link">
+                  {readOnly.deployment_correlation_window_minutes.value} min, edit in{' '}
+                  <Link to="/policies" className="underline underline-offset-2">
                     Policies
                   </Link>
                 </dd>
               </div>
             </dl>
-
-            <h3 className="section-label section-label--spaced">Root cause taxonomy</h3>
-            <div className="tag-list">
+            <h3 className="mt-4 mb-1.5 text-xs font-medium text-muted-foreground">Root cause taxonomy</h3>
+            <ul className="flex flex-wrap gap-1.5">
               {readOnly.root_causes.map((rc) => (
-                <Tag key={rc}>{titleCase(rc)}</Tag>
+                <li key={rc}>
+                  <Badge variant="secondary" className="font-normal">
+                    {rootCauseLabel(rc)}
+                  </Badge>
+                </li>
               ))}
-            </div>
-          </ReadOnlyCard>
+            </ul>
+          </ReadOnlyPanel>
         </>
       )}
-    </div>
+    </ConfigPage>
   )
 }

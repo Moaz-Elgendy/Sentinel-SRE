@@ -110,27 +110,12 @@ class Settings(BaseSettings):
     # It has its own key/model/timeout so switching LLM_PROVIDER back and
     # forth between providers never requires re-typing another provider's
     # settings. Nothing outside app/reasoning/ knows Groq exists.
-    #
-    # Model default: Groq decommissions models on a published schedule
-    # (console.groq.com/docs/deprecations) and a stale id here fails EVERY
-    # call with HTTP 404 model_not_found — indistinguishable at a glance from
-    # a genuine URL/config bug. `llama-3.3-70b-versatile` (the previous
-    # default) was decommissioned 2026-08-16; Groq's own recommended
-    # replacement for it is `openai/gpt-oss-120b`. If this default 404s
-    # again in the future, it means Groq has deprecated this one too — check
-    # console.groq.com/docs/deprecations before assuming the code is wrong.
     groq_api_key: str = ""
-    groq_model: str = "openai/gpt-oss-120b"
+    groq_model: str = "llama-3.3-70b-versatile"
     groq_timeout_seconds: float = 20.0
 
-    # Same situation on Gemini: `gemini-2.0-flash` (the previous default)
-    # was shut down 2026-06-01. `gemini-3.5-flash` is Google's own documented
-    # GA replacement (ai.google.dev/gemini-api/docs/deprecations) as of this
-    # writing. `gemini-2.5-flash` was deliberately NOT chosen even though it
-    # still works today — it is itself scheduled for shutdown and would just
-    # repeat this bug on a short fuse.
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3.5-flash"
+    gemini_model: str = "gemini-2.0-flash"
     gemini_timeout_seconds: float = 20.0
 
     # Empty key => rule-based RCA only. Everything still works; we log it and

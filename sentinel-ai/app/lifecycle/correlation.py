@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from app.models.incident import Evidence, Incident
 
@@ -46,8 +47,47 @@ BAD_EVENT_REASONS = frozenset(
 )
 
 CRASHLOOP_WAITING_REASONS = frozenset(
-    {"CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerError"}
+    {
+        "CrashLoopBackOff",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "CreateContainerError",
+        # A container stuck here never even reaches ImagePullBackOff — the
+        # image string itself failed reference-format validation before any
+        # pull was attempted (e.g. the citizen-service/frontend placeholder
+        # incident: "...amazonaws.com/.../citizen-service:PLACEHOLDER").
+        # Previously absent from this set, so `crash_looping` and
+        # `init_container_failing` both silently missed this exact failure
+        # mode.
+        "InvalidImageName",
+    }
 )
+
+
+def _find_valid_rollback_candidate(
+    older_revisions: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """First (newest-first, since `older_revisions` is already sorted that
+    way) ReplicaSet among candidates strictly older than the current one
+    whose images are not known-invalid.
+
+    `images_valid` is computed once by `KubernetesClient.list_replicasets()`
+    from the actual pod template — both `containers` AND `initContainers` —
+    not from the older `images` summary field, which historically only
+    covered `containers`. A candidate missing the key entirely (older
+    evidence, or a hand-built test fixture that predates this field) is
+    treated as valid, so this can only ever make Sentinel skip a candidate
+    it previously would have blindly used — never reject something it used
+    to accept.
+
+    Returns None when every retained revision has a known-bad image, i.e.
+    there is no safe rollback target in the history Kubernetes still has —
+    which must not be papered over by guessing.
+    """
+    for candidate in older_revisions:
+        if candidate.get("images_valid", True):
+            return candidate
+    return None
 
 # RSS growth over the investigation window that we are willing to call
 # leak-shaped. 50 MiB in 30 minutes with no deploy is well outside normal
@@ -70,6 +110,7 @@ class CorrelationFindings:
         self.recent_deployment_age_seconds: float | None = None
         self.deploy_correlates_with_onset: bool = False
         self.previous_revision: int | None = None
+        self.rollback_candidates_skipped: list[int | None] = []
         self.current_revision: int | None = None
         self.revision_count: int = 0
         self.image_changed: bool = False
@@ -142,51 +183,77 @@ def correlate(
             f.recent_deployment_age_seconds = age
             f.recent_deployment = age <= correlation_window_minutes * 60
         if len(history) > 1:
-            previous = history[1]
-            f.previous_revision = previous.get("revision")
-            newest_images = set(newest.get("images") or [])
-            previous_images = set(previous.get("images") or [])
-            # An image change is the strongest signal that a rollback would
-            # actually change what is running. A revision bump with identical
-            # images is usually a `rollout restart` (annotation-only change)
-            # — possibly one Sentinel itself performed a minute ago, which is
-            # exactly the case where rolling "back" achieves nothing.
-            f.image_changed = bool(newest_images != previous_images)
-
-            # Deployment-level available/desired counts are the wrong signal
-            # for a stuck rollout: with the default RollingUpdate strategy
-            # (maxSurge/maxUnavailable both >=1), Kubernetes creates the new
-            # (surge) pod *before* removing the old one, so a single-replica
-            # Deployment can sit at "1 desired / 1 available" forever even
-            # though the new ReplicaSet it just created never becomes ready —
-            # the old ReplicaSet's still-healthy pod is quietly covering for
-            # it. `replicas_unavailable` cannot see this; it only compares
-            # the Deployment's aggregate counts.
+            # Two distinct questions, deliberately kept separate:
             #
-            # The ReplicaSet-level counts do not have this blind spot: the
-            # newest ReplicaSet's own ready_replicas vs its own desired
-            # replicas tells us directly whether *this* rollout is
-            # progressing, independent of whatever the previous ReplicaSet is
-            # doing. Requiring the previous ReplicaSet to still have a ready
-            # pod is what distinguishes "this rollout has stalled" from the
-            # ordinary few-second window every rollout passes through on the
-            # way to a healthy new ReplicaSet.
+            #   "is the CURRENT rollout stalled?" — always compares newest
+            #   against the true immediate predecessor (`history[1]`),
+            #   whatever its own health. This is a fact about the rollout,
+            #   unrelated to what a rollback would target, and must not
+            #   change based on candidate validity (unchanged from before).
+            #
+            #   "what would a SAFE rollback target be?" — must skip past any
+            #   candidate with a known-invalid image, because
+            #   `history[1]` alone means nothing more than "one revision
+            #   number lower than whatever is currently broken". Once any
+            #   bad revision exists, that is true of the bad revision
+            #   itself just as often as a genuinely healthy one — which is
+            #   exactly the citizen-service incident this fixes: revision 66
+            #   (a placeholder-image ReplicaSet from outside Sentinel) sat
+            #   at history[1] and was rolled forward, unvalidated, as the
+            #   new "fix".
+            previous_immediate = history[1]
             newest_desired = newest.get("replicas") or 0
             newest_ready = newest.get("ready_replicas") or 0
-            previous_ready = previous.get("ready_replicas") or 0
+            previous_immediate_ready = previous_immediate.get("ready_replicas") or 0
             f.new_replicaset_unhealthy = bool(
-                newest_desired > 0 and newest_ready < newest_desired and previous_ready > 0
+                newest_desired > 0
+                and newest_ready < newest_desired
+                and previous_immediate_ready > 0
             )
             if f.new_replicaset_unhealthy:
                 evidence.correlations.append(
                     f"the newest ReplicaSet (revision {f.current_revision}) has "
                     f"{newest_ready}/{newest_desired} ready pod(s) while the "
-                    f"previous ReplicaSet (revision {f.previous_revision}) still "
-                    f"has {previous_ready} ready pod(s) serving traffic — the "
-                    "rollout has stalled without the Deployment's aggregate "
-                    "available/desired counts ever showing it, because the old "
-                    "ReplicaSet is covering for the new one"
+                    f"previous ReplicaSet (revision {previous_immediate.get('revision')}) "
+                    f"still has {previous_immediate_ready} ready pod(s) serving "
+                    "traffic — the rollout has stalled without the Deployment's "
+                    "aggregate available/desired counts ever showing it, because "
+                    "the old ReplicaSet is covering for the new one"
                 )
+
+            older_revisions = history[1:]
+            candidate = _find_valid_rollback_candidate(older_revisions)
+            invalid_skipped = [
+                r.get("revision")
+                for r in older_revisions
+                if r is not candidate and r.get("images_valid") is False
+            ]
+            if invalid_skipped:
+                f.rollback_candidates_skipped = invalid_skipped
+                evidence.correlations.append(
+                    "skipped rollback candidate revision(s) "
+                    f"{invalid_skipped} — placeholder/malformed container or "
+                    "init-container image, not a safe rollback target"
+                )
+
+            if candidate is not None:
+                f.previous_revision = candidate.get("revision")
+                newest_images = set(newest.get("images") or [])
+                candidate_images = set(candidate.get("images") or [])
+                # An image change is the strongest signal that a rollback
+                # would actually change what is running. A revision bump
+                # with identical images is usually a `rollout restart`
+                # (annotation-only change) — possibly one Sentinel itself
+                # performed a minute ago, which is exactly the case where
+                # rolling "back" achieves nothing.
+                f.image_changed = bool(newest_images != candidate_images)
+            # else: every retained revision has a known-bad image. There is
+            # no safe rollback target in reach — f.previous_revision stays
+            # None, which is exactly the existing
+            # `context.previous_revision_exists` Policy Engine precondition
+            # (see policy.py DenialReason.NO_PREVIOUS_REVISION), so this
+            # correctly denies rollback rather than guessing, with no
+            # change to policy.py required.
 
     # ---- symptom shape --------------------------------------------------
     if evidence.error_rate is not None and evidence.error_rate > error_rate_threshold:

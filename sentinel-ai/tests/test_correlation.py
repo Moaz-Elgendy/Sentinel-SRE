@@ -255,3 +255,151 @@ def test_replicas_unavailable_path_still_works_independently():
     assert findings.replicas_unavailable is True
     assert findings.new_replicaset_unhealthy is False
     assert findings.deploy_correlates_with_onset is True
+
+
+# ---------------------------------------------------------------------------
+# Rollback target selection — the live citizen-service/frontend incident:
+# `previous = history[1]` blindly, with no image validation, selected an
+# already-broken placeholder ReplicaSet as the rollback target.
+# ---------------------------------------------------------------------------
+REAL_IMAGE_65 = (
+    "890608336467.dkr.ecr.eu-central-1.amazonaws.com/sentinel-sre-demo/"
+    "citizen-service:6e36eedd0da47e4a24f0aa5a1c534ce6f4954a84"
+)
+PLACEHOLDER_IMAGE = (
+    "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/citizen-service:PLACEHOLDER"
+)
+
+
+def _rs(revision, *, ready_replicas, images, images_valid, created_at=10_000.0):
+    return {
+        "revision": revision,
+        "created_at": created_at,
+        "replicas": 1,
+        "ready_replicas": ready_replicas,
+        "images": images,
+        "images_valid": images_valid,
+    }
+
+
+def test_previous_revision_skips_a_placeholder_candidate_to_the_next_valid_one():
+    """The exact live incident: current (67) is broken, revision 66 sitting
+    immediately below it is ALSO a placeholder/invalid image (created
+    outside Sentinel), and revision 65 further back is the real, valid,
+    previously-healthy revision. previous_revision must land on 65, not 66."""
+    evidence = _surge_stuck_rollout_evidence(
+        replicaset_history=[
+            _rs(67, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            _rs(66, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            _rs(65, ready_replicas=1, images=[REAL_IMAGE_65], images_valid=True),
+        ]
+    )
+    findings = _correlate(evidence)
+
+    assert findings.previous_revision == 65
+    assert findings.rollback_candidates_skipped == [66]
+    assert findings.image_changed is True  # 67's image differs from 65's
+
+
+def test_previous_revision_skips_multiple_consecutive_invalid_candidates():
+    evidence = _surge_stuck_rollout_evidence(
+        replicaset_history=[
+            _rs(70, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            _rs(69, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            _rs(68, ready_replicas=0, images=["also-bad:latest"], images_valid=False),
+            _rs(67, ready_replicas=1, images=[REAL_IMAGE_65], images_valid=True),
+        ]
+    )
+    findings = _correlate(evidence)
+
+    assert findings.previous_revision == 67
+    assert findings.rollback_candidates_skipped == [69, 68]
+
+
+def test_previous_revision_is_none_when_every_retained_revision_is_invalid():
+    """No safe rollback target anywhere in the retained history (e.g.
+    revisionHistoryLimit already pruned the last good revision). Must not
+    guess — this feeds straight into the existing
+    `previous_revision_exists` Policy Engine precondition, which already
+    denies rollback (and therefore escalates) when there is nothing safe to
+    target."""
+    evidence = _surge_stuck_rollout_evidence(
+        replicaset_history=[
+            _rs(67, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            _rs(66, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+        ]
+    )
+    findings = _correlate(evidence)
+
+    assert findings.previous_revision is None
+    assert findings.rollback_candidates_skipped == [66]
+
+
+def test_new_replicaset_unhealthy_still_uses_the_true_immediate_predecessor():
+    """new_replicaset_unhealthy is a fact about whether THIS rollout is
+    stalled, and must keep comparing against the literal history[1] even
+    when previous_revision (the rollback TARGET) skips further back — these
+    are two different questions and must not be conflated."""
+    evidence = _surge_stuck_rollout_evidence(
+        replicaset_history=[
+            _rs(67, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            # history[1]: itself unhealthy (0 ready) AND invalid — proves
+            # new_replicaset_unhealthy is computed from this one directly,
+            # not from whatever `previous_revision` ends up being.
+            _rs(66, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            _rs(65, ready_replicas=1, images=[REAL_IMAGE_65], images_valid=True),
+        ]
+    )
+    findings = _correlate(evidence)
+
+    # previous_revision skipped forward to 65, but new_replicaset_unhealthy
+    # requires the TRUE previous ReplicaSet (66) to have a ready pod, and it
+    # does not (0 ready) — so the stalled-rollout signal must be False here,
+    # proving the two computations are genuinely independent.
+    assert findings.previous_revision == 65
+    assert findings.new_replicaset_unhealthy is False
+
+
+def test_valid_digest_pinned_candidate_is_accepted():
+    digest_image = (
+        "890608336467.dkr.ecr.eu-central-1.amazonaws.com/sentinel-sre-demo/"
+        "citizen-service@sha256:" + "a" * 64
+    )
+    evidence = _surge_stuck_rollout_evidence(
+        replicaset_history=[
+            _rs(67, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            _rs(66, ready_replicas=1, images=[digest_image], images_valid=True),
+        ]
+    )
+    findings = _correlate(evidence)
+    assert findings.previous_revision == 66
+
+
+def test_historical_replicaset_with_zero_replicas_but_valid_template_is_still_a_candidate():
+    """A scaled-down-to-zero old revision is still a legitimate rollback
+    target as far as image validity goes — `images_valid` is about the
+    template, not current replica counts."""
+    evidence = _surge_stuck_rollout_evidence(
+        replicaset_history=[
+            _rs(67, ready_replicas=0, images=[PLACEHOLDER_IMAGE], images_valid=False),
+            _rs(66, ready_replicas=0, images=[REAL_IMAGE_65], images_valid=True),
+        ]
+    )
+    findings = _correlate(evidence)
+    assert findings.previous_revision == 66
+
+
+def test_missing_images_valid_key_defaults_to_valid_for_backward_compatibility():
+    """A hand-built/older evidence bundle that predates this field must
+    behave exactly as before: history[1] is used, nothing is skipped."""
+    evidence = _surge_stuck_rollout_evidence(
+        replicaset_history=[
+            {"revision": 20, "created_at": 10_000.0 - 60, "replicas": 1,
+             "ready_replicas": 0, "images": [PLACEHOLDER_IMAGE]},
+            {"revision": 19, "created_at": 10_000.0 - 3600, "replicas": 1,
+             "ready_replicas": 1, "images": [REAL_IMAGE_65]},
+        ]
+    )
+    findings = _correlate(evidence)
+    assert findings.previous_revision == 19
+    assert findings.rollback_candidates_skipped == []

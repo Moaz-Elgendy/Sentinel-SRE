@@ -4,5 +4,14 @@
   "rules": {
     "react/rules-of-hooks": "error",
     "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
+  },
+  "overrides": [
+    {
+      // shadcn/ui primitives intentionally co-export their cva variants
+      // (buttonVariants, badgeVariants …) next to the component, and a React
+      // context module conventionally exports its Provider and its hook together.
+      "files": ["src/components/ui/**", "src/context/**"],
+      "rules": { "react/only-export-components": "off" }
+    }
+  ]
 }
