@@ -1,59 +1,39 @@
-import { applyPolicyChange, getPolicyConfig, previewPolicyChange } from '../api/config.js'
-import { ChangeReview, ConfigActionBar, LastChanged, ReadOnlyCard } from '../components/config/ConfigParts.jsx'
-import AlertBanner from '../components/ui/AlertBanner.jsx'
-import Card from '../components/ui/Card.jsx'
-import { ErrorState } from '../components/ui/EmptyState.jsx'
-import Field from '../components/ui/Field.jsx'
-import { PageSkeleton } from '../components/ui/Loading.jsx'
-import PageHeader from '../components/ui/PageHeader.jsx'
-import { useConfigEditor } from '../hooks/useConfigEditor.js'
-import { usePageTitle } from '../hooks/usePageTitle.js'
+import { applyPolicyChange, getPolicyConfig, previewPolicyChange } from '@/api/config'
+import { ConfigPage, ReadOnlyPanel, SettingsSection } from '@/components/config/ConfigShell'
+import { ListSetting, NumberSetting } from '@/components/config/SettingFields'
+import { Badge } from '@/components/ui/badge'
+import { useConfigEditor } from '@/hooks/useConfigEditor'
+import { usePageTitle } from '@/hooks/usePageTitle'
+import { listToText, textToList } from '@/utils/list'
 
 const CONFIDENCE_FIELDS = [
-  { field: 'confidence_restart', label: 'Restart' },
-  { field: 'confidence_rollback', label: 'Rollback' },
-  { field: 'confidence_scale', label: 'Scale' },
-  { field: 'confidence_chaos_reset', label: 'Chaos reset' },
+  { field: 'confidence_restart', label: 'Restart a deployment' },
+  { field: 'confidence_rollback', label: 'Roll back a deployment' },
+  { field: 'confidence_scale', label: 'Scale a deployment' },
+  { field: 'confidence_chaos_reset', label: 'Reset a chaos fault' },
 ]
-
 const LIMIT_FIELDS = [
-  { field: 'min_replicas', label: 'Minimum replicas' },
-  { field: 'max_replicas', label: 'Maximum replicas' },
-  { field: 'max_actions_per_incident', label: 'Max actions per incident' },
-  { field: 'action_cooldown_seconds', label: 'Action cooldown (seconds)' },
-  { field: 'deployment_correlation_window_minutes', label: 'Deploy correlation window (minutes)' },
+  { field: 'min_replicas', label: 'Minimum replicas', hint: 'Sentinel never scales below this.' },
+  { field: 'max_replicas', label: 'Maximum replicas', hint: 'Sentinel never scales above this.' },
+  { field: 'max_actions_per_incident', label: 'Actions per incident', hint: 'After this many, Sentinel escalates instead of trying again.' },
+  { field: 'action_cooldown_seconds', label: 'Cooldown between actions (seconds)', hint: 'Minimum gap before the same workload is acted on again.' },
+  { field: 'deployment_correlation_window_minutes', label: 'Deploy correlation window (minutes)', hint: 'How recent a deployment must be to count as a suspect.' },
 ]
-
 const LIST_FIELDS = [
-  { field: 'allowed_namespaces', label: 'Allowed namespaces' },
-  { field: 'allowed_deployments', label: 'Allowed deployments' },
+  { field: 'allowed_namespaces', label: 'Allowed namespaces', hint: 'Comma-separated. Sentinel acts only inside these.' },
+  { field: 'allowed_deployments', label: 'Allowed deployments', hint: 'Comma-separated. Sentinel acts only on these. Can never include anything on the protected list.' },
 ]
 
-function listToText(list) {
-  return (list ?? []).join(', ')
-}
-
-function textToList(text) {
-  return text
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-}
-
-function makeDraft(current) {
-  return {
-    ...Object.fromEntries([...CONFIDENCE_FIELDS, ...LIMIT_FIELDS].map(({ field }) => [field, current[field]])),
-    ...Object.fromEntries(LIST_FIELDS.map(({ field }) => [field, listToText(current[field])])),
-  }
-}
+const makeDraft = (current) => ({
+  ...Object.fromEntries([...CONFIDENCE_FIELDS, ...LIMIT_FIELDS].map(({ field }) => [field, current[field]])),
+  ...Object.fromEntries(LIST_FIELDS.map(({ field }) => [field, listToText(current[field])])),
+})
 
 function diffChanges(current, draft) {
   const changes = {}
   for (const { field } of [...CONFIDENCE_FIELDS, ...LIMIT_FIELDS]) {
-    const draftValue = Number(draft[field])
-    if (!Number.isNaN(draftValue) && draftValue !== current[field]) {
-      changes[field] = draftValue
-    }
+    const value = Number(draft[field])
+    if (draft[field] !== '' && !Number.isNaN(value) && value !== current[field]) changes[field] = value
   }
   for (const { field } of LIST_FIELDS) {
     // Allow-lists are sets: order is not a change.
@@ -65,131 +45,45 @@ function diffChanges(current, draft) {
   return changes
 }
 
-function rangeHint(bounds) {
-  return bounds ? `Allowed range ${bounds.min}–${bounds.max}` : undefined
-}
-
 export default function PoliciesPage() {
   usePageTitle('Policies')
-  const editor = useConfigEditor({
-    load: getPolicyConfig,
-    previewChange: previewPolicyChange,
-    applyChange: applyPolicyChange,
-    makeDraft,
-    diffChanges,
-    loadErrorMessage: 'Could not load policy configuration.',
-  })
-  const { data, draft, changes, preview } = editor
-
-  if (editor.loading) return <PageSkeleton label="Loading policy configuration…" cards={3} />
-  if (editor.loadError) {
-    return <ErrorState title="Couldn't load policies" message={editor.loadError} onRetry={editor.retryLoad} />
-  }
-  if (!data || !draft) return null
-
+  const editor = useConfigEditor({ load: getPolicyConfig, previewChange: previewPolicyChange, applyChange: applyPolicyChange, makeDraft, diffChanges, loadErrorMessage: 'Could not load policy configuration.' })
   return (
-    <div className="page">
-      <PageHeader
-        title="Policies"
-        subtitle={
-          <>
-            Backed live by Sentinel's real Policy Engine — a change here takes effect on the very next incident
-            evaluation.
-            <LastChanged at={data.last_changed_at} by={data.last_changed_by} />
-          </>
-        }
-      />
-
-      {editor.justApplied && !preview && (
-        <AlertBanner tone="success">Configuration applied — Sentinel is using the new values now.</AlertBanner>
-      )}
-      {editor.actionError && <AlertBanner>{editor.actionError}</AlertBanner>}
-
-      {preview ? (
-        <ChangeReview
-          preview={preview}
-          reason={editor.reason}
-          onReasonChange={editor.setReason}
-          applying={editor.applying}
-          onApply={editor.apply}
-          onCancel={editor.cancelReview}
-        />
-      ) : (
+    <ConfigPage editor={editor} description="Backed live by Sentinel’s Policy Engine. A change takes effect on the very next incident evaluation.">
+      {editor.data && (
         <>
-          <Card title="Confidence thresholds" description="Minimum diagnosis confidence required before Sentinel acts autonomously.">
-            <div className="form-grid">
-              {CONFIDENCE_FIELDS.map(({ field, label }) => (
-                <Field key={field} label={label} hint={rangeHint(data.bounds[field])} modified={field in changes}>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min={data.bounds[field].min}
-                    max={data.bounds[field].max}
-                    className="input"
-                    value={draft[field]}
-                    onChange={(e) => editor.setField(field, e.target.value)}
-                  />
-                </Field>
+          <SettingsSection title="Confidence thresholds" description="How sure Sentinel must be of its diagnosis before it acts without asking. Higher is more cautious.">
+            {CONFIDENCE_FIELDS.map((f) => (
+              <NumberSetting key={f.field} editor={editor} step="0.01" {...f} />
+            ))}
+          </SettingsSection>
+          <SettingsSection title="Limits and cooldowns" description="Hard limits on how much, and how often, Sentinel may act.">
+            {LIMIT_FIELDS.map((f) => (
+              <NumberSetting key={f.field} editor={editor} {...f} />
+            ))}
+          </SettingsSection>
+          <SettingsSection title="Allow-lists" description="The only places Sentinel is permitted to act.">
+            {LIST_FIELDS.map((f) => (
+              <ListSetting key={f.field} editor={editor} {...f} />
+            ))}
+          </SettingsSection>
+          <ReadOnlyPanel title="Protected: never editable, here or anywhere else" description="Sentinel will refuse to touch these even if an allow-list or a human authorization says otherwise.">
+            <dl className="space-y-3 text-sm">
+              {[
+                ['Denied deployments', editor.data.protected.denied_deployments],
+                ['Denied namespaces', editor.data.protected.denied_namespaces],
+              ].map(([label, items]) => (
+                <div key={label} className="flex flex-wrap items-baseline gap-x-6 gap-y-1.5">
+                  <dt className="w-40 shrink-0 text-xs text-muted-foreground">{label}</dt>
+                  <dd className="flex flex-wrap gap-1.5">
+                    {items.length ? items.map((i) => <Badge key={i} variant="secondary" className="font-mono font-normal">{i}</Badge>) : '—'}
+                  </dd>
+                </div>
               ))}
-            </div>
-          </Card>
-
-          <Card title="Limits & cooldowns">
-            <div className="form-grid">
-              {LIMIT_FIELDS.map(({ field, label }) => (
-                <Field key={field} label={label} hint={rangeHint(data.bounds[field])} modified={field in changes}>
-                  <input
-                    type="number"
-                    min={data.bounds[field].min}
-                    max={data.bounds[field].max}
-                    className="input"
-                    value={draft[field]}
-                    onChange={(e) => editor.setField(field, e.target.value)}
-                  />
-                </Field>
-              ))}
-            </div>
-          </Card>
-
-          <Card
-            title="Allow-lists"
-            description="Comma-separated. An entry here can never include anything on the protected list below."
-          >
-            <div className="form-grid form-grid--1">
-              {LIST_FIELDS.map(({ field, label }) => (
-                <Field key={field} label={label} modified={field in changes}>
-                  <input
-                    type="text"
-                    className="input mono"
-                    value={draft[field]}
-                    onChange={(e) => editor.setField(field, e.target.value)}
-                  />
-                </Field>
-              ))}
-            </div>
-          </Card>
-
-          <ReadOnlyCard title="Protected — never editable, here or anywhere else">
-            <dl>
-              <div className="dl__row">
-                <dt>Denied deployments</dt>
-                <dd className="mono">{data.protected.denied_deployments.join(', ') || '—'}</dd>
-              </div>
-              <div className="dl__row">
-                <dt>Denied namespaces</dt>
-                <dd className="mono">{data.protected.denied_namespaces.join(', ') || '—'}</dd>
-              </div>
             </dl>
-          </ReadOnlyCard>
-
-          <ConfigActionBar
-            changeCount={editor.changeCount}
-            reviewing={editor.reviewing}
-            onReview={() => editor.review()}
-            onDiscard={editor.discard}
-          />
+          </ReadOnlyPanel>
         </>
       )}
-    </div>
+    </ConfigPage>
   )
 }

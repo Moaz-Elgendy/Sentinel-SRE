@@ -1,40 +1,36 @@
+import { FlaskConical, KeyRound, LoaderCircle, OctagonAlert, Play, TriangleAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { extractErrorMessage } from '../api/client.js'
-import { getChaosToken, getRunStatus, listScenarios, runScenario, setChaosToken } from '../api/chaosScenarios.js'
-import AlertBanner from '../components/ui/AlertBanner.jsx'
-import Button from '../components/ui/Button.jsx'
-import Card from '../components/ui/Card.jsx'
-import ConfirmDialog from '../components/ui/ConfirmDialog.jsx'
-import EmptyState from '../components/ui/EmptyState.jsx'
-import Field from '../components/ui/Field.jsx'
-import { Skeleton } from '../components/ui/Loading.jsx'
-import PageHeader from '../components/ui/PageHeader.jsx'
-import StatusPill from '../components/ui/StatusPill.jsx'
-import Tag from '../components/ui/Tag.jsx'
-import { usePageTitle } from '../hooks/usePageTitle.js'
+import { extractErrorMessage } from '@/api/client'
+import { getChaosToken, getRunStatus, listScenarios, runScenario, setChaosToken } from '@/api/chaosScenarios'
+import { ConfirmDialog } from '@/components/sentinel/ConfirmDialog'
+import { PageHeader } from '@/components/sentinel/PageHeader'
+import { Panel } from '@/components/sentinel/Panel'
+import { Callout, EmptyState, SkeletonRows } from '@/components/sentinel/States'
+import { StatusBadge } from '@/components/sentinel/StatusBadge'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { usePageTitle } from '@/hooks/usePageTitle'
+import { sentenceCase } from '@/utils/format'
 
 const TERMINAL = new Set(['Success', 'Failed', 'Cancelled', 'TimedOut'])
 
-// Polls one SSM command until it reaches a terminal state, then stops. Kept in
-// this file (not the generic usePolling) because it is specific to this shape
-// and must stop on its own.
+// Polls one SSM command until it reaches a terminal state, then stops on its own.
 function useCommandStatus(commandId) {
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
-
   useEffect(() => {
     let cancelled = false
     let timer
-
     async function tick() {
       try {
         const result = await getRunStatus(commandId)
         if (cancelled) return
         setData(result)
         setError(null)
-        if (!TERMINAL.has(result.status)) {
-          timer = setTimeout(tick, 3000)
-        }
+        if (!TERMINAL.has(result.status)) timer = setTimeout(tick, 3000)
       } catch (err) {
         if (!cancelled) setError(err)
       }
@@ -45,106 +41,89 @@ function useCommandStatus(commandId) {
       clearTimeout(timer)
     }
   }, [commandId])
-
   return { data, error }
 }
 
 function RunStatus({ run }) {
   const { data, error } = useCommandStatus(run.commandId)
-  if (error) return <AlertBanner>{extractErrorMessage(error, 'Could not read run status.')}</AlertBanner>
-  if (!data) return <Skeleton width={160} height={22} />
+  if (error) return <Callout tone="bad">{extractErrorMessage(error, 'Could not read run status.')}</Callout>
+  if (!data) return <SkeletonRows rows={1} className="p-0" />
   return (
-    <div className="stack" style={{ gap: 8 }}>
-      <div className="cluster">
-        <span className="muted">Status</span>
-        <StatusPill status={data.status} />
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-2 text-sm">
+        <span className="text-muted-foreground">Status</span>
+        <StatusBadge status={data.status} />
       </div>
-      {data.status_details && <div className="muted small">{data.status_details}</div>}
+      {data.status_details && <p className="text-xs text-muted-foreground">{data.status_details}</p>}
     </div>
   )
 }
 
 function TokenGate({ onSet }) {
   const [value, setValue] = useState('')
-
-  function handleSubmit(event) {
-    event.preventDefault()
-    if (value) onSet(value)
-  }
-
   return (
-    <Card
-      title="Enter the chaos admin token"
-      description="This is the existing CHAOS_ADMIN_TOKEN shared secret (see sentinel-ai/app/routers/chaos_scenarios.py) — not your Sentinel admin login. It is kept in this tab's session only."
-    >
-      <form className="demo-token-form" onSubmit={handleSubmit}>
-        <Field label="Chaos admin token">
-          <input
-            type="password"
-            className="input"
-            autoComplete="off"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-          />
-        </Field>
-        <Button type="submit" variant="primary" disabled={!value}>
+    <Panel title="Enter the chaos admin token" icon={KeyRound} description="This is the existing CHAOS_ADMIN_TOKEN shared secret, not your Sentinel admin login. It is kept in this tab’s session only.">
+      <form
+        className="flex max-w-md flex-col gap-3"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (value) onSet(value)
+        }}
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="chaos-token">Chaos admin token</Label>
+          <Input id="chaos-token" type="password" autoComplete="off" value={value} onChange={(e) => setValue(e.target.value)} />
+        </div>
+        <Button type="submit" disabled={!value} className="self-start">
           Continue
         </Button>
       </form>
-    </Card>
+    </Panel>
   )
 }
 
-function ScenarioCard({ scenario, onRun, running }) {
+function ScenarioRow({ scenario, onRun, running }) {
   const [autoRollback, setAutoRollback] = useState(Boolean(scenario.auto_rollback_supported))
   const [confirming, setConfirming] = useState(false)
-
-  function handleRun() {
-    if (scenario.dangerous) {
-      setConfirming(true)
-      return
-    }
-    onRun(scenario.id, autoRollback)
-  }
-
+  const id = `rollback-${scenario.id}`
   return (
-    <li className="demo-scenario">
-      <div className="demo-scenario__header">
-        <strong>{scenario.title}</strong>
-        <Tag>{scenario.family}</Tag>
-        {scenario.dangerous && <Tag tone="warn">Dangerous</Tag>}
+    <li className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 px-4 py-3.5">
+      <div className="min-w-0 flex-1 basis-80">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-sm font-medium">{scenario.title}</p>
+          <Badge variant="secondary">{sentenceCase(scenario.family)}</Badge>
+          {scenario.dangerous && (
+            <Badge variant="warn">
+              <TriangleAlert /> Dangerous
+            </Badge>
+          )}
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">{scenario.description}</p>
       </div>
-      <p className="muted small">{scenario.description}</p>
-      <div className="demo-scenario__actions">
+      <div className="flex items-center gap-4">
         {scenario.auto_rollback_supported && (
-          <label className="checkbox">
-            <input type="checkbox" checked={autoRollback} onChange={(e) => setAutoRollback(e.target.checked)} />
-            Auto-rollback
-          </label>
+          <div className="flex items-center gap-2">
+            <Checkbox id={id} checked={autoRollback} onCheckedChange={(v) => setAutoRollback(v === true)} />
+            <Label htmlFor={id} className="text-xs font-normal">
+              Auto-rollback
+            </Label>
+          </div>
         )}
-        <Button
-          variant={scenario.dangerous ? 'caution' : 'secondary'}
-          onClick={handleRun}
-          busy={running}
-          busyLabel="Running…"
-        >
-          Run scenario
+        <Button variant="outline" size="sm" disabled={running} onClick={() => (scenario.dangerous ? setConfirming(true) : onRun(scenario.id, autoRollback))}>
+          {running ? <LoaderCircle className="animate-spin" /> : <Play />} {running ? 'Starting…' : 'Run scenario'}
         </Button>
       </div>
-
       <ConfirmDialog
         open={confirming}
+        onOpenChange={setConfirming}
         title={`Run “${scenario.title}”?`}
+        description="This scenario is marked dangerous and may leave the incident open."
         confirmLabel="Run anyway"
-        tone="caution"
         onConfirm={() => {
           setConfirming(false)
           onRun(scenario.id, autoRollback)
         }}
-        onCancel={() => setConfirming(false)}
-      >
-        <p>This scenario is marked dangerous and may leave the incident open.</p>
-      </ConfirmDialog>
+      />
     </li>
   )
 }
@@ -154,23 +133,19 @@ export default function DemoChaosPage() {
   const [tokenSet, setTokenSet] = useState(Boolean(getChaosToken()))
   const [scenarios, setScenarios] = useState(null)
   const [error, setError] = useState(null)
-  const [loading, setLoading] = useState(false)
   const [runningId, setRunningId] = useState(null)
   const [activeRun, setActiveRun] = useState(null)
 
   useEffect(() => {
     if (!tokenSet) return
-    setLoading(true)
     listScenarios()
       .then((data) => setScenarios(data.scenarios))
-      .catch((err) => setError(extractErrorMessage(err, 'Could not load chaos scenarios.')))
-      .finally(() => setLoading(false))
+      .catch((err) => {
+        setScenarios([])
+        setError(extractErrorMessage(err, 'Could not load chaos scenarios.'))
+      })
   }, [tokenSet])
-
-  function handleTokenSet(value) {
-    setChaosToken(value)
-    setTokenSet(true)
-  }
+  const loading = tokenSet && scenarios === null
 
   async function handleRun(scenarioId, autoRollback) {
     setRunningId(scenarioId)
@@ -186,45 +161,39 @@ export default function DemoChaosPage() {
   }
 
   return (
-    <div className="page">
-      <PageHeader
-        title="Demo & chaos utilities"
-        subtitle="Admin/demo tooling only — not a Sentinel capability."
-      />
-
-      <AlertBanner tone="warn" title="This triggers real faults">
-        Scenarios here break things in the demo cluster on purpose, via the existing chaos-scenario runner, so you can show
-        Sentinel responding.
-      </AlertBanner>
-
+    <div className="space-y-4">
+      <PageHeader title="Chaos scenarios" description="Demo and admin tooling only. This is not a Sentinel capability." />
+      <Callout tone="warn" icon={OctagonAlert} title="This triggers real faults">
+        Scenarios here break things in the demo cluster on purpose, via the existing chaos-scenario runner, so you can show Sentinel responding.
+      </Callout>
       {!tokenSet ? (
-        <TokenGate onSet={handleTokenSet} />
+        <TokenGate
+          onSet={(value) => {
+            setChaosToken(value)
+            setTokenSet(true)
+          }}
+        />
       ) : (
         <>
-          {error && <AlertBanner>{error}</AlertBanner>}
-
+          {error && <Callout tone="bad">{error}</Callout>}
           {activeRun && (
-            <Card title={`Run in progress: ${activeRun.scenario}`}>
+            <Panel title={`Run in progress: ${activeRun.scenario}`}>
               <RunStatus run={activeRun} />
-            </Card>
+            </Panel>
           )}
-
-          <Card title="Scenarios" muted>
+          <Panel title="Scenarios" flush>
             {loading ? (
-              <div className="stack">
-                <Skeleton height={64} />
-                <Skeleton height={64} />
-              </div>
+              <SkeletonRows rows={2} />
             ) : (scenarios ?? []).length === 0 ? (
-              <EmptyState compact title="No scenarios available" description="The chaos runner returned no scenarios." />
+              <EmptyState compact icon={FlaskConical} title="No scenarios available" description="The chaos runner returned no scenarios." />
             ) : (
-              <ul className="demo-scenario-list">
+              <ul className="divide-y">
                 {scenarios.map((scenario) => (
-                  <ScenarioCard key={scenario.id} scenario={scenario} onRun={handleRun} running={runningId === scenario.id} />
+                  <ScenarioRow key={scenario.id} scenario={scenario} onRun={handleRun} running={runningId === scenario.id} />
                 ))}
               </ul>
             )}
-          </Card>
+          </Panel>
         </>
       )}
     </div>

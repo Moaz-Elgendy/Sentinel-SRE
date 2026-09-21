@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -534,6 +535,12 @@ class KubernetesClient:
                 revision = int(revision_raw) if revision_raw is not None else None
             except (TypeError, ValueError):
                 revision = None
+            init_images = [
+                c.image for c in (rs.spec.template.spec.init_containers or []) if c.image
+            ]
+            container_images = [
+                c.image for c in (rs.spec.template.spec.containers or []) if c.image
+            ]
             out.append(
                 {
                     "name": rs.metadata.name,
@@ -545,9 +552,20 @@ class KubernetesClient:
                     ),
                     "replicas": rs.spec.replicas,
                     "ready_replicas": rs.status.ready_replicas or 0,
-                    "images": [
-                        c.image for c in (rs.spec.template.spec.containers or []) if c.image
-                    ],
+                    "images": container_images,
+                    "init_images": init_images,
+                    # Whether EVERY container and init container on this
+                    # ReplicaSet has a plausible image reference — computed
+                    # once, here, rather than re-derived by every caller
+                    # that needs to pick a rollback candidate. This is what
+                    # lets `correlate()` skip a numerically-previous
+                    # revision that is itself broken (see
+                    # `find_valid_rollback_candidate` in correlation.py)
+                    # instead of blindly trusting "one revision back".
+                    "images_valid": all(
+                        _looks_like_a_valid_image_reference(img)
+                        for img in (container_images + init_images)
+                    ),
                     # Kept so the rollback path does not need a second API
                     # round-trip. This is the raw client model object, not a
                     # dict — the only place in this module that leaks a
@@ -709,10 +727,23 @@ class KubernetesClient:
         # sitting next to a Deployment now on revision 63 — they answer
         # different questions ("whose template did we restore" vs. "how many
         # template changes has this Deployment seen"), not the same one.
+        #
+        # ALSO IMPORTANT — and the reason `rolled-back-at` exists: this
+        # annotation is only ever written HERE, i.e. only on a genuine
+        # rollback. `restart_deployment()` never touches it. So it can sit
+        # unchanged through any number of intervening restarts and is only
+        # ever telling you "the last time an actual rollback ran, it
+        # restored revision X" — not "revision X is what's running now" or
+        # even "a rollback ran recently". Without a timestamp there is no
+        # way to tell a rollback that just happened from one from days ago;
+        # `rolled-back-at` makes that staleness checkable instead of
+        # silently misleading.
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         template_dict["metadata"].setdefault("annotations", {})
         template_dict["metadata"]["annotations"]["sentinel.sre/rolled-back-to"] = str(
             target_revision
         )
+        template_dict["metadata"]["annotations"]["sentinel.sre/rolled-back-at"] = stamp
 
         body = {"spec": {"template": template_dict}}
 
@@ -777,10 +808,23 @@ class InvalidRollbackTemplate(ValueError):
 def _looks_like_a_valid_image_reference(image: Any) -> bool:
     """Cheap, deliberately permissive sanity check — this is a last-resort
     guard, not a full Docker reference-format validator (that regex is
-    large and registries vary). It exists only to catch the failure modes
-    the corruption doc called out: a missing image, `None`, or a Python
-    object having been accidentally stringified (`str(container)`,
-    `repr(...)`, `"{...}"`) instead of the real image string.
+    large and registries vary). It exists to catch two distinct failure
+    modes:
+
+    1. A Python object having been accidentally stringified
+       (`str(container)`, `repr(...)`, `"{...}"`) instead of the real image
+       string being read.
+    2. A CI/CD or IaC templating placeholder that was never substituted —
+       the live incident this guard was written for: a ReplicaSet whose
+       image was literally the string
+       "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/.../citizen-service:PLACEHOLDER".
+       That string is syntactically well-formed (no bad characters, not
+       empty) — check (1) alone does not catch it. `ACCOUNT_ID` and
+       `REGION` are checked as exact path segments, not substrings, so a
+       real image is never falsely rejected: a genuine ECR host is
+       `<12 digits>.dkr.ecr.<region>.amazonaws.com` — digits and a real
+       lowercase region name (`eu-central-1`) never equal the literal
+       uppercase token `ACCOUNT_ID`/`REGION`.
     """
     if not isinstance(image, str):
         return False
@@ -792,6 +836,16 @@ def _looks_like_a_valid_image_reference(image: Any) -> bool:
     if image in ("None", "null", "{}", "[]") or image.startswith(("{", "[", "<")):
         return False
     if any(ch.isspace() for ch in image):
+        return False
+    # Unsubstituted templating placeholders. Segment-based (split on the
+    # separators an image reference actually uses), not a raw substring
+    # search, so e.g. a hypothetical real repo path containing "region" as
+    # part of a longer real word is not what is being matched here — these
+    # are checked as whole path segments / tag values only.
+    segments = re.split(r"[./:@]", image)
+    if "ACCOUNT_ID" in segments or "REGION" in segments:
+        return False
+    if image.endswith(":PLACEHOLDER") or image.endswith("/PLACEHOLDER"):
         return False
     return True
 

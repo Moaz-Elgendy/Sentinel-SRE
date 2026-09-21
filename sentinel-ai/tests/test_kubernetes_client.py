@@ -328,7 +328,167 @@ async def test_rollback_refuses_when_only_the_init_container_image_is_bad():
         ("{}", False),
         ("<V1Container object>", False),
         ("has a space:latest", False),
+        # The live citizen-service/frontend incident: an unsubstituted
+        # CI/CD templating placeholder. Syntactically well-formed (no bad
+        # characters, not empty) — only the placeholder-segment check
+        # catches it.
+        ("ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/citizen-service:PLACEHOLDER", False),
+        ("890608336467.dkr.ecr.eu-central-1.amazonaws.com/sentinel-sre-demo/frontend:PLACEHOLDER", False),
+        # A REAL ECR image must never be rejected: numeric account id, real
+        # lowercase region — neither literally equals "ACCOUNT_ID"/"REGION".
+        (
+            "890608336467.dkr.ecr.eu-central-1.amazonaws.com/sentinel-sre-demo/"
+            "citizen-service:6e36eedd0da47e4a24f0aa5a1c534ce6f4954a84",
+            True,
+        ),
     ],
 )
 def test_looks_like_a_valid_image_reference(image, expected):
     assert _looks_like_a_valid_image_reference(image) is expected
+
+
+# ---------------------------------------------------------------------------
+# list_replicasets — images_valid must see BOTH containers and
+# initContainers, and must not be fooled by a well-formed-looking
+# placeholder host/tag.
+# ---------------------------------------------------------------------------
+class _Owner:
+    def __init__(self, kind, name):
+        self.kind = kind
+        self.name = name
+
+
+class _RSMeta:
+    def __init__(self, name, revision, owner_name, creation_timestamp=None):
+        self.name = name
+        self.annotations = {"deployment.kubernetes.io/revision": str(revision)}
+        self.owner_references = [_Owner("Deployment", owner_name)]
+        self.creation_timestamp = creation_timestamp
+
+
+class _RSStatus:
+    def __init__(self, ready_replicas=0):
+        self.ready_replicas = ready_replicas
+
+
+class _PodTemplateSpec:
+    def __init__(self, containers, init_containers=None):
+        self.containers = containers
+        self.init_containers = init_containers or []
+
+
+class _PodTemplate:
+    def __init__(self, containers, init_containers=None):
+        self.spec = _PodTemplateSpec(containers, init_containers)
+
+
+class _RSSpec:
+    def __init__(self, replicas, containers, init_containers=None):
+        self.replicas = replicas
+        self.template = _PodTemplate(containers, init_containers)
+
+
+class _FakeReplicaSet:
+    def __init__(
+        self, name, revision, owner_name, containers, init_containers=None,
+        replicas=1, ready_replicas=0,
+    ):
+        self.metadata = _RSMeta(name, revision, owner_name)
+        self.spec = _RSSpec(replicas, containers, init_containers)
+        self.status = _RSStatus(ready_replicas)
+
+
+class _FakeAppsV1ForReplicaSets:
+    def __init__(self, items):
+        self._items = items
+
+    def list_namespaced_replica_set(self, namespace):
+        class _List:
+            def __init__(self, items):
+                self.items = items
+
+        return _List(self._items)
+
+
+def _client_with_fake_replicasets(items) -> KubernetesClient:
+    client = KubernetesClient()
+    client._available = True  # noqa: SLF001
+    client._apps = _FakeAppsV1ForReplicaSets(items)  # noqa: SLF001
+    return client
+
+
+@pytest.mark.asyncio
+async def test_list_replicasets_marks_a_real_ecr_image_valid():
+    class _C:
+        def __init__(self, image):
+            self.image = image
+
+    rs = _FakeReplicaSet(
+        "citizen-service-5654c9bc4c", 65, "citizen-service",
+        containers=[_C(TAG_IMAGE)], init_containers=[_C(TAG_IMAGE)],
+    )
+
+    client = _client_with_fake_replicasets([rs])
+    out = await client.list_replicasets("citizen-portal", "citizen-service")
+
+    assert len(out) == 1
+    assert out[0]["images_valid"] is True
+    assert out[0]["init_images"] == [TAG_IMAGE]
+
+
+@pytest.mark.asyncio
+async def test_list_replicasets_flags_placeholder_container_image_as_invalid():
+    class _C:
+        def __init__(self, image):
+            self.image = image
+
+    rs = _FakeReplicaSet(
+        "citizen-service-5f5f6754bf", 66, "citizen-service",
+        containers=[_C(
+            "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/citizen-service:PLACEHOLDER"
+        )],
+        init_containers=[_C(
+            "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/sentinel-sre-demo/citizen-service:PLACEHOLDER"
+        )],
+    )
+
+    client = _client_with_fake_replicasets([rs])
+    out = await client.list_replicasets("citizen-portal", "citizen-service")
+
+    assert out[0]["images_valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_replicasets_flags_invalid_when_only_init_container_is_bad():
+    """The `frontend`/`citizen-service` dual-container concern: preserving
+    (or here, validating) `containers[]` while forgetting `initContainers[]`
+    is exactly the bug class this guards against."""
+    class _C:
+        def __init__(self, image):
+            self.image = image
+
+    rs = _FakeReplicaSet(
+        "citizen-service-abc", 66, "citizen-service",
+        containers=[_C(TAG_IMAGE)],
+        init_containers=[_C("ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/x/y:PLACEHOLDER")],
+    )
+
+    client = _client_with_fake_replicasets([rs])
+    out = await client.list_replicasets("citizen-portal", "citizen-service")
+
+    assert out[0]["images_valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_replicasets_filters_by_owning_deployment():
+    class _C:
+        def __init__(self, image):
+            self.image = image
+
+    owned = _FakeReplicaSet("citizen-service-a", 65, "citizen-service", containers=[_C(TAG_IMAGE)])
+    other = _FakeReplicaSet("frontend-a", 43, "frontend", containers=[_C(TAG_IMAGE)])
+
+    client = _client_with_fake_replicasets([owned, other])
+    out = await client.list_replicasets("citizen-portal", "citizen-service")
+
+    assert [r["name"] for r in out] == ["citizen-service-a"]

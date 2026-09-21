@@ -1,135 +1,84 @@
+import { ArrowRight, ShieldOff } from 'lucide-react'
 import { Fragment } from 'react'
-import { applyRemediationChange, getRemediationConfig, previewRemediationChange } from '../api/config.js'
-import { ChangeReview, LastChanged, ReadOnlyCard } from '../components/config/ConfigParts.jsx'
-import AlertBanner from '../components/ui/AlertBanner.jsx'
-import Button from '../components/ui/Button.jsx'
-import Card from '../components/ui/Card.jsx'
-import { ErrorState } from '../components/ui/EmptyState.jsx'
-import Icon from '../components/ui/Icon.jsx'
-import { PageSkeleton } from '../components/ui/Loading.jsx'
-import PageHeader from '../components/ui/PageHeader.jsx'
-import StatusPill from '../components/ui/StatusPill.jsx'
-import { useConfigEditor } from '../hooks/useConfigEditor.js'
-import { usePageTitle } from '../hooks/usePageTitle.js'
-import { titleCase } from '../utils/format.js'
+import { applyRemediationChange, getRemediationConfig, previewRemediationChange } from '@/api/config'
+import { ConfigPage, ReadOnlyPanel, SettingRow, SettingsSection } from '@/components/config/ConfigShell'
+import { Callout } from '@/components/sentinel/States'
+import { Badge } from '@/components/ui/badge'
+import { Switch } from '@/components/ui/switch'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { useConfigEditor } from '@/hooks/useConfigEditor'
+import { usePageTitle } from '@/hooks/usePageTitle'
+import { actionLabel, rootCauseLabel } from '@/utils/incident'
 
-// This page has one editable setting (dry run) and it is changed through the
-// same review → confirm flow as everything else, started from the toggle.
+// One editable setting (dry run). It is changed through the same review → confirm
+// flow as everything else, started directly from the switch.
 const makeDraft = (current) => ({ dry_run: current.dry_run })
 const diffChanges = () => ({})
 
 export default function RemediationConfigPage() {
-  usePageTitle('Remediation')
-  const editor = useConfigEditor({
-    load: getRemediationConfig,
-    previewChange: previewRemediationChange,
-    applyChange: applyRemediationChange,
-    makeDraft,
-    diffChanges,
-    loadErrorMessage: 'Could not load remediation configuration.',
-  })
-  const { data, preview } = editor
-
-  if (editor.loading) return <PageSkeleton label="Loading remediation configuration…" cards={2} />
-  if (editor.loadError) {
-    return <ErrorState title="Couldn't load remediation configuration" message={editor.loadError} onRetry={editor.retryLoad} />
-  }
-  if (!data) return null
-
-  const readOnly = data.read_only
-  const dryRun = data.current.dry_run
+  usePageTitle('Remediation configuration')
+  const editor = useConfigEditor({ load: getRemediationConfig, previewChange: previewRemediationChange, applyChange: applyRemediationChange, makeDraft, diffChanges, loadErrorMessage: 'Could not load remediation configuration.' })
+  const readOnly = editor.data?.read_only
+  const dryRun = editor.data?.current.dry_run
 
   return (
-    <div className="page">
-      <PageHeader
-        title="Remediation"
-        subtitle={
-          <>
-            How Sentinel applies the actions it decides on.
-            <LastChanged at={data.last_changed_at} by={data.last_changed_by} />
-          </>
-        }
-      />
-
-      {editor.justApplied && !preview && (
-        <AlertBanner tone="success">Configuration applied — Sentinel is using the new value now.</AlertBanner>
-      )}
-      {editor.actionError && <AlertBanner>{editor.actionError}</AlertBanner>}
-
-      {preview ? (
-        <ChangeReview
-          preview={preview}
-          reason={editor.reason}
-          onReasonChange={editor.setReason}
-          applying={editor.applying}
-          onApply={editor.apply}
-          onCancel={editor.cancelReview}
-        />
-      ) : (
+    <ConfigPage editor={editor} noActionBar description="How Sentinel applies the actions it decides on." appliedMessage="Configuration applied. Sentinel is using the new mode now.">
+      {editor.data && (
         <>
-          <Card
-            title="Dry run mode"
-            description="When on, Sentinel decides and authorises actions exactly as normal, but does not apply them to the cluster — everything else (evidence, RCA, Policy Engine, audit trail) runs for real."
-          >
-            <div className="mode-row">
-              <div className="mode-row__state">
-                <StatusPill
-                  size="lg"
-                  status={dryRun ? 'unknown' : 'escalated'}
-                  label={dryRun ? 'Dry run — no cluster mutations' : 'Autonomous — actions are applied'}
-                />
+          <SettingsSection title="Dry run" description="When on, Sentinel decides and authorizes actions exactly as normal but applies none of them to the cluster. Evidence, diagnosis, policy checks and the audit trail all still run.">
+            <SettingRow label={dryRun ? 'Dry run is on' : 'Sentinel is applying actions'} hint={dryRun ? 'No changes are being made to the cluster. Turn it off to let Sentinel remediate.' : 'Turn dry run on to observe decisions without any risk to the cluster.'}>
+              <div className="flex items-center gap-3">
+                <Switch checked={dryRun} onCheckedChange={() => editor.review({ dry_run: !dryRun })} disabled={editor.reviewing} aria-label="Dry run mode" />
+                <Badge variant={dryRun ? 'warn' : 'neutral'}>{dryRun ? 'Dry run' : 'Autonomous'}</Badge>
               </div>
-              <Button
-                variant={dryRun ? 'caution' : 'secondary'}
-                onClick={() => editor.review({ dry_run: !dryRun })}
-                busy={editor.reviewing}
-                busyLabel="Validating…"
-              >
-                {dryRun ? 'Turn dry run off' : 'Turn dry run on'}
-              </Button>
-            </div>
-          </Card>
-
-          <ReadOnlyCard title="Action ladder" description={readOnly.description}>
-            <div className="card card--flush table-wrap">
-              <table className="table">
+            </SettingRow>
+          </SettingsSection>
+          {!dryRun && (
+            <Callout tone="neutral" icon={ShieldOff}>
+              Toggling this opens a review first. Nothing changes until you confirm.
+            </Callout>
+          )}
+          <ReadOnlyPanel title="Action ladder" description={readOnly.description}>
+            <div className="overflow-hidden rounded-md border">
+              <Table>
                 <caption className="sr-only">Candidate remediation actions per root cause</caption>
-                <thead>
-                  <tr>
-                    <th scope="col">Root cause</th>
-                    <th scope="col">Candidate actions, in order</th>
-                  </tr>
-                </thead>
-                <tbody>
+                <TableHeader>
+                  <TableRow className="hover:bg-transparent">
+                    <TableHead>When the diagnosis is</TableHead>
+                    <TableHead>Sentinel tries, in order</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
                   {Object.entries(readOnly.action_ladder).map(([rootCause, actions]) => (
-                    <tr key={rootCause}>
-                      <td>{titleCase(rootCause)}</td>
-                      <td>
+                    <TableRow key={rootCause}>
+                      <TableCell>{rootCauseLabel(rootCause)}</TableCell>
+                      <TableCell>
                         {actions.length > 0 ? (
-                          <span className="ladder">
+                          <span className="inline-flex flex-wrap items-center gap-1.5">
                             {actions.map((action, i) => (
                               <Fragment key={action}>
-                                {i > 0 && <Icon name="arrowRight" size={12} className="ladder__arrow" />}
-                                <span className="tag">{titleCase(action)}</span>
+                                {i > 0 && <ArrowRight aria-label="then" className="size-3 text-muted-foreground" />}
+                                <Badge variant="secondary" className="font-normal">
+                                  {actionLabel(action)}
+                                </Badge>
                               </Fragment>
                             ))}
                           </span>
                         ) : (
-                          <span className="muted">Never remediable</span>
+                          <span className="text-muted-foreground">Never remediated: always escalates to an SRE</span>
                         )}
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   ))}
-                </tbody>
-              </table>
+                </TableBody>
+              </Table>
             </div>
-            <p className="muted small ladder__footnote">
-              Fallback confidence discount: <span className="num">{readOnly.fallback_confidence_discount}</span> per step down the
-              ladder.
+            <p className="mt-2 text-xs text-muted-foreground">
+              Each step down the ladder discounts confidence by <span className="tnum font-medium text-foreground">{readOnly.fallback_confidence_discount}</span>, so a fallback needs stronger evidence to pass policy.
             </p>
-          </ReadOnlyCard>
+          </ReadOnlyPanel>
         </>
       )}
-    </div>
+    </ConfigPage>
   )
 }

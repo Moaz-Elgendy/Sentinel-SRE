@@ -29,44 +29,9 @@ from app.clients.github_client import GitHubClient
 from app.clients.kubernetes_client import KubernetesClient
 from app.clients.loki import LokiClient, looks_like_chaos_silence, summarise
 from app.clients.prometheus import PrometheusClient
-from app.lifecycle.correlation import CRASHLOOP_WAITING_REASONS
 from app.models.incident import Evidence, Incident
 
 logger = logging.getLogger(__name__)
-
-# Tail length for the targeted init-container log fetch below. Small on
-# purpose — this only needs to show the failure (a traceback, a
-# connection-refused line), not a full log dump.
-INIT_CONTAINER_LOG_TAIL_LINES = 100
-
-
-def _find_failing_init_container(
-    pods: list[dict[str, Any]],
-) -> tuple[str, str, bool] | None:
-    """First (pod, init container) that looks like it is the reason a
-    rollout is stuck, or None.
-
-    Returns `(pod_name, container_name, use_previous)`. `use_previous` is
-    True when the container is currently *waiting* (mid-backoff, no live
-    attempt to read logs from) and False when it has a `terminated` state of
-    its own to read directly — matching what `kubectl logs` vs
-    `kubectl logs --previous` would each actually return.
-
-    Deliberately returns at most one target: this is a targeted, bounded
-    evidence fetch, not a sweep of every crash-looping container in the
-    namespace.
-    """
-    for pod in pods:
-        for container in pod.get("container_states") or []:
-            if not container.get("is_init"):
-                continue
-            waiting = container.get("waiting_reason")
-            terminated = container.get("terminated_reason")
-            if waiting in CRASHLOOP_WAITING_REASONS:
-                return pod.get("name"), container.get("name"), True
-            if terminated and terminated not in ("Completed",):
-                return pod.get("name"), container.get("name"), False
-    return None
 
 # How far back the evidence window reaches. 15 minutes covers the typical
 # `for:` duration on the existing alert rules (2-5m) plus enough lead-in to
@@ -222,31 +187,6 @@ async def investigate(
     evidence.restart_count_total = sum(
         int(p.get("restart_count") or 0) for p in evidence.pods
     )
-
-    # ---- targeted init-container log retrieval ---------------------------
-    # Sequential and conditional, same pattern as the GitHub commit lookup
-    # below: it depends on `evidence.pods` from the parallel gather above,
-    # and it only runs at all when that evidence already shows a failing
-    # init container. Every other incident pays nothing for this.
-    failing_init = _find_failing_init_container(evidence.pods)
-    if failing_init and k8s.available:
-        pod_name, container_name, use_previous = failing_init
-        try:
-            log_result = await k8s.get_container_logs(
-                namespace,
-                pod_name,
-                container_name,
-                tail_lines=INIT_CONTAINER_LOG_TAIL_LINES,
-                previous=use_previous,
-            )
-            evidence.init_container_logs.append(log_result)
-        except Exception as exc:  # noqa: BLE001
-            # Same fail-soft contract as every other collector: a log-fetch
-            # failure is recorded, not raised — the rest of RCA still runs
-            # on the container-state evidence alone.
-            evidence.errors.append(
-                f"collector 'init_container_logs' failed: {str(exc)[:200]}"
-            )
 
     history = evidence.replicaset_history
     if history:

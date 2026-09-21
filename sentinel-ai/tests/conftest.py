@@ -198,25 +198,12 @@ class FakePrometheus:
 class FakeKubernetes:
     """Records every write so tests can assert on what was (not) called."""
 
-    def __init__(
-        self,
-        available=True,
-        deployment=None,
-        pods=None,
-        replicasets=None,
-        container_logs=None,
-    ):
+    def __init__(self, available=True, deployment=None, pods=None, replicasets=None):
         self.available = available
         self.init_error = "" if available else "fake: not in cluster"
         self._deployment = deployment
         self._pods = pods or []
         self._replicasets = replicasets or []
-        # What get_container_logs() should return, keyed by
-        # (pod, container, previous) — falls back to a generic "available"
-        # result for anything not explicitly configured, so tests that don't
-        # care about log content don't need to configure it.
-        self._container_logs = container_logs or {}
-        self.log_calls: list[tuple[str, str, str, int, bool]] = []
         self.writes: list[tuple[str, dict]] = []
 
     async def get_deployment(self, namespace, name):
@@ -230,22 +217,6 @@ class FakeKubernetes:
 
     async def list_replicasets(self, namespace, deployment):
         return self._replicasets
-
-    async def get_container_logs(
-        self, namespace, pod, container, *, tail_lines=100, previous=False
-    ):
-        self.log_calls.append((namespace, pod, container, tail_lines, previous))
-        key = (pod, container, previous)
-        if key in self._container_logs:
-            return self._container_logs[key]
-        return {
-            "pod": pod,
-            "container": container,
-            "previous": previous,
-            "available": True,
-            "error": None,
-            "lines": ["fake log line"],
-        }
 
     async def restart_deployment(self, namespace, name):
         self.writes.append(("restart", {"namespace": namespace, "name": name}))
@@ -367,10 +338,10 @@ def gui_client(tmp_path):
     settings_obj.openai_timeout_seconds = 20.0
     settings_obj.openai_base_url = ""
     settings_obj.gemini_api_key = ""
-    settings_obj.gemini_model = "gemini-3.5-flash"
+    settings_obj.gemini_model = "gemini-2.0-flash"
     settings_obj.gemini_timeout_seconds = 20.0
     settings_obj.groq_api_key = ""
-    settings_obj.groq_model = "openai/gpt-oss-120b"
+    settings_obj.groq_model = "llama-3.3-70b-versatile"
     settings_obj.groq_timeout_seconds = 20.0
 
     def login(client) -> dict[str, str]:

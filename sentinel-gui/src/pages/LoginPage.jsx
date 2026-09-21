@@ -1,12 +1,15 @@
+import { Eye, EyeOff, LoaderCircle } from 'lucide-react'
 import { useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { extractErrorMessage } from '../api/client.js'
-import AlertBanner from '../components/ui/AlertBanner.jsx'
-import Button from '../components/ui/Button.jsx'
-import Field from '../components/ui/Field.jsx'
-import Icon, { BrandMark } from '../components/ui/Icon.jsx'
-import { useAuth } from '../context/AuthContext.jsx'
-import { usePageTitle } from '../hooks/usePageTitle.js'
+import { extractErrorMessage } from '@/api/client'
+import { BrandMark } from '@/components/sentinel/BrandMark'
+import { Callout } from '@/components/sentinel/States'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { useAuth } from '@/context/AuthContext'
+import { usePageTitle } from '@/hooks/usePageTitle'
+import { CircleAlert } from 'lucide-react'
 
 export default function LoginPage() {
   usePageTitle('Sign in')
@@ -30,8 +33,7 @@ export default function LoginPage() {
     setSubmitting(true)
     try {
       await login(form.username, form.password)
-      const redirectTo = location.state?.from?.pathname ?? '/'
-      navigate(redirectTo, { replace: true })
+      navigate(location.state?.from?.pathname ?? '/', { replace: true })
     } catch (err) {
       setError(extractErrorMessage(err, 'Incorrect username or password.'))
     } finally {
@@ -40,74 +42,68 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="auth-page">
-      <main className="auth-card">
-        <div className="auth-card__brand">
-          <BrandMark size={36} />
+    <main className="grid min-h-svh place-items-center bg-background px-4 py-10">
+      <div className="w-full max-w-sm">
+        <div className="mb-6 flex items-center gap-3">
+          <span className="grid size-10 place-items-center rounded-lg border bg-card">
+            <BrandMark className="size-6" />
+          </span>
           <div>
-            <h1>Sentinel SRE Control Center</h1>
-            <p className="auth-card__subtitle">Authorized SRE administrator access only.</p>
+            <h1 className="text-lg leading-6 font-semibold tracking-tight">Sentinel</h1>
+            <p className="text-xs text-muted-foreground">Autonomous SRE control center</p>
           </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="stack">
-          <AlertBanner>{error}</AlertBanner>
+        <form onSubmit={handleSubmit} className="space-y-4 rounded-lg border bg-card p-5">
+          <div>
+            <h2 className="text-sm font-semibold">Sign in</h2>
+            <p className="mt-0.5 text-xs text-muted-foreground">Authorized SRE administrator access only.</p>
+          </div>
 
-          <Field label="Username">
-            <input
-              type="text"
-              name="username"
-              className="input"
-              value={form.username}
-              onChange={handleChange}
-              required
-              autoComplete="username"
-              autoFocus
-            />
-          </Field>
+          {error && (
+            <Callout tone="bad" icon={CircleAlert}>
+              {error}
+            </Callout>
+          )}
 
-          <Field label="Password">
-            <PasswordInput
-              value={form.password}
-              onChange={handleChange}
-              visible={showPassword}
-              onToggle={() => setShowPassword((v) => !v)}
-            />
-          </Field>
+          <div className="space-y-1.5">
+            <Label htmlFor="username">Username</Label>
+            <Input id="username" name="username" value={form.username} onChange={handleChange} required autoComplete="username" autoFocus />
+          </div>
 
-          <Button type="submit" variant="primary" className="button--block" busy={submitting} busyLabel="Signing in…">
-            Sign in
+          <div className="space-y-1.5">
+            <Label htmlFor="password">Password</Label>
+            <div className="relative">
+              <Input
+                id="password"
+                name="password"
+                type={showPassword ? 'text' : 'password'}
+                value={form.password}
+                onChange={handleChange}
+                required
+                autoComplete="current-password"
+                className="pr-9"
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="absolute top-0.5 right-0.5 text-muted-foreground"
+                onClick={() => setShowPassword((v) => !v)}
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                aria-pressed={showPassword}
+              >
+                {showPassword ? <EyeOff /> : <Eye />}
+              </Button>
+            </div>
+          </div>
+
+          <Button type="submit" className="w-full" disabled={submitting}>
+            {submitting && <LoaderCircle className="animate-spin" />}
+            {submitting ? 'Signing in…' : 'Sign in'}
           </Button>
         </form>
-      </main>
-    </div>
-  )
-}
-
-// Field injects id / aria-describedby into its direct child, so the input and
-// its reveal toggle live inside one wrapper component that forwards them.
-function PasswordInput({ visible, onToggle, ...inputProps }) {
-  return (
-    <div className="input-group input-group--trailing">
-      <input
-        type={visible ? 'text' : 'password'}
-        name="password"
-        className="input"
-        required
-        autoComplete="current-password"
-        {...inputProps}
-      />
-      <span className="input-group__trailing">
-        <button
-          type="button"
-          className="icon-button icon-button--sm"
-          onClick={onToggle}
-          aria-pressed={visible}
-          aria-label={visible ? 'Hide password' : 'Show password'}
-        >
-          <Icon name={visible ? 'eyeOff' : 'eye'} size={15} />
-        </button>
-      </span>
-    </div>
+      </div>
+    </main>
   )
 }

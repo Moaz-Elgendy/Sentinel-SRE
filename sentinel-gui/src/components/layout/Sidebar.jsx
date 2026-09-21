@@ -1,121 +1,102 @@
-import { useEffect, useRef } from 'react'
-import { Link, NavLink } from 'react-router-dom'
-import { useSummary } from '../../context/SummaryContext.jsx'
-import Icon, { BrandMark } from '../ui/Icon.jsx'
+import { ChevronsUpDown, LogOut, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import { Button } from '@/components/ui/button'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { useAuth } from '@/context/AuthContext'
+import { useSummary } from '@/context/SummaryContext'
+import { cn } from '@/lib/utils'
+import { BrandMark } from '../sentinel/BrandMark.jsx'
+import { SidebarNav } from './SidebarNav.jsx'
 
-const NAV_ITEMS = [
-  { to: '/', label: 'Dashboard', icon: 'dashboard', end: true },
-  { to: '/incidents', label: 'Incidents', icon: 'alertTriangle', badge: true },
-  { to: '/live', label: 'Sentinel Live', icon: 'radio' },
-  { to: '/logs', label: 'Sentinel Logs', icon: 'terminal' },
-  { to: '/environment', label: 'Environment', icon: 'server' },
-  { to: '/actions', label: 'Action History', icon: 'history' },
-  { to: '/performance', label: 'Performance', icon: 'activity' },
-]
-
-const ADMIN_NAV_ITEMS = [
-  { to: '/policies', label: 'Policies', icon: 'shield' },
-  { to: '/rca-config', label: 'RCA & Diagnosis', icon: 'search' },
-  { to: '/remediation-config', label: 'Remediation', icon: 'wrench' },
-  { to: '/ai-config', label: 'AI & Reasoning', icon: 'cpu' },
-  { to: '/monitoring-config', label: 'Monitoring', icon: 'eye' },
-  { to: '/config-history', label: 'Configuration History', icon: 'fileText' },
-]
-
-function NavItem({ item, activeIncidents }) {
-  const showBadge = item.badge && activeIncidents > 0
+export function SidebarBrand({ collapsed }) {
+  const { data } = useSummary()
+  const env = data?.environment
   return (
-    <NavLink to={item.to} end={item.end} className="sidebar__link">
-      <Icon name={item.icon} size={16} />
-      {item.label}
-      {showBadge && (
-        <span className="sidebar__badge">
-          {activeIncidents}
-          <span className="sr-only"> active</span>
-        </span>
+    <div className={cn('flex h-12 shrink-0 items-center gap-2.5 border-b border-sidebar-border px-4', collapsed && 'justify-center px-0')}>
+      <BrandMark className="size-6 shrink-0 text-sidebar-foreground" />
+      {!collapsed && (
+        <div className="min-w-0 leading-tight">
+          <p className="text-sm font-semibold tracking-tight">Sentinel</p>
+          <p className="truncate text-[11px] text-sidebar-foreground/60" title={env ? `${env.name} · ${env.customer_id}` : undefined}>
+            {env?.name ?? 'Autonomous SRE'}
+          </p>
+        </div>
       )}
-    </NavLink>
+    </div>
   )
 }
 
-export default function Sidebar({ open, onClose }) {
-  const { data: summary } = useSummary()
-  const activeIncidents = summary?.incidents?.active_incidents ?? 0
-  const ref = useRef(null)
-
-  // Small screens: the sidebar is a modal drawer, so keep keyboard focus inside
-  // it while open and let Escape close it.
-  useEffect(() => {
-    if (!open) return undefined
-    const root = ref.current
-    const focusable = () => [...root.querySelectorAll('a[href], button:not([disabled])')]
-    focusable()[0]?.focus()
-
-    function handleKeyDown(event) {
-      if (event.key === 'Escape') {
-        onClose()
-        return
-      }
-      if (event.key !== 'Tab') return
-      const items = focusable()
-      const first = items[0]
-      const last = items[items.length - 1]
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [open, onClose])
-
+export function UserMenu({ collapsed }) {
+  const { admin, logout } = useAuth()
+  const name = admin?.username ?? 'admin'
+  const trigger = (
+    <button
+      type="button"
+      className={cn(
+        'flex h-10 w-full items-center gap-2.5 rounded-md px-2 text-left text-sm outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring',
+        collapsed && 'justify-center px-0'
+      )}
+    >
+      <Avatar className="size-6">
+        <AvatarFallback className="bg-sidebar-accent text-[11px] font-medium uppercase">{name.slice(0, 1)}</AvatarFallback>
+      </Avatar>
+      {!collapsed && (
+        <>
+          <span className="flex-1 truncate">{name}</span>
+          <ChevronsUpDown aria-hidden="true" className="size-3.5 text-sidebar-foreground/50" />
+        </>
+      )}
+    </button>
+  )
   return (
-    <aside ref={ref} id="app-sidebar" className={`sidebar${open ? ' sidebar--open' : ''}`} aria-label="Sentinel navigation">
-      <div className="sidebar__head">
-        <Link to="/" className="sidebar__brand" aria-label="Sentinel SRE Control Center — dashboard">
-          <BrandMark />
-          <div>
-            <div className="sidebar__brand-title">Sentinel</div>
-            <div className="sidebar__brand-subtitle">SRE Control Center</div>
-          </div>
-        </Link>
-        <button type="button" className="icon-button sidebar__close" onClick={onClose} aria-label="Close navigation">
-          <Icon name="x" size={18} />
-        </button>
-      </div>
+    <DropdownMenu>
+      {collapsed ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent side="right">{name}</TooltipContent>
+        </Tooltip>
+      ) : (
+        <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
+      )}
+      <DropdownMenuContent side="top" align="start" className="w-52">
+        <DropdownMenuLabel className="font-normal">
+          <p className="text-xs text-muted-foreground">Signed in as</p>
+          <p className="truncate text-sm font-medium">{name}</p>
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={logout}>
+          <LogOut /> Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
 
-      <nav className="sidebar__group" aria-label="Operations">
-        {NAV_ITEMS.map((item) => (
-          <NavItem key={item.to} item={item} activeIncidents={activeIncidents} />
-        ))}
-      </nav>
-
-      <div className="sidebar__label" id="admin-nav-label">
-        Administration
-      </div>
-      <nav className="sidebar__group" aria-labelledby="admin-nav-label">
-        {ADMIN_NAV_ITEMS.map((item) => (
-          <NavItem key={item.to} item={item} activeIncidents={0} />
-        ))}
-      </nav>
-
-      {/* Kept visually and structurally separate from the operational console
-          above — this is an admin/demo utility for intentionally triggering a
-          scenario during a presentation, not a Sentinel capability. */}
-      <div className="sidebar__demo">
-        <div className="sidebar__label" id="demo-nav-label">
-          Demo utilities
-        </div>
-        <nav className="sidebar__group" aria-labelledby="demo-nav-label">
-          <NavLink to="/demo" className="sidebar__link sidebar__link--demo">
-            <Icon name="flask" size={16} />
-            Chaos scenarios
-          </NavLink>
-        </nav>
+export function Sidebar({ collapsed, onToggle }) {
+  return (
+    <aside
+      className={cn(
+        'sticky top-0 hidden h-svh shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-[width] duration-200 lg:flex',
+        collapsed ? 'w-14' : 'w-58'
+      )}
+    >
+      <SidebarBrand collapsed={collapsed} />
+      <SidebarNav collapsed={collapsed} />
+      <div className="flex flex-col gap-1 border-t border-sidebar-border p-2">
+        <UserMenu collapsed={collapsed} />
+        <Button
+          variant="ghost"
+          size={collapsed ? 'icon' : 'sm'}
+          onClick={onToggle}
+          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          className={cn('text-sidebar-foreground/60 hover:text-sidebar-foreground', collapsed ? 'mx-auto' : 'justify-start')}
+        >
+          {collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+          {!collapsed && 'Collapse'}
+        </Button>
       </div>
     </aside>
   )

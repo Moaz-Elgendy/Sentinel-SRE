@@ -737,6 +737,38 @@ class Orchestrator:
                     attempt = AttemptRecord(plan=plan, verdict=verdict)
                     incident.attempts.append(attempt)
 
+                    # ---- ROLLBACK TARGET AUDIT --------------------------
+                    # Sentinel is about to autonomously mutate a Deployment.
+                    # Show exactly which ReplicaSet/images were selected and
+                    # why — real evidence pulled from what was already
+                    # collected, not a scripted line — before the write
+                    # happens, not only after. This is what would have
+                    # caught the citizen-service/frontend placeholder-image
+                    # incident before it reached the cluster.
+                    if plan.action is RemediationAction.ROLLBACK_DEPLOYMENT:
+                        target_rs = next(
+                            (
+                                r
+                                for r in evidence.replicaset_history
+                                if r.get("revision") == plan.params.target_revision
+                            ),
+                            None,
+                        )
+                        if target_rs is not None:
+                            self._emit(
+                                incident,
+                                "Rollback target selected — "
+                                f"deployment={plan.params.deployment} "
+                                f"current_revision={findings.current_revision} "
+                                f"target={target_rs.get('name', '<unknown>')} "
+                                f"target_revision={target_rs.get('revision')} "
+                                f"containers={target_rs.get('images')} "
+                                f"initContainers={target_rs.get('init_images')} "
+                                f"images_valid={target_rs.get('images_valid', 'unknown')} "
+                                f"skipped_invalid_candidates={findings.rollback_candidates_skipped}",
+                                "rollback_target_selected",
+                            )
+
                     # ---- AUTONOMOUS EXECUTION ---------------------------
                     incident.record(
                         LifecyclePhase.AUTONOMOUS_EXECUTION,

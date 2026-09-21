@@ -1,19 +1,21 @@
+import { SearchX } from 'lucide-react'
 import { Link } from 'react-router-dom'
-import EmptyState from '../components/ui/EmptyState.jsx'
-import { usePageTitle } from '../hooks/usePageTitle.js'
+import { EmptyState } from '@/components/sentinel/States'
+import { Button } from '@/components/ui/button'
+import { usePageTitle } from '@/hooks/usePageTitle'
 
 export default function NotFoundPage() {
   usePageTitle('Page not found')
   return (
-    <main className="auth-page">
+    <main className="grid min-h-svh place-items-center">
       <EmptyState
-        icon="search"
+        icon={SearchX}
         title="Page not found"
         description="That page doesn't exist, or it has moved."
         action={
-          <Link to="/" className="button button--primary">
-            Back to dashboard
-          </Link>
+          <Button asChild>
+            <Link to="/">Back to command center</Link>
+          </Button>
         }
       />
     </main>

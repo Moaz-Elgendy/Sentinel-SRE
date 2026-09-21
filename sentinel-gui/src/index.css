@@ -1,7 +1,275 @@
-/* Sentinel SRE Control Center — stylesheet entry point.
-   Layers, in order: tokens → base → layout → components → pages. */
-@import './styles/tokens.css';
-@import './styles/base.css';
-@import './styles/layout.css';
-@import './styles/components.css';
-@import './styles/pages.css';
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Self-hosted (bundled) fonts: the console is served from the Sentinel host and
+   must not depend on a public font CDN being reachable during an incident. */
+@import "@fontsource/ibm-plex-sans/latin-400.css";
+@import "@fontsource/ibm-plex-sans/latin-500.css";
+@import "@fontsource/ibm-plex-sans/latin-600.css";
+@import "@fontsource/ibm-plex-mono/latin-400.css";
+@import "@fontsource/ibm-plex-mono/latin-500.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ==========================================================================
+   Sentinel design tokens
+
+   One principle: COLOUR MEANS STATE. Surfaces, text and primary actions are
+   neutral; hue is reserved for operational status (ok / warn / bad / info),
+   so anything coloured on screen is telling you something about the system.
+
+   Every status has four roles:  --x        text / icon on any surface (AA)
+                                 --x-solid  fills: dots, meters, bars
+                                 --x-tint   soft background behind a label
+                                 --x-edge   hairline around a tinted label
+   ========================================================================== */
+:root {
+  color-scheme: light;
+  --radius: 0.5rem;
+
+  --background: oklch(0.985 0.002 255);
+  --foreground: oklch(0.2 0.01 255);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0.01 255);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0.01 255);
+  --primary: oklch(0.2 0.01 255);
+  --primary-foreground: oklch(0.985 0.002 255);
+  --secondary: oklch(0.955 0.004 255);
+  --secondary-foreground: oklch(0.2 0.01 255);
+  --muted: oklch(0.968 0.004 255);
+  --muted-foreground: oklch(0.47 0.015 255);
+  --accent: oklch(0.94 0.005 255);
+  --accent-foreground: oklch(0.2 0.01 255);
+  --destructive: oklch(0.55 0.21 25);
+  --border: oklch(0.905 0.005 255);
+  --input: oklch(0.86 0.006 255);
+  --ring: oklch(0.55 0.15 240);
+
+  --ok: oklch(0.45 0.13 152);
+  --ok-solid: oklch(0.6 0.16 152);
+  --ok-tint: oklch(0.45 0.13 152 / 0.1);
+  --ok-edge: oklch(0.45 0.13 152 / 0.3);
+  --warn: oklch(0.5 0.12 70);
+  --warn-solid: oklch(0.72 0.16 72);
+  --warn-tint: oklch(0.6 0.14 72 / 0.13);
+  --warn-edge: oklch(0.55 0.13 70 / 0.38);
+  --bad: oklch(0.5 0.19 25);
+  --bad-solid: oklch(0.6 0.21 25);
+  --bad-tint: oklch(0.5 0.19 25 / 0.09);
+  --bad-edge: oklch(0.5 0.19 25 / 0.32);
+  --info: oklch(0.48 0.13 235);
+  --info-solid: oklch(0.62 0.15 235);
+  --info-tint: oklch(0.48 0.13 235 / 0.09);
+  --info-edge: oklch(0.48 0.13 235 / 0.3);
+  --neutral: oklch(0.5 0.015 255);
+  --neutral-solid: oklch(0.65 0.015 255);
+  --neutral-tint: oklch(0.5 0.015 255 / 0.09);
+  --neutral-edge: oklch(0.5 0.015 255 / 0.28);
+
+  --chart-1: var(--ok-solid);
+  --chart-2: var(--warn-solid);
+  --chart-3: var(--info-solid);
+  --chart-4: var(--bad-solid);
+  --chart-5: var(--neutral-solid);
+
+  --sidebar: oklch(0.975 0.003 255);
+  --sidebar-foreground: oklch(0.2 0.01 255);
+  --sidebar-primary: oklch(0.2 0.01 255);
+  --sidebar-primary-foreground: oklch(0.985 0.002 255);
+  --sidebar-accent: oklch(0.935 0.005 255);
+  --sidebar-accent-foreground: oklch(0.2 0.01 255);
+  --sidebar-border: oklch(0.905 0.005 255);
+  --sidebar-ring: oklch(0.55 0.15 240);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --background: oklch(0.155 0.005 255);
+  --foreground: oklch(0.96 0.003 255);
+  --card: oklch(0.19 0.006 255);
+  --card-foreground: oklch(0.96 0.003 255);
+  --popover: oklch(0.215 0.007 255);
+  --popover-foreground: oklch(0.96 0.003 255);
+  --primary: oklch(0.96 0.003 255);
+  --primary-foreground: oklch(0.18 0.006 255);
+  --secondary: oklch(0.245 0.007 255);
+  --secondary-foreground: oklch(0.96 0.003 255);
+  --muted: oklch(0.225 0.006 255);
+  --muted-foreground: oklch(0.72 0.012 255);
+  --accent: oklch(0.27 0.008 255);
+  --accent-foreground: oklch(0.96 0.003 255);
+  --destructive: oklch(0.62 0.21 25);
+  --border: oklch(0.29 0.008 255);
+  --input: oklch(0.33 0.009 255);
+  --ring: oklch(0.72 0.14 235);
+
+  --ok: oklch(0.81 0.16 155);
+  --ok-solid: oklch(0.7 0.17 152);
+  --ok-tint: oklch(0.7 0.17 152 / 0.12);
+  --ok-edge: oklch(0.7 0.17 152 / 0.36);
+  --warn: oklch(0.84 0.15 82);
+  --warn-solid: oklch(0.77 0.16 76);
+  --warn-tint: oklch(0.77 0.16 76 / 0.12);
+  --warn-edge: oklch(0.77 0.16 76 / 0.4);
+  --bad: oklch(0.81 0.15 25);
+  --bad-solid: oklch(0.66 0.21 25);
+  --bad-tint: oklch(0.66 0.21 25 / 0.13);
+  --bad-edge: oklch(0.66 0.21 25 / 0.42);
+  --info: oklch(0.83 0.11 225);
+  --info-solid: oklch(0.7 0.14 235);
+  --info-tint: oklch(0.7 0.14 235 / 0.13);
+  --info-edge: oklch(0.7 0.14 235 / 0.4);
+  --neutral: oklch(0.79 0.012 255);
+  --neutral-solid: oklch(0.55 0.012 255);
+  --neutral-tint: oklch(0.55 0.012 255 / 0.16);
+  --neutral-edge: oklch(0.55 0.012 255 / 0.36);
+
+  --sidebar: oklch(0.135 0.005 255);
+  --sidebar-foreground: oklch(0.96 0.003 255);
+  --sidebar-primary: oklch(0.96 0.003 255);
+  --sidebar-primary-foreground: oklch(0.18 0.006 255);
+  --sidebar-accent: oklch(0.225 0.007 255);
+  --sidebar-accent-foreground: oklch(0.96 0.003 255);
+  --sidebar-border: oklch(0.255 0.007 255);
+  --sidebar-ring: oklch(0.72 0.14 235);
+}
+
+@theme inline {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Dense operational UI: 13px body. `text-xs` stays 12px for metadata. */
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.25rem;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-ok: var(--ok);
+  --color-ok-solid: var(--ok-solid);
+  --color-ok-tint: var(--ok-tint);
+  --color-ok-edge: var(--ok-edge);
+  --color-warn: var(--warn);
+  --color-warn-solid: var(--warn-solid);
+  --color-warn-tint: var(--warn-tint);
+  --color-warn-edge: var(--warn-edge);
+  --color-bad: var(--bad);
+  --color-bad-solid: var(--bad-solid);
+  --color-bad-tint: var(--bad-tint);
+  --color-bad-edge: var(--bad-edge);
+  --color-info: var(--info);
+  --color-info-solid: var(--info-solid);
+  --color-info-tint: var(--info-tint);
+  --color-info-edge: var(--info-edge);
+  --color-neutral: var(--neutral);
+  --color-neutral-solid: var(--neutral-solid);
+  --color-neutral-tint: var(--neutral-tint);
+  --color-neutral-edge: var(--neutral-edge);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --animate-live-ring: live-ring 1.8s cubic-bezier(0.2, 0.7, 0.2, 1) infinite;
+  --animate-live-sweep: live-sweep 2.4s linear infinite;
+}
+
+@keyframes live-ring {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 55%, transparent);
+  }
+  70%,
+  100% {
+    box-shadow: 0 0 0 5px color-mix(in oklab, currentColor 0%, transparent);
+  }
+}
+
+/* A slow sweep across the active lifecycle segment: motion that exists only
+   because Sentinel is genuinely working on that stage right now. */
+@keyframes live-sweep {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans text-sm antialiased;
+    overflow-x: hidden;
+  }
+
+  /* Numbers that change or align in columns never jitter. */
+  time,
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--info-solid) 35%, transparent);
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  /* Honour the user's motion preference everywhere, including tw-animate and
+     the live indicators; state is still communicated by text and icons. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

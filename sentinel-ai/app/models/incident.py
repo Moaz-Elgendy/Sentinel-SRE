@@ -413,12 +413,6 @@ class Evidence:
     restart_count_total: int = 0
     latest_revision_age_seconds: float | None = None
 
-    # Targeted init-container log tail, fetched ONLY when correlation-worthy
-    # evidence (see `pods`/`container_states`) already shows a failing init
-    # container — never fetched speculatively for every incident. Each entry
-    # is the structured result of KubernetesClient.get_container_logs().
-    init_container_logs: list[dict[str, Any]] = field(default_factory=list)
-
     # GitHub commit correlation for the currently-running image tag (see
     # investigation.py). None whenever GITHUB_TOKEN/GITHUB_REPOSITORY are
     # not configured, the image tag is not a real commit SHA (e.g. a
@@ -461,7 +455,6 @@ class Evidence:
             "replicaset_history": self.replicaset_history,
             "restart_count_total": self.restart_count_total,
             "latest_revision_age_seconds": self.latest_revision_age_seconds,
-            "init_container_logs": self.init_container_logs,
             "deploy_commit": self.deploy_commit,
             "health_status": self.health_status,
             "health_http_code": self.health_http_code,
@@ -497,7 +490,6 @@ class Evidence:
             replicaset_history=data.get("replicaset_history") or [],
             restart_count_total=data.get("restart_count_total", 0),
             latest_revision_age_seconds=data.get("latest_revision_age_seconds"),
-            init_container_logs=data.get("init_container_logs") or [],
             deploy_commit=data.get("deploy_commit"),
             health_status=data.get("health_status"),
             health_http_code=data.get("health_http_code"),
