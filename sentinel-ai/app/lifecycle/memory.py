@@ -11,17 +11,37 @@ normalised log/event patterns — is exactly what "recognise a similar
 incident" needs too: coarse on purpose, so two incidents with the same kind
 of problem match even though their raw numbers never repeat exactly.
 
-### What this module does NOT do
+### What this module does
 
-* It does not touch confidence, root cause, or the candidate action list.
-  Its only output (`hypothesis.supporting` entries, via the orchestrator)
-  is prose alongside evidence Sentinel already collected — informational,
-  the same way `evidence.correlations` is informational. See
-  learning.py's own module docstring for the sibling mechanism (outcome
-  bias) and why it is capped so it can only make Sentinel more cautious,
-  never less: this module carries that same rule by construction, because
-  it never produces a number that reaches the Decision or Policy Engine at
-  all — only strings for a human (or the GUI) to read.
+Besides the citations described above, `find_similar_incidents()`'s results
+also feed `build_similarity_bias()`, a second, independent bounded feedback
+signal alongside learning.py's root-cause-wide outcome bias — see that
+function's own docstring for exactly how, and why it is bounded the same
+way learning.py's `build_bias()` is (multipliers in
+`[MEMORY_MAX_PENALTY_MULTIPLIER, 1.0]`, never above 1.0, so this can only
+ever make Sentinel more cautious about an action, never less). The
+orchestrator multiplies this bias together with learning.py's before
+passing the combined result to `DecisionEngine.candidates()` — two
+independent, equally-capped signals, not a second unbounded path to the
+same effect.
+
+This is a deliberate change from this module's earlier, citation-only
+design: a handful of similarity-matched neighbours is a real (if smaller
+and noisier) signal about whether an action worked for a situation like
+this one, not just root cause and action in the abstract, and there is no
+reason to compute it and then discard it. It remains fundamentally
+different from learning.py's signal, and is combined with (never replaces)
+it: learning.py aggregates every recorded outcome for a root cause, however
+long ago or however differently the incident looked; this module only ever
+looks at the handful of incidents whose full evidence signature actually
+resembles this one.
+
+### What this module still does NOT do
+
+* It does not choose, invent, or add an action. Both the citations and the
+  bias are strictly about actions the static `ACTION_LADDER` (decision.py)
+  already offers; a similarity match can make one of those less likely to
+  be tried, never more likely to exist.
 * It does not persist a second copy of past incidents. Signatures for past
   incidents are recomputed at read time from their stored Evidence
   (SQLiteStore.list_terminal_incidents_for_app), the same way
@@ -153,6 +173,74 @@ class SimilarIncident:
             "validated": self.validated,
             "escalated": self.escalated,
         }
+
+
+# Below this many similarity-matched incidents that both tried the SAME
+# action AND have a definitive outcome, no bias is applied for that action.
+# `find_similar_incidents()` surfaces at most DEFAULT_LIMIT (3) neighbours
+# per lookup, so this floor means the bias only ever engages when at least
+# two of those few neighbours agree on having tried the same thing — a
+# single anecdote must never move a decision.
+MIN_SIMILAR_SAMPLES_FOR_BIAS = 2
+
+# Gentler ceiling than learning.py's MAX_PENALTY_MULTIPLIER (0.85): this
+# signal comes from a handful of similarity-matched neighbours, not a
+# root-cause-wide outcome tally built from every incident ever recorded, so
+# it is deliberately allowed to move confidence less. Never above 1.0 — see
+# the module docstring for why that ceiling is the whole point, same as
+# learning.py's.
+MEMORY_MAX_PENALTY_MULTIPLIER = 0.92
+
+
+def build_similarity_bias(similar: list[SimilarIncident]) -> dict[str, float]:
+    """Turn similarity-matched past incidents into {action_name: multiplier}.
+
+    Mirrors learning.py's `build_bias()` in spirit and in its safety
+    invariant: multipliers are always in `[MEMORY_MAX_PENALTY_MULTIPLIER,
+    1.0]`, NEVER above 1.0, so this can only ever make Sentinel more
+    cautious about an action, never more confident than the rule-based
+    hypothesis already made it. See that function's docstring for the
+    argument against ever lifting a ceiling like this.
+
+    Each similar incident with a recorded `action_taken` and a definitive
+    outcome (`succeeded` is not `None`) casts one vote, weighted by its own
+    `similarity_score`, for whether that action worked here — a close match
+    counts for more than a borderline one. An incident with no executed
+    action, or whose last attempt has no result recorded at all, casts no
+    vote: an absence of information must never bias a decision either way.
+    "Worked" requires both a successful result AND (when validation ran) a
+    passed validation — an action that "succeeded" but was never confirmed
+    to have actually resolved anything must not read as a success story.
+
+    `MIN_SIMILAR_SAMPLES_FOR_BIAS` gates each action independently: a root
+    cause with three similar incidents, two of which tried
+    `restart_deployment` and one of which tried `rollback_deployment`, only
+    ever produces a bias for `restart_deployment`.
+    """
+    weighted_success: dict[str, float] = {}
+    weighted_total: dict[str, float] = {}
+    sample_count: dict[str, int] = {}
+    for s in similar:
+        if not s.action_taken or s.succeeded is None:
+            continue
+        weight = max(s.similarity_score, 0.0)
+        if weight <= 0.0:
+            continue
+        worked = bool(s.succeeded) and s.validated is not False
+        weighted_success[s.action_taken] = weighted_success.get(s.action_taken, 0.0) + (weight if worked else 0.0)
+        weighted_total[s.action_taken] = weighted_total.get(s.action_taken, 0.0) + weight
+        sample_count[s.action_taken] = sample_count.get(s.action_taken, 0) + 1
+
+    bias: dict[str, float] = {}
+    for action, total in weighted_total.items():
+        if sample_count[action] < MIN_SIMILAR_SAMPLES_FOR_BIAS or total <= 0.0:
+            continue
+        success_ratio = weighted_success[action] / total
+        multiplier = MEMORY_MAX_PENALTY_MULTIPLIER + (1.0 - MEMORY_MAX_PENALTY_MULTIPLIER) * success_ratio
+        # Belt and braces, same as learning.py: clamp so nothing above can
+        # ever produce a multiplier outside the documented bound.
+        bias[action] = max(MEMORY_MAX_PENALTY_MULTIPLIER, min(1.0, multiplier))
+    return bias
 
 
 def _last_executed_attempt(record: dict[str, Any]) -> dict[str, Any] | None:

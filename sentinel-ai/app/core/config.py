@@ -181,6 +181,15 @@ class Settings(BaseSettings):
     confidence_threshold_restart: float = 0.90
     confidence_threshold_scale: float = 0.90
     confidence_threshold_chaos_reset: float = 0.90
+    # Deep Investigation / novel typed remediation (lifecycle/deep_investigation.py,
+    # models/incident.py's NovelActionType). Deliberately HIGHER than every
+    # known-action threshold above: this gates a proposal the rule engine
+    # never vetted, so it needs to clear a stricter bar before a human is
+    # even offered the chance to authorise it. Unlike the four known
+    # actions, clearing this threshold never makes the action autonomous —
+    # see policy.py's evaluate_deep_proposal, which always still requires
+    # human authorization regardless of confidence.
+    confidence_threshold_deep_remediation: float = 0.97
 
     # ---- Policy: bounds and rate limits ---------------------------------
     min_replicas: int = 1  # never, ever 0 — that is an outage, not a fix
@@ -188,6 +197,22 @@ class Settings(BaseSettings):
     max_actions_per_incident: int = 3
     action_cooldown_seconds: int = 120
     deployment_correlation_window_minutes: int = 30
+
+    # ---- Deep Investigation ------------------------------------------------
+    # Master switch. False means orchestrator.py's `_maybe_deep_investigate`
+    # is never called at all — incidents escalate exactly as they did before
+    # this feature existed. True does not make anything autonomous by
+    # itself: a proposal still needs confidence above the threshold above
+    # AND a human's explicit authorization (see routers/authorizations.py).
+    deep_investigation_enabled: bool = True
+    # Bounds LLM spend per incident, independent of MAX_LIFECYCLE_CYCLES: a
+    # pathological incident that keeps re-escalating must not keep spending
+    # new Deep Investigation calls forever.
+    deep_investigation_max_per_incident: int = 1
+    # Hard ceiling on the raw model response size Sentinel will even attempt
+    # to json.loads — rejected before parsing, independent of whatever
+    # output-size behaviour the provider itself has.
+    deep_investigation_output_max_chars: int = 4000
 
     # ---- Validation ------------------------------------------------------
     validation_settle_seconds: int = 20

@@ -3,7 +3,6 @@ import Navbar from './components/Navbar'
 import ProtectedRoute from './components/ProtectedRoute'
 import { AuthProvider } from './context/AuthContext'
 import HomePage from './pages/HomePage'
-import ChaosPage from './pages/ChaosPage'
 import LoginPage from './pages/LoginPage'
 import NotFoundPage from './pages/NotFoundPage'
 import ProfilePage from './pages/ProfilePage'
@@ -22,7 +21,6 @@ export default function App() {
           <Route path="/login" element={<LoginPage />} />
           <Route path="/register" element={<RegisterPage />} />
           <Route path="/services" element={<ServicesPage />} />
-          <Route path="/chaos" element={<ChaosPage />} />
 
           <Route element={<ProtectedRoute />}>
             <Route path="/requests" element={<RequestsPage />} />

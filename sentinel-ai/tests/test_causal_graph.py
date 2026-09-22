@@ -15,10 +15,15 @@ from app.models.incident import (
     ActionParams,
     ActionPlan,
     AttemptRecord,
+    DeepActionTarget,
+    DeepProposalStatus,
+    DeepRemediationProposal,
     DenialReason,
     Evidence,
     Hypothesis,
     Incident,
+    IncidentStatus,
+    NovelActionType,
     PolicyVerdict,
     RemediationAction,
     RemediationResult,
@@ -173,3 +178,126 @@ def test_graph_is_deterministic_for_the_same_incident():
     first = build_causal_graph(incident)
     second = build_causal_graph(incident)
     assert first == second
+
+
+# ---------------------------------------------------------------------------
+# Deep Investigation integration (task #35 — no parallel systems: a deep
+# proposal must appear in the SAME causal graph as a known action, not a
+# separate view the rest of Sentinel's differentiators never see).
+# ---------------------------------------------------------------------------
+def _deep_proposal(**overrides) -> DeepRemediationProposal:
+    defaults = dict(
+        id="deep-1",
+        incident_id="INC-TEST-0001",
+        created_at=500.0,
+        problem="citizen-service cannot reach its database",
+        root_cause="misconfigured DATABASE_HOST",
+        action_type=NovelActionType.SET_ENV_VAR,
+        target=DeepActionTarget(
+            namespace="citizen-portal", deployment="citizen-service", container="citizen-service",
+            key="DATABASE_HOST", value="good-host", previous_value="bad-host", previous_value_existed=True,
+        ),
+        reason="evidence shows connection refused against the configured host",
+        expected_effect="database connections succeed",
+        risk_level="moderate",
+        validation_plan="poll error rate for 60s",
+        confidence=0.99,
+        status=DeepProposalStatus.SUGGESTED,
+    )
+    defaults.update(overrides)
+    return DeepRemediationProposal(**defaults)
+
+
+def test_suggested_deep_proposal_has_an_action_node_but_no_outcome():
+    """Not yet authorized — nothing happened to have an outcome, exactly
+    like a known action the Policy Engine denied before execution."""
+    incident = make_bare_incident()
+    incident.hypothesis = Hypothesis(
+        root_cause=RootCause.UNKNOWN, confidence=0.2, reasoning="no rule matched",
+        recommended_action=RemediationAction.ESCALATE,
+    )
+    incident.deep_proposals.append(_deep_proposal())
+
+    graph = build_causal_graph(incident)
+    action_nodes = [n for n in graph["nodes"] if n["kind"] == "action"]
+    outcome_nodes = [n for n in graph["nodes"] if n["kind"] == "outcome"]
+    assert len(action_nodes) == 1
+    assert action_nodes[0]["detail"]["source"] == "deep_investigation"
+    assert action_nodes[0]["detail"]["status"] == "suggested"
+    assert action_nodes[0]["detail"]["env_var"] == "DATABASE_HOST"
+    assert outcome_nodes == []
+    # Hangs off the hypothesis, not a fabricated "recommended" claim.
+    deep_edges = [e for e in graph["edges"] if e["target"] == action_nodes[0]["id"]]
+    assert len(deep_edges) == 1
+    assert deep_edges[0]["label"] != "recommended"
+
+
+def test_rejected_deep_proposal_surfaces_its_rejection_reason_with_no_outcome():
+    incident = make_bare_incident()
+    incident.hypothesis = Hypothesis(
+        root_cause=RootCause.UNKNOWN, confidence=0.2, reasoning="no rule matched",
+        recommended_action=RemediationAction.ESCALATE,
+    )
+    incident.deep_proposals.append(
+        _deep_proposal(status=DeepProposalStatus.REJECTED, rejected_reason="confidence below the deep threshold")
+    )
+    graph = build_causal_graph(incident)
+    action_nodes = [n for n in graph["nodes"] if n["kind"] == "action"]
+    outcome_nodes = [n for n in graph["nodes"] if n["kind"] == "outcome"]
+    assert action_nodes[0]["detail"]["status"] == "rejected"
+    assert action_nodes[0]["detail"]["rejected_reason"] == "confidence below the deep threshold"
+    assert outcome_nodes == []
+
+
+def test_validated_deep_proposal_produces_a_full_action_outcome_chain():
+    incident = make_bare_incident()
+    incident.hypothesis = Hypothesis(
+        root_cause=RootCause.UNKNOWN, confidence=0.2, reasoning="no rule matched",
+        recommended_action=RemediationAction.ESCALATE,
+    )
+    incident.deep_proposals.append(
+        _deep_proposal(status=DeepProposalStatus.VALIDATED, result_detail="env var updated; error rate recovered")
+    )
+    graph = build_causal_graph(incident)
+    action_edges = [e for e in graph["edges"] if e["kind"] == "action" and e["label"] == "executed"]
+    assert len(action_edges) == 1
+    outcome_nodes = [n for n in graph["nodes"] if n["kind"] == "outcome"]
+    assert len(outcome_nodes) == 1
+    assert outcome_nodes[0]["detail"]["result_detail"] == "env var updated; error rate recovered"
+
+
+def test_a_later_deep_proposal_outcome_wins_the_final_resolution_edge():
+    """A Deep Investigation proposal only ever executes after every known
+    action has already been tried and exhausted — so when one succeeds, IT
+    is the incident's real final outcome, not whatever the last known
+    action attempt happened to be."""
+    incident = make_bare_incident()
+    incident.hypothesis = Hypothesis(
+        root_cause=RootCause.BAD_DEPLOYMENT, confidence=0.97, reasoning="new revision correlated",
+        recommended_action=RemediationAction.ROLLBACK_DEPLOYMENT,
+    )
+    plan = ActionPlan(
+        action=RemediationAction.ROLLBACK_DEPLOYMENT,
+        params=ActionParams(namespace="citizen-portal", deployment="citizen-service"),
+        confidence=0.97,
+    )
+    verdict = PolicyVerdict(allowed=True, action=RemediationAction.ROLLBACK_DEPLOYMENT)
+    failed_result = RemediationResult(
+        action=RemediationAction.ROLLBACK_DEPLOYMENT, params=plan.params, succeeded=True,
+        started_at=100.0,
+    )
+    failed_validation = ValidationReport(outcome=ValidationOutcome.FAILED, detail="error rate did not recover")
+    incident.attempts.append(
+        AttemptRecord(plan=plan, verdict=verdict, result=failed_result, validation=failed_validation)
+    )
+    incident.deep_proposals.append(
+        _deep_proposal(created_at=500.0, status=DeepProposalStatus.VALIDATED, result_detail="recovered")
+    )
+    incident.status = IncidentStatus.RESOLVED
+
+    graph = build_causal_graph(incident)
+    deep_outcome = next(n for n in graph["nodes"] if n["kind"] == "outcome" and n["id"].startswith("deep_outcome"))
+    resolution_edges = [e for e in graph["edges"] if e["label"] in ("resolves", "did not fully resolve")]
+    assert len(resolution_edges) == 1
+    assert resolution_edges[0]["source"] == deep_outcome["id"]
+    assert resolution_edges[0]["label"] == "resolves"

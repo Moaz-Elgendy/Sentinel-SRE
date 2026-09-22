@@ -4,7 +4,13 @@ OPERATIONAL MEMORY tests (lifecycle/memory.py).
 from __future__ import annotations
 
 from app.lifecycle.evidence_signature import compute_signature
-from app.lifecycle.memory import find_similar_incidents, similarity
+from app.lifecycle.memory import (
+    MEMORY_MAX_PENALTY_MULTIPLIER,
+    SimilarIncident,
+    build_similarity_bias,
+    find_similar_incidents,
+    similarity,
+)
 from app.models.incident import Evidence
 
 
@@ -166,3 +172,95 @@ def test_limit_is_respected():
     ]
     results = find_similar_incidents(current, records, min_similarity=0.0, limit=3)
     assert len(results) == 3
+
+
+# ---------------------------------------------------------------------------
+# build_similarity_bias() — the second, independent bounded feedback signal
+# (see the module docstring; merged with learning.py's bias in
+# orchestrator.py via learning.merge_bias()).
+# ---------------------------------------------------------------------------
+def _similar(action_taken="restart_deployment", succeeded=True, validated=True, score=0.9, incident_id="INC-1"):
+    return SimilarIncident(
+        incident_id=incident_id,
+        occurred_at=0.0,
+        similarity_score=score,
+        root_cause="memory_leak",
+        action_taken=action_taken,
+        succeeded=succeeded,
+        validated=validated,
+        escalated=False,
+    )
+
+
+def test_similarity_bias_below_min_samples_is_no_bias_at_all():
+    """A single matching neighbour, however it turned out, must not move a
+    decision — one anecdote is not a trend, same principle as learning.py's
+    own sample floor."""
+    assert build_similarity_bias([_similar(incident_id="INC-1")]) == {}
+
+
+def test_similarity_bias_two_successes_is_no_penalty():
+    similar = [_similar(incident_id="INC-1"), _similar(incident_id="INC-2")]
+    assert build_similarity_bias(similar)["restart_deployment"] == 1.0
+
+
+def test_similarity_bias_two_failures_is_capped_at_the_memory_ceiling():
+    similar = [
+        _similar(incident_id="INC-1", succeeded=False),
+        _similar(incident_id="INC-2", succeeded=False),
+    ]
+    assert build_similarity_bias(similar)["restart_deployment"] == MEMORY_MAX_PENALTY_MULTIPLIER
+
+
+def test_similarity_bias_ceiling_is_gentler_than_learnings():
+    from app.lifecycle.learning import MAX_PENALTY_MULTIPLIER
+
+    assert MEMORY_MAX_PENALTY_MULTIPLIER > MAX_PENALTY_MULTIPLIER
+
+
+def test_similarity_bias_unvalidated_success_does_not_count_as_working():
+    """succeeded=True but validated=False means the action ran without
+    error but recovery was never confirmed — as_supporting_note() already
+    treats this as distinct from a real success, and the bias must agree."""
+    similar = [
+        _similar(incident_id="INC-1", succeeded=True, validated=False),
+        _similar(incident_id="INC-2", succeeded=True, validated=False),
+    ]
+    assert build_similarity_bias(similar)["restart_deployment"] == MEMORY_MAX_PENALTY_MULTIPLIER
+
+
+def test_similarity_bias_ignores_incidents_with_no_executed_action():
+    similar = [
+        _similar(incident_id="INC-1", action_taken=None, succeeded=None),
+        _similar(incident_id="INC-2", action_taken=None, succeeded=None),
+    ]
+    assert build_similarity_bias(similar) == {}
+
+
+def test_similarity_bias_weights_a_closer_match_more_than_a_borderline_one():
+    """One close, failed match and one borderline, successful match should
+    pull the ratio toward the closer match's outcome, not split it evenly."""
+    similar = [
+        _similar(incident_id="INC-CLOSE", succeeded=False, score=0.95),
+        _similar(incident_id="INC-BORDERLINE", succeeded=True, score=0.61),
+    ]
+    bias = build_similarity_bias(similar)["restart_deployment"]
+    midpoint = MEMORY_MAX_PENALTY_MULTIPLIER + (1.0 - MEMORY_MAX_PENALTY_MULTIPLIER) * 0.5
+    assert bias < midpoint  # the closer (failed) match dominates
+
+
+def test_similarity_bias_never_exceeds_1_0_or_drops_below_its_floor():
+    similar = [_similar(incident_id=f"INC-{i}", succeeded=True) for i in range(5)]
+    bias = build_similarity_bias(similar)["restart_deployment"]
+    assert MEMORY_MAX_PENALTY_MULTIPLIER <= bias <= 1.0
+
+
+def test_similarity_bias_is_per_action_not_pooled_across_actions():
+    similar = [
+        _similar(incident_id="INC-1", action_taken="restart_deployment", succeeded=False),
+        _similar(incident_id="INC-2", action_taken="restart_deployment", succeeded=False),
+        _similar(incident_id="INC-3", action_taken="scale_deployment", succeeded=True),
+    ]
+    bias = build_similarity_bias(similar)
+    assert bias["restart_deployment"] == MEMORY_MAX_PENALTY_MULTIPLIER
+    assert "scale_deployment" not in bias  # only one sample for this action

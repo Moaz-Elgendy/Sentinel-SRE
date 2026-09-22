@@ -1,0 +1,14 @@
+# Force LF line endings for shell scripts regardless of the checkout
+# platform's core.autocrlf setting.
+#
+# Several scripts under scripts/ were found checked out with CRLF line
+# endings (a `\r` trailing every line, including the shebang). A `\r`
+# immediately after `#!/bin/bash` on a script invoked via AWS SSM
+# (scripts/incident-scenarios.sh, invoked by sentinel-ai's chaos-scenario
+# runner) or by CI can make the interpreter path in the shebang fail to
+# resolve, causing the whole script to fail to execute rather than merely
+# running slowly. bash also rejects CRLF-corrupted `function() {` headers
+# outright under `bash -n`. This file prevents the corruption from
+# recurring on a future Windows/OneDrive checkout; it has no effect until
+# this directory is (or becomes) a git repository.
+*.sh text eol=lf

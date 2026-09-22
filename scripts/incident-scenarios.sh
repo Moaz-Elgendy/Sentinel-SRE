@@ -303,9 +303,12 @@ scenario_db_outage() {
   echo "    since a DB outage is the most severe scenario this project can simulate)."
   require_token
   pin_single_replica citizen-service
+  # Only the target service's port-forward gates the fault itself.
+  # Prometheus/Alertmanager are opened after injection (below) since they are
+  # only needed for the verification that follows, not for the fault to go
+  # live — this is what lets a GUI-triggered run show something happening
+  # within seconds instead of waiting on tunnels the injection doesn't need.
   port_forward citizen-service "$CITIZEN_PORT" 8000
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
 
   echo "    Injecting simulated DB failure..."
   set_chaos_fault "$CITIZEN_PORT" '{"db_failure": true}'
@@ -313,6 +316,9 @@ scenario_db_outage() {
   local readyz_status
   readyz_status=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$CITIZEN_PORT/readyz")
   echo "    /readyz now returns HTTP $readyz_status (expected 503)"
+
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "ChaosDatabaseFailure" 90
   check_alertmanager_seen "ChaosDatabaseFailure"
@@ -331,12 +337,15 @@ scenario_http_errors() {
   echo "    been sustained long enough to rule out a brief blip."
   require_token
   pin_single_replica citizen-service
+  # Only the target service's port-forward gates the fault itself; see the
+  # note in scenario_db_outage for why Prometheus/Alertmanager come after.
   port_forward citizen-service "$CITIZEN_PORT" 8000
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
 
   echo "    Injecting 100% forced HTTP error rate..."
   set_chaos_fault "$CITIZEN_PORT" '{"error_rate": 1.0}'
+
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "ChaosForcedHTTPFailures" 90
   check_alertmanager_seen "ChaosForcedHTTPFailures"
@@ -363,12 +372,15 @@ scenario_latency() {
   echo "    script detail (see Phases.md Phase 12 'what's missing')."
   require_token
   pin_single_replica citizen-service
+  # Only the target service's port-forward gates the fault itself; see the
+  # note in scenario_db_outage for why Prometheus/Alertmanager come after.
   port_forward citizen-service "$CITIZEN_PORT" 8000
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
 
   echo "    Injecting 1500ms artificial latency..."
   set_chaos_fault "$CITIZEN_PORT" '{"latency_ms": 1500}'
+
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "ChaosLatencyInjection" 90
   check_alertmanager_seen "ChaosLatencyInjection"
@@ -395,13 +407,18 @@ scenario_notification_degradation() {
   require_token
   pin_single_replica citizen-service
   pin_single_replica notification-service
-  port_forward citizen-service "$CITIZEN_PORT" 8000
+  # Only notification-service's port-forward gates the fault itself.
+  # citizen-service is only needed for the traffic generator below, and
+  # Prometheus/Alertmanager only for verification — both come after
+  # injection so the fault goes live as soon as possible.
   port_forward notification-service "$NOTIF_PORT" 8000
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
 
   echo "    Injecting 100% notification delivery failure..."
   set_chaos_fault "$NOTIF_PORT" '{"notification_failure_rate": 1.0}'
+
+  port_forward citizen-service "$CITIZEN_PORT" 8000
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
 
   generate_traffic "http://localhost:$CITIZEN_PORT" 60 &
   local traffic_pid=$!
@@ -425,11 +442,15 @@ scenario_full_outage() {
   local current
   current=$(kubectl get deployment citizen-service -n "$NAMESPACE" -o jsonpath='{.spec.replicas}')
   ORIGINAL_REPLICAS+=("citizen-service:$current")
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
 
   echo "    Scaling citizen-service to 0 replicas..."
   kubectl scale deployment citizen-service -n "$NAMESPACE" --replicas=0
+
+  # Prometheus/Alertmanager are only needed for the verification below, not
+  # for the fault itself — opened after the scale so the outage takes effect
+  # as soon as possible once this scenario is triggered.
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "ServiceDown" 240
   check_alertmanager_seen "ServiceDown"
@@ -452,9 +473,9 @@ scenario_high_cpu() {
   echo "    HighCPUUsage's threshold has to sit below that to ever fire here."
   require_token
   pin_single_replica citizen-service
+  # Only the target service's port-forward gates the fault itself; see the
+  # note in scenario_db_outage for why Prometheus/Alertmanager come after.
   port_forward citizen-service "$CITIZEN_PORT" 8000
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
 
   echo "    Enabling the CPU burn worker..."
   set_chaos_fault "$CITIZEN_PORT" '{"cpu_burn": true}'
@@ -464,6 +485,9 @@ scenario_high_cpu() {
   local healthz_status
   healthz_status=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$CITIZEN_PORT/healthz")
   echo "    /healthz still returns HTTP $healthz_status while burning (expected 200)"
+
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
 
   # Generous timeout: the alert is built on a 2m rate window, so Prometheus
   # needs at least that much history before the expression is even true,
@@ -494,12 +518,15 @@ scenario_memory_leak() {
   echo "    the moment the container hits its memory limit and is OOMKilled."
   require_token
   pin_single_replica citizen-service
+  # Only the target service's port-forward gates the fault itself; see the
+  # note in scenario_db_outage for why Prometheus/Alertmanager come after.
   port_forward citizen-service "$CITIZEN_PORT" 8000
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
 
   echo "    Retaining ${leak_mb} MiB in the leak buffer..."
   set_chaos_fault "$CITIZEN_PORT" "{\"memory_leak_mb\": $leak_mb}"
+
+  port_forward prometheus "$PROM_PORT" 9090
+  port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "MemoryLeakSuspected" 420
   check_alertmanager_seen "MemoryLeakSuspected"
@@ -525,8 +552,10 @@ scenario_crashloop() {
   local container
   container=$(kubectl get deployment citizen-service -n "$NAMESPACE" \
     -o jsonpath='{.spec.template.spec.containers[0].name}')
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
+  # No Prometheus/Alertmanager port-forward here: this scenario verifies via
+  # wait_for_waiting_reason (a direct kubectl poll), never wait_for_alert or
+  # check_alertmanager_seen, so those tunnels would only add setup latency
+  # before the actual fault below with nothing to show for it.
 
   local before_revision
   before_revision=$(deployment_revision citizen-service)
@@ -581,8 +610,10 @@ scenario_bad_deployment() {
   echo "    The only real fix is a rollback — no amount of restarting helps,"
   echo "    which is exactly what distinguishes a bad release from a transient"
   echo "    fault, and exactly the judgement call this scenario is here to test."
-  port_forward prometheus "$PROM_PORT" 9090
-  port_forward alertmanager "$AM_PORT" 9093
+  # No Prometheus/Alertmanager port-forward here: this scenario verifies via
+  # wait_for_no_ready_replicas (a direct kubectl poll), never wait_for_alert
+  # or check_alertmanager_seen, so those tunnels would only add setup latency
+  # before the actual fault below with nothing to show for it.
 
   local before_revision
   before_revision=$(deployment_revision citizen-service)

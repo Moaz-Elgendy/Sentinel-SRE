@@ -6,6 +6,7 @@ import { openIncidentDocument } from '@/api/incidents'
 import { AttentionPanel } from '@/components/incident/AttentionPanel'
 import { DecisionSection } from '@/components/incident/DecisionSection'
 import { DecisionSummaryCard } from '@/components/incident/DecisionSummaryCard'
+import { DeepInvestigationSection } from '@/components/incident/DeepInvestigationSection'
 import { DiagnosisSection } from '@/components/incident/DiagnosisSection'
 import { CausalGraphTab } from '@/components/incident/CausalGraphTab'
 import { ReplayTab } from '@/components/incident/ReplayTab'
@@ -179,6 +180,7 @@ export default function IncidentDetailPage() {
               <ObservedSection incident={incident} limits={limits} />
               <DiagnosisSection incident={incident} />
               <DecisionSection incident={incident} />
+              <DeepInvestigationSection incident={incident} onChanged={() => setRefreshKey((k) => k + 1)} />
             </div>
             <aside className="min-w-0 xl:sticky xl:top-16 xl:self-start" aria-label="Incident facts">
               <FactsPanel incident={incident} now={now} />

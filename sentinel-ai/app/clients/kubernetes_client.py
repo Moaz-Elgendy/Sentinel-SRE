@@ -251,6 +251,25 @@ class KubernetesClient:
             "images": [
                 c.image for c in (spec.template.spec.containers or []) if c.image
             ],
+            # Container env, for Deep Investigation evidence and for
+            # RemediationEngine's `before`-value capture (see
+            # patch_deployment_env_var / remove_deployment_env_var above).
+            # Read-only, and deliberately redacted at this single source
+            # rather than at each caller: a name matching `_SENSITIVE_ENV_KEY`
+            # never has its literal value surfaced to Sentinel's own
+            # evidence, the LLM, or the GUI — there is no legitimate need for
+            # a hostname/flag-style variable (which is what SET_ENV_VAR /
+            # UNSET_ENV_VAR exist for) to ever require seeing a secret's
+            # value, and `valueFrom`-sourced entries (secretKeyRef /
+            # configMapKeyRef) are never resolved here at all — only the
+            # reference's existence and kind is reported.
+            "containers": [
+                {
+                    "name": c.name,
+                    "env": _redacted_env(c.env or []),
+                }
+                for c in (spec.template.spec.containers or [])
+            ],
         }
 
     @staticmethod
@@ -797,6 +816,107 @@ class KubernetesClient:
         )
         return {"replicas": replicas, "generation": result.metadata.generation}
 
+    # RBAC: apps/deployments: patch (same verb/resource already granted above —
+    # no new RBAC entry needed).
+    #
+    # Deep Investigation / novel typed remediation (see
+    # models/incident.py's NovelActionType and lifecycle/remediation.py's
+    # `execute_deep`). Two methods, both container-env-var writes, both
+    # strategic-merge patches exactly as narrow as `restart_deployment`'s: the
+    # patch body only ever names ONE container (by `name`, the corev1
+    # `containers` list's merge key) and ONE env entry (by `name`, the corev1
+    # `EnvVar` list's own merge key — see the Kubernetes API's
+    # `x-kubernetes-patch-merge-key: name` / `x-kubernetes-patch-strategy:
+    # merge` on `Container.env`). A strategic-merge patch shaped this way adds
+    # or updates exactly that one variable and leaves every other container,
+    # and every other env var on this one, untouched — there is still no
+    # generic "patch this manifest" method, only two more narrowly-typed ones.
+    async def patch_deployment_env_var(
+        self, namespace: str, name: str, container: str, key: str, value: str
+    ) -> dict[str, Any]:
+        """Set (add or update) one environment variable on one container.
+
+        This is the write side of SET_ENV_VAR. The caller (RemediationEngine)
+        is responsible for having already captured the previous value (for
+        revert / audit) — this method only ever applies the new one.
+        """
+        self._require()
+        body = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {"name": container, "env": [{"name": key, "value": str(value)}]}
+                        ]
+                    }
+                }
+            }
+        }
+
+        def _call() -> Any:
+            return self._apps.patch_namespaced_deployment(
+                name=name, namespace=namespace, body=body
+            )
+
+        result = await asyncio.to_thread(_call)
+        logger.info(
+            "k8s_env_var_set",
+            extra={
+                "namespace": namespace,
+                "deployment": name,
+                "container": container,
+                "key": key,
+            },
+        )
+        return {"key": key, "generation": result.metadata.generation}
+
+    async def remove_deployment_env_var(
+        self, namespace: str, name: str, container: str, key: str
+    ) -> dict[str, Any]:
+        """Remove one environment variable from one container.
+
+        The write side of UNSET_ENV_VAR — and also how SET_ENV_VAR's own
+        revert path undoes itself when the variable did not exist before
+        Sentinel set it (see RemediationEngine._set_env_var's `before`
+        capture). The `$patch: delete` directive is standard strategic-merge
+        syntax for removing one entry from a merge-keyed list without
+        touching the rest of it — this does not delete the container, only
+        the one named env entry on it, and is a no-op (not an error) if the
+        key was already absent.
+        """
+        self._require()
+        body = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": container,
+                                "env": [{"name": key, "$patch": "delete"}],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+        def _call() -> Any:
+            return self._apps.patch_namespaced_deployment(
+                name=name, namespace=namespace, body=body
+            )
+
+        result = await asyncio.to_thread(_call)
+        logger.info(
+            "k8s_env_var_removed",
+            extra={
+                "namespace": namespace,
+                "deployment": name,
+                "container": container,
+                "key": key,
+            },
+        )
+        return {"key": key, "generation": result.metadata.generation}
+
 
 class InvalidRollbackTemplate(ValueError):
     """Raised by `_assert_valid_container_images` — caught by
@@ -894,6 +1014,64 @@ def _to_dict(obj: Any) -> dict[str, Any]:
     # NOT accept. Returning it would produce a confusing 422 rather than a
     # silent misconfiguration, which is the lesser evil.
     return obj.to_dict() if hasattr(obj, "to_dict") else {}
+
+
+# Substring match, case-insensitive, against an env var's NAME (never its
+# value) — see get_deployment's own docstring note above. Deliberately broad
+# (over-redacting a hostname-ish var named e.g. "API_KEY_ENDPOINT" is a far
+# smaller cost than under-redacting a real secret).
+#
+# Public (not `_`-prefixed): also imported by lifecycle/deep_investigation.py,
+# lifecycle/policy.py, and lifecycle/remediation.py, which each independently
+# refuse a Deep Investigation proposal that names a matching key — at
+# construction time, at the policy-eligibility check, and again immediately
+# before the cluster write. A Deep Investigation proposal is LLM-authored and
+# never rule-vetted the way the four known actions are, so this is the one
+# additional boundary that action type needs: not just "which container" but
+# "never a variable that looks like a secret", however confident or
+# well-reasoned the model's proposal otherwise sounds. Reusing one constant
+# across all four sites means tightening this list happens once, not four
+# times that can drift.
+SENSITIVE_ENV_KEY_MARKERS = (
+    "password", "secret", "token", "key", "credential", "private", "auth",
+)
+# Backward-compatible alias for the one pre-existing internal reference.
+_SENSITIVE_ENV_KEY_MARKERS = SENSITIVE_ENV_KEY_MARKERS
+
+
+def _redacted_env(env_list: Any) -> list[dict[str, Any]]:
+    """Trimmed, redacted view of one container's env list.
+
+    `valueFrom`-sourced entries (secretKeyRef / configMapKeyRef / fieldRef)
+    are never resolved — only which kind of reference it is. A plain literal
+    value is passed through UNLESS its key name matches
+    `_SENSITIVE_ENV_KEY_MARKERS`, in which case it is redacted exactly like a
+    secret reference. This is the only place Sentinel reads container env
+    vars from the cluster; every caller (evidence, Deep Investigation, the
+    remediation `before`-capture) goes through this.
+    """
+    out: list[dict[str, Any]] = []
+    for e in env_list:
+        name = getattr(e, "name", None)
+        if not name:
+            continue
+        sensitive = any(marker in name.lower() for marker in _SENSITIVE_ENV_KEY_MARKERS)
+        value_from = getattr(e, "value_from", None)
+        if value_from is not None:
+            kind = (
+                "secretKeyRef" if getattr(value_from, "secret_key_ref", None)
+                else "configMapKeyRef" if getattr(value_from, "config_map_key_ref", None)
+                else "fieldRef" if getattr(value_from, "field_ref", None)
+                else "other"
+            )
+            out.append({"name": name, "value": None, "source": kind, "redacted": True})
+            continue
+        raw_value = getattr(e, "value", None)
+        if sensitive and raw_value is not None:
+            out.append({"name": name, "value": None, "source": "literal", "redacted": True})
+        else:
+            out.append({"name": name, "value": raw_value, "source": "literal", "redacted": False})
+    return out
 
 
 def find_previous_revision(

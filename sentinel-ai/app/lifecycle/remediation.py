@@ -42,6 +42,7 @@ import time
 
 from app.clients.chaos_client import ChaosClient
 from app.clients.kubernetes_client import (
+    SENSITIVE_ENV_KEY_MARKERS,
     KubernetesClient,
     KubernetesUnavailable,
     find_previous_revision,
@@ -50,6 +51,10 @@ from app.core.metrics import observe_remediation
 from app.models.incident import (
     ActionParams,
     ActionPlan,
+    DeepActionTarget,
+    DeepPolicyVerdict,
+    DeepRemediationResult,
+    NovelActionType,
     PolicyVerdict,
     RemediationAction,
     RemediationResult,
@@ -128,6 +133,20 @@ class RemediationEngine:
         if deployment not in self.allowed_deployments:
             raise RemediationRefused(
                 f"remediation refused: deployment {deployment} is not allow-listed"
+            )
+
+    def assert_env_key_permitted(self, key: str | None) -> None:
+        """Re-validate a Deep Investigation target's environment variable
+        name. Same posture as `assert_target_permitted`: the last gate
+        before the cluster re-checks a rule already applied upstream
+        (deep_investigation.apply_llm_response, PolicyEngine.
+        evaluate_deep_proposal) rather than trusting either of them — see
+        SENSITIVE_ENV_KEY_MARKERS's own docstring for why this is checked at
+        three independent points."""
+        if key and any(marker in key.lower() for marker in SENSITIVE_ENV_KEY_MARKERS):
+            raise RemediationRefused(
+                f"remediation refused: environment variable {key!r} looks like a "
+                "credential or secret"
             )
 
     def _assert_authorised(self, plan: ActionPlan, verdict: PolicyVerdict) -> ActionParams:
@@ -412,4 +431,163 @@ class RemediationEngine:
                 "gauges per kubernetes_pod_name before this is treated as fixed."
             ),
             before={"chaos_reset_response": outcome.to_dict()},
+        )
+
+    # ---- Deep Investigation / novel typed remediation --------------------
+    # A SEPARATE entry point from `execute()`, not a branch inside it: the
+    # input shape (`DeepPolicyVerdict` + a target with container/key/value)
+    # is different enough from `ActionPlan`/`PolicyVerdict` that forcing it
+    # through the same signature would mean smuggling these fields through
+    # `ActionParams` (which has no such fields, deliberately — see
+    # models/incident.py) or adding a fifth `RemediationAction` member that
+    # every existing exhaustive dispatch (`decision.py`'s `_params_for`,
+    # this class's own `execute()`, `policy.py`'s `evaluate()`) would then
+    # have to explicitly special-case anyway. Keeping it separate is what
+    # keeps `execute()`'s dispatch — and every one of its own callers'
+    # assumption that a `PolicyVerdict.action` is one of the four known,
+    # rule-vetted actions — completely unchanged.
+    async def execute_deep(
+        self, target: DeepActionTarget, verdict: DeepPolicyVerdict
+    ) -> DeepRemediationResult:
+        """Perform a human-authorised Deep Investigation action. Never
+        raises for operational errors, exactly like `execute()`. Called only
+        from orchestrator.authorize_and_remediate_deep, itself only reached
+        after a human has explicitly authorised this exact proposal — see
+        that method's own docstring for why this is never on the autonomous
+        path.
+        """
+        if verdict is None or not verdict.allowed:
+            raise RemediationRefused(
+                f"remediation refused: no policy eligibility for deep action "
+                f"{getattr(verdict, 'action_type', None)}"
+            )
+        self.assert_target_permitted(
+            ActionParams(namespace=target.namespace, deployment=target.deployment)
+        )
+        self.assert_env_key_permitted(target.key)
+        started = time.time()
+
+        if self.dry_run:
+            logger.info(
+                "deep_remediation_dry_run",
+                extra={
+                    "action_type": verdict.action_type.value,
+                    "namespace": target.namespace,
+                    "deployment": target.deployment,
+                    "container": target.container,
+                    "key": target.key,
+                },
+            )
+            observe_remediation(f"deep:{verdict.action_type.value}", "dry_run", 0.0)
+            return DeepRemediationResult(
+                action_type=verdict.action_type,
+                target=target,
+                succeeded=True,
+                dry_run=True,
+                detail="DRY_RUN=true: action was authorised and fully resolved but "
+                "not applied to the cluster",
+                started_at=started,
+                duration_seconds=0.0,
+            )
+
+        try:
+            if verdict.action_type is NovelActionType.SET_ENV_VAR:
+                result = await self._set_env_var(target)
+            elif verdict.action_type is NovelActionType.UNSET_ENV_VAR:
+                result = await self._unset_env_var(target)
+            else:
+                raise RemediationRefused(
+                    f"no executor for deep action type {verdict.action_type.value}"
+                )
+        except KubernetesUnavailable as exc:
+            duration = time.time() - started
+            observe_remediation(f"deep:{verdict.action_type.value}", "failure", duration)
+            return DeepRemediationResult(
+                action_type=verdict.action_type,
+                target=target,
+                succeeded=False,
+                detail=f"Kubernetes API unavailable: {exc}",
+                started_at=started,
+                duration_seconds=duration,
+            )
+        except Exception as exc:  # noqa: BLE001
+            duration = time.time() - started
+            observe_remediation(f"deep:{verdict.action_type.value}", "failure", duration)
+            logger.error(
+                "deep_remediation_failed",
+                extra={
+                    "action_type": verdict.action_type.value,
+                    "namespace": target.namespace,
+                    "deployment": target.deployment,
+                    "error_detail": str(exc)[:300],
+                },
+            )
+            return DeepRemediationResult(
+                action_type=verdict.action_type,
+                target=target,
+                succeeded=False,
+                detail=f"{type(exc).__name__}: {str(exc)[:300]}",
+                started_at=started,
+                duration_seconds=duration,
+            )
+
+        result.started_at = started
+        result.duration_seconds = time.time() - started
+        observe_remediation(
+            f"deep:{verdict.action_type.value}",
+            "success" if result.succeeded else "failure",
+            result.duration_seconds,
+        )
+        logger.info(
+            "deep_remediation_executed",
+            extra={
+                "action_type": verdict.action_type.value,
+                "namespace": target.namespace,
+                "deployment": target.deployment,
+                "container": target.container,
+                "key": target.key,
+                "succeeded": result.succeeded,
+            },
+        )
+        return result
+
+    async def _set_env_var(self, target: DeepActionTarget) -> DeepRemediationResult:
+        if not target.container or not target.key or target.value is None:
+            raise RemediationRefused(
+                "set_env_var reached the engine with a missing container/key/value"
+            )
+        await self.k8s.patch_deployment_env_var(
+            target.namespace, target.deployment, target.container, target.key, target.value
+        )
+        return DeepRemediationResult(
+            action_type=NovelActionType.SET_ENV_VAR,
+            target=target,
+            succeeded=True,
+            detail=(
+                f"set {target.key} on container {target.container} "
+                f"(previous value {'existed' if target.previous_value_existed else 'did not exist'}"
+                + (f": {target.previous_value!r}" if target.previous_value else "")
+                + "). Revert by setting it back to the previous value, or by "
+                "removing it if it did not exist before this change."
+            ),
+        )
+
+    async def _unset_env_var(self, target: DeepActionTarget) -> DeepRemediationResult:
+        if not target.container or not target.key:
+            raise RemediationRefused(
+                "unset_env_var reached the engine with a missing container/key"
+            )
+        await self.k8s.remove_deployment_env_var(
+            target.namespace, target.deployment, target.container, target.key
+        )
+        return DeepRemediationResult(
+            action_type=NovelActionType.UNSET_ENV_VAR,
+            target=target,
+            succeeded=True,
+            detail=(
+                f"removed {target.key} from container {target.container} "
+                f"(previous value {'existed' if target.previous_value_existed else 'did not exist'}"
+                + (f": {target.previous_value!r}" if target.previous_value else "")
+                + "). Revert by setting it back to the previous value if it existed."
+            ),
         )
