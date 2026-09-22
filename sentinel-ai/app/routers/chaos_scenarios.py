@@ -21,26 +21,66 @@ from app.core.config import settings
 router = APIRouter(prefix="/api/sentinel/chaos-scenarios", tags=["chaos-scenarios"])
 
 
+# `expected_root_cause`/`expected_action`/`expected_app` are ground truth for
+# app/lifecycle/evaluation.py, added deliberately conservatively: a scenario
+# only carries them when the RCA rules (lifecycle/rca.py) produce exactly
+# one unambiguous outcome for it. Two scenarios are left without ground
+# truth on purpose rather than guessed at:
+#
+# * "high-cpu" can rules-classify as either CPU_SATURATION or
+#   CAPACITY_SHORTFALL depending on whether the CPU burn also produces a
+#   latency spike as a side effect (rca.py checks CAPACITY_SHORTFALL first,
+#   but only when latency is *also* elevated) - a live-cluster-timing
+#   question this codebase's "no live-cluster testing" constraint means
+#   cannot be verified, so it is not asserted.
+# * "crashloop" patches the Deployment to introduce the crash, which is
+#   itself a new revision - rca.py checks BAD_DEPLOYMENT (a recent
+#   deployment correlating with the symptom onset) *before* POD_CRASH_LOOP,
+#   so the rules-correct outcome plausibly is BAD_DEPLOYMENT, not the
+#   scenario's namesake. Asserting POD_CRASH_LOOP here would likely just be
+#   wrong, so neither is asserted.
+# * "bad-deployment" carries `expected_root_cause` (BAD_DEPLOYMENT is
+#   unambiguous - rule 2, a direct namesake) but no `expected_action`: an
+#   env-var-only change does not change the container image, which holds
+#   confidence at 0.90 - below the rollback gate - so the scenario's own
+#   description ("by default, leaves the incident open") is the documented
+#   expectation: escalate, not any specific executed action. Evaluating
+#   root-cause correctness for it is still meaningful; asserting a specific
+#   action would not be.
+# * "all" (the suite runner) triggers every scenario in sequence, so no
+#   single incident or root cause corresponds to it at all.
 SCENARIOS: dict[str, dict[str, Any]] = {
     "db-outage": {
         "title": "Database outage",
         "family": "application fault",
         "description": "Forces citizen-service DB failures and verifies ChaosDatabaseFailure.",
+        "expected_app": "citizen-service",
+        "expected_root_cause": "chaos_database_fault",
+        "expected_action": "reset_chaos_fault",
     },
     "http-errors": {
         "title": "HTTP 5xx storm",
         "family": "application fault",
         "description": "Forces citizen-service 5xx responses and drives error-rate alerts.",
+        "expected_app": "citizen-service",
+        "expected_root_cause": "chaos_http_fault",
+        "expected_action": "reset_chaos_fault",
     },
     "latency": {
         "title": "High latency",
         "family": "application fault",
         "description": "Injects 1500ms citizen-service latency and generates request traffic.",
+        "expected_app": "citizen-service",
+        "expected_root_cause": "chaos_latency_fault",
+        "expected_action": "reset_chaos_fault",
     },
     "notification-degradation": {
         "title": "Notification degradation",
         "family": "application fault",
         "description": "Forces notification delivery failures while citizen requests continue.",
+        "expected_app": "notification-service",
+        "expected_root_cause": "chaos_notification_fault",
+        "expected_action": "reset_chaos_fault",
     },
     "high-cpu": {
         "title": "High CPU",
@@ -51,6 +91,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "title": "Memory leak",
         "family": "application fault",
         "description": "Retains memory in citizen-service until MemoryLeakSuspected fires.",
+        "expected_app": "citizen-service",
+        "expected_root_cause": "memory_leak",
+        "expected_action": "restart_deployment",
     },
     "crashloop": {
         "title": "CrashLoopBackOff",
@@ -61,6 +104,9 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "title": "Full outage",
         "family": "platform fault",
         "description": "Scales citizen-service to zero replicas, then restores it.",
+        "expected_app": "citizen-service",
+        "expected_root_cause": "service_down",
+        "expected_action": "restart_deployment",
     },
     "bad-deployment": {
         "title": "Bad deployment",
@@ -68,6 +114,8 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "description": "Rolls out a bad DATABASE_HOST. By default, leaves the incident open.",
         "dangerous": True,
         "auto_rollback_supported": True,
+        "expected_app": "citizen-service",
+        "expected_root_cause": "bad_deployment",
     },
     "all": {
         "title": "Run safe suite",

@@ -179,6 +179,41 @@ def test_cpu_and_memory_thresholds():
     assert check_memory(900e6, 700e6)[0] is False
 
 
+def test_before_after_baseline_shown_when_captured_never_fabricated():
+    """Phase 4 brief section 27: a real pre-remediation reading, when
+    investigation.py actually captured one, is surfaced as an explicit
+    'before -> after' in the detail string. Omitted (not guessed) when there
+    is no baseline. Outcome (pass/fail) is unaffected either way."""
+    ok, detail = check_latency(0.21, 1.5, baseline=1.84)
+    assert ok is True
+    assert "1.84" in detail and "0.21" in detail
+
+    ok, detail = check_latency(0.5, 1.5)
+    assert ok is True
+    assert "->" not in detail
+
+    ok, detail = check_cpu(0.3, 0.9, baseline=1.2)
+    assert ok is True
+    assert "1.20" in detail and "0.30" in detail
+
+    ok, detail = check_memory(200e6, 700e6, baseline=650e6)
+    assert ok is True
+    assert "650" in detail and "200" in detail
+
+    ok, detail = check_replicas(
+        {"desired_replicas": 2, "available_replicas": 2},
+        baseline_deployment={"desired_replicas": 2, "available_replicas": 1},
+    )
+    assert ok is True
+    assert detail == "1/2 -> 2/2 replicas available"
+
+    # A failing check with a baseline still fails — before/after enriches the
+    # message, it never changes the pass/fail verdict.
+    ok, detail = check_latency(2.5, 1.5, baseline=1.0)
+    assert ok is False
+    assert "1.00" in detail and "2.50" in detail
+
+
 # ---------------------------------------------------------------------------
 # Chaos gauge verification, per pod
 # ---------------------------------------------------------------------------

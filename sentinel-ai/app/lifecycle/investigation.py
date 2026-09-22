@@ -29,6 +29,7 @@ from app.clients.github_client import GitHubClient
 from app.clients.kubernetes_client import KubernetesClient
 from app.clients.loki import LokiClient, looks_like_chaos_silence, summarise
 from app.clients.prometheus import PrometheusClient
+from app.lifecycle.correlation import CRASHLOOP_WAITING_REASONS
 from app.models.incident import Evidence, Incident
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,48 @@ logger = logging.getLogger(__name__)
 # How far back the evidence window reaches. 15 minutes covers the typical
 # `for:` duration on the existing alert rules (2-5m) plus enough lead-in to
 # see what changed just before the alert started firing.
+#
+# This is the "MAX_METRIC_RANGE" / "MAX_LOG_LINES" bound a hypothesis-driven,
+# multi-round investigator would need to configure per tool call. This
+# implementation is deterministic and single-round instead (see
+# MAX_INVESTIGATION_ROUNDS below), so the equivalent bounds already exist —
+# just as real default parameters on the collectors themselves, not a
+# separate config surface:
+#   get_metrics        -> PrometheusClient.*(app) queries this LOOKBACK_SECONDS
+#                          window; each call has its own httpx timeout
+#                          (PrometheusClient(timeout=...), default 10s).
+#   query_logs         -> LokiClient.recent_errors/access_log_errors, each
+#                          bounded by its own `limit` kwarg (100-200 lines)
+#                          and the same per-call timeout.
+#   inspect_pods,
+#   inspect_deployment,
+#   inspect_events,
+#   inspect_previous_revision
+#                      -> KubernetesClient.list_pods/get_deployment/
+#                          list_events/list_replicasets, each a single bounded
+#                          API list/get call (list_events is itself bounded by
+#                          `since_seconds`).
+#   inspect_service_health -> the injected `health_probe` (see
+#                          validation.probe_health), its own httpx timeout.
+#   inspect_dependencies -> the notification_deliveries/dispatch_failures
+#                          Prometheus queries, scoped by owner app (see the
+#                          evidence-isolation comment below) so one
+#                          incident's dependency evidence can never leak into
+#                          another's.
 LOOKBACK_SECONDS = 900
+
+# Every real incident today runs exactly one investigation round: all
+# collectors above fire concurrently, and re-investigation (after a failed
+# validation, or a manual/automatic reopen) replays this same function in
+# full rather than adaptively picking a next tool call from a partial
+# result. That is a deliberate choice (see this module's docstring and the
+# brief this constant was added for): a complete, structured evidence bundle
+# every time is simpler to test, cheaper (one RCA/LLM call per investigation,
+# not N), and easier to audit than an adaptive multi-round loop would be.
+# Named and set to 1 here, rather than left as an implicit assumption of the
+# control flow, so a future adaptive investigator has an explicit switch to
+# change rather than a hidden one to discover.
+MAX_INVESTIGATION_ROUNDS = 1
 
 # The app that emits `notification_deliveries_total` (its own delivery view)
 # and the app that emits `notification_dispatches_total` (the caller's view).
@@ -187,6 +229,52 @@ async def investigate(
     evidence.restart_count_total = sum(
         int(p.get("restart_count") or 0) for p in evidence.pods
     )
+
+    # ---- failing init-container logs ------------------------------------
+    # A pod stuck on a failing init container never starts its app
+    # container, so ordinary evidence (metrics, app logs) is silent about it
+    # — this is the one place Sentinel goes and looks directly at *why* the
+    # init container itself is failing (e.g. an invalid/placeholder image
+    # that never even reaches ImagePullBackOff cleanly). Same failure test as
+    # correlation.py's `init_container_failing` finding, kept in sync with it
+    # deliberately: this collects the evidence, correlation.py explains it.
+    if k8s.available:
+        failing_init_containers = [
+            (pod.get("name"), container.get("name"))
+            for pod in evidence.pods
+            for container in (pod.get("container_states") or [])
+            if container.get("is_init")
+            and (
+                container.get("waiting_reason") in CRASHLOOP_WAITING_REASONS
+                or (
+                    container.get("terminated_reason") is not None
+                    and container.get("terminated_reason") != "Completed"
+                )
+            )
+            and pod.get("name")
+            and container.get("name")
+        ]
+        if failing_init_containers:
+            log_results = await asyncio.gather(
+                *(
+                    # `previous=True`: a crash-looping container's current
+                    # attempt is typically mid-backoff with no output yet —
+                    # see KubernetesClient.get_container_logs's own docstring.
+                    k8s.get_container_logs(namespace, pod_name, container_name, previous=True)
+                    for pod_name, container_name in failing_init_containers
+                ),
+                return_exceptions=True,
+            )
+            for (pod_name, container_name), result in zip(
+                failing_init_containers, log_results, strict=True
+            ):
+                if isinstance(result, BaseException):
+                    evidence.errors.append(
+                        f"collector 'init_container_logs[{pod_name}/{container_name}]' "
+                        f"failed: {str(result)[:200]}"
+                    )
+                    continue
+                evidence.init_container_logs.append(result)
 
     history = evidence.replicaset_history
     if history:

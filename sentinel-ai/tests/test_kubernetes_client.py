@@ -166,6 +166,7 @@ async def test_get_container_logs_failure_is_structured_not_raised():
 from app.clients.kubernetes_client import (  # noqa: E402
     InvalidRollbackTemplate,
     _looks_like_a_valid_image_reference,
+    find_previous_revision,
 )
 
 
@@ -492,3 +493,59 @@ async def test_list_replicasets_filters_by_owning_deployment():
     out = await client.list_replicasets("citizen-portal", "citizen-service")
 
     assert [r["name"] for r in out] == ["citizen-service-a"]
+
+
+# ---------------------------------------------------------------------------
+# find_previous_revision — rollback target selection must not simply mean
+# "the previous revision" (plain `kubectl rollout undo` semantics). This is
+# a regression test for the real citizen-service incident: revision 66 (a
+# placeholder-image ReplicaSet from outside Sentinel) sat one revision back
+# from the broken one and would have been rolled forward, unvalidated, as
+# the "fix", had `find_previous_revision` not checked `images_valid`.
+# ---------------------------------------------------------------------------
+def test_find_previous_revision_with_no_explicit_target_skips_an_invalid_candidate():
+    replicasets = [
+        {"name": "rs-68", "revision": 68, "images_valid": True},   # current (broken app, valid image)
+        {"name": "rs-66", "revision": 66, "images_valid": False},  # placeholder image — must be skipped
+        {"name": "rs-65", "revision": 65, "images_valid": True},   # genuinely safe target
+    ]
+    target = find_previous_revision(replicasets, target_revision=None)
+    assert target is not None
+    assert target["revision"] == 65
+
+
+def test_find_previous_revision_returns_none_when_every_older_revision_is_invalid():
+    replicasets = [
+        {"name": "rs-68", "revision": 68, "images_valid": True},
+        {"name": "rs-66", "revision": 66, "images_valid": False},
+    ]
+    assert find_previous_revision(replicasets, target_revision=None) is None
+
+
+def test_find_previous_revision_treats_a_missing_images_valid_key_as_valid():
+    """Older evidence / hand-built fixtures without the `images_valid` key
+    must still resolve to the immediate previous revision — this can only
+    ever make Sentinel skip a target it previously accepted, never reject
+    one it used to accept."""
+    replicasets = [
+        {"name": "rs-68", "revision": 68},
+        {"name": "rs-67", "revision": 67},
+    ]
+    target = find_previous_revision(replicasets, target_revision=None)
+    assert target is not None
+    assert target["revision"] == 67
+
+
+def test_find_previous_revision_with_explicit_target_revision_is_unaffected_by_validity():
+    """An explicitly requested revision (autonomous plan built from
+    correlation's own validated candidate, or a human-authorized override
+    that named a specific revision) is still returned exactly as asked —
+    `patch_deployment_template`'s own image check is what guards this path,
+    not this lookup."""
+    replicasets = [
+        {"name": "rs-68", "revision": 68, "images_valid": True},
+        {"name": "rs-66", "revision": 66, "images_valid": False},
+    ]
+    target = find_previous_revision(replicasets, target_revision=66)
+    assert target is not None
+    assert target["name"] == "rs-66"

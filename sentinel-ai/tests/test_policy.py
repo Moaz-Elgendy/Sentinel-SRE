@@ -568,3 +568,37 @@ def test_human_override_never_applies_to_escalate(engine, incident):
     verdict = engine.evaluate(incident, plan, PolicyContext(), NOW, human_override=True)
     assert verdict.allowed is True
     assert "confidence_human_override" not in verdict.checks
+
+
+# ---------------------------------------------------------------------------
+# Risk/impact assessment (lifecycle/risk.py) is echoed, never consulted
+# ---------------------------------------------------------------------------
+def test_verdict_echoes_context_risk_verbatim_on_both_allow_and_deny(
+    engine, incident, rollback_ready_context
+):
+    """`context.risk` is populated by the orchestrator (lifecycle/risk.py)
+    before evaluate() runs, and must come back unchanged on the verdict
+    regardless of which branch decided allow/deny — see policy.py's
+    evaluate()/_evaluate() split. It must never change what gets decided."""
+    rollback_ready_context.risk = {"level": "low", "blast_radius_scope": "single_workload"}
+
+    allowed_plan = make_plan(RemediationAction.RESTART_DEPLOYMENT, confidence=0.95)
+    allowed_verdict = engine.evaluate(incident, allowed_plan, rollback_ready_context, NOW)
+    assert allowed_verdict.allowed is True
+    assert allowed_verdict.risk == {"level": "low", "blast_radius_scope": "single_workload"}
+
+    denied_plan = make_plan(RemediationAction.RESTART_DEPLOYMENT, confidence=0.01)
+    denied_verdict = engine.evaluate(incident, denied_plan, rollback_ready_context, NOW)
+    assert denied_verdict.allowed is False
+    assert denied_verdict.reason is DenialReason.CONFIDENCE_TOO_LOW
+    assert denied_verdict.risk == {"level": "low", "blast_radius_scope": "single_workload"}
+
+
+def test_verdict_risk_is_none_when_context_never_set_it(engine, incident, rollback_ready_context):
+    """A caller that never populates `context.risk` (e.g. an older test, or
+    a future direct construction) gets exactly the previous behaviour: no
+    risk field, nothing implied."""
+    plan = make_plan(RemediationAction.RESTART_DEPLOYMENT, confidence=0.95)
+    verdict = engine.evaluate(incident, plan, rollback_ready_context, NOW)
+    assert verdict.allowed is True
+    assert verdict.risk is None

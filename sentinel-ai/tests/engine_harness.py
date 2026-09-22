@@ -124,7 +124,16 @@ class FakeValidator:
 
     def is_available_for(self, deployment): return True
 
-    async def validate(self, incident, params, baseline_error_rate=None):
+    async def validate(
+        self,
+        incident,
+        params,
+        baseline_error_rate=None,
+        baseline_p95_latency_seconds=None,
+        baseline_cpu_cores=None,
+        baseline_memory_bytes=None,
+        baseline_deployment=None,
+    ):
         self.calls += 1
         return ValidationReport(outcome=self.outcome, detail=f"scripted {self.outcome.value}")
 

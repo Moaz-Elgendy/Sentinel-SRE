@@ -229,7 +229,7 @@ export default function IncidentsListPage() {
                   key={incident.id}
                   tabIndex={0}
                   onClick={() => navigate(`/incidents/${incident.id}`)}
-                  onKeyDown={(e) => e.key === 'Enter' && navigate(`/incidents/${incident.id}`)}
+                  onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), navigate(`/incidents/${incident.id}`))}
                   className="cursor-pointer focus-visible:bg-muted/60 focus-visible:outline-none"
                 >
                   <TableCell className="max-w-96 whitespace-normal">

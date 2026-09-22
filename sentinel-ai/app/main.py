@@ -95,6 +95,7 @@ from app.routers import (
     config,
     dashboard,
     environments,
+    evaluation,
     events,
     feedback,
     health,
@@ -443,6 +444,7 @@ app.include_router(config.router)
 app.include_router(authorizations.router)
 app.include_router(environments.router)
 app.include_router(chaos_scenarios.router)
+app.include_router(evaluation.router)
 app.include_router(dashboard.router)
 app.include_router(actions.router)
 app.include_router(performance.router)

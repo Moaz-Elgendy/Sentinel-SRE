@@ -32,6 +32,46 @@ see feedback.py's module docstring.
 `remediation_success_rate` and `avg_time_to_remediation_seconds` are
 computed across executed attempts (`AttemptRecord.result is not None`), not
 denied candidates.
+
+### Sentinel Agent Evaluation additions
+
+These distinguish failure MODES that `remediation_success_rate` alone
+conflates, and surface two rates that were not computed anywhere before:
+
+* `first_action_success_rate` — validation-passed rate of only the FIRST
+  executed attempt per incident, distinct from `remediation_success_rate`
+  (computed across every executed attempt, including fallbacks). A high
+  overall rate with a much lower first-action rate means Sentinel's
+  fallback ladder is doing the real work, not its first, best-evidenced
+  decision.
+* `execution_failure_rate` — of executed attempts, how many failed to even
+  APPLY (`RemediationResult.succeeded is False`; a Kubernetes API error, for
+  example) — distinct from an attempt that applied fine but did not fix the
+  problem.
+* `ineffective_remediation_rate` — of attempts that DID apply
+  (`succeeded is True`) AND had a validation outcome recorded, how many
+  nonetheless failed validation. This is "ran, but didn't help", the
+  specific failure mode `execution_failure_rate` does not cover.
+* `recovery_validation_success_rate` — passed vs. (passed+failed+timeout+
+  degraded) across every attempt that had a validation outcome recorded at
+  all. `ValidationOutcome.UNAVAILABLE` (no health surface configured, or
+  Kubernetes unreachable) is excluded from both sides — it means "we could
+  not check", not "we checked and it failed", so counting it either way
+  would misrepresent Sentinel's own visibility as a remediation failure.
+* `policy_rejection_rate` — of every candidate action the Policy Engine
+  ever ruled on for any incident (`AttemptRecord.verdict is not None`,
+  executed or denied alike), how many were denied.
+* `escalation_rate` — `escalations` (an existing count) expressed as a
+  fraction of `total_incidents`.
+* `avg_investigation_latency_seconds` — average time from an incident's
+  DETECTION timeline event to its first ROOT_CAUSE_ANALYSIS event. This IS
+  independently measurable, unlike `avg_time_to_detection_seconds` above:
+  both are Sentinel's own timeline events, not a comparison against
+  Alertmanager's clock.
+
+All five rates use the same `null`-when-the-denominator-is-empty rule as
+every other rate in this file — a metric with zero qualifying attempts
+reports `null`, never a misleading `0.0` or `1.0`.
 """
 from __future__ import annotations
 
@@ -83,18 +123,27 @@ def performance_summary(request: Request) -> dict[str, Any]:
     ]
 
     executed_attempts: list[dict[str, Any]] = []
+    first_executed_attempts: list[dict[str, Any]] = []
+    verdicted_attempts: list[dict[str, Any]] = []
     time_to_first_remediation: list[float] = []
     resolution_times: list[float] = []
+    investigation_latencies: list[float] = []
 
     for incident in incidents:
         attempts = incident.get("attempts") or []
         created_at = incident.get("created_at")
         first_executed_at = None
+        first_executed_attempt = None
         for attempt in attempts:
+            if attempt.get("verdict"):
+                verdicted_attempts.append(attempt)
             if attempt.get("result"):
                 executed_attempts.append(attempt)
                 if first_executed_at is None:
                     first_executed_at = attempt.get("at")
+                    first_executed_attempt = attempt
+        if first_executed_attempt is not None:
+            first_executed_attempts.append(first_executed_attempt)
         if created_at and first_executed_at:
             time_to_first_remediation.append(first_executed_at - created_at)
 
@@ -102,12 +151,63 @@ def performance_summary(request: Request) -> dict[str, Any]:
         if created_at and resolved_at and incident.get("status") in terminal:
             resolution_times.append(resolved_at - created_at)
 
-    validated = [
-        a for a in executed_attempts if (a.get("validation") or {}).get("outcome") == "passed"
-    ]
+        detection_at = None
+        rca_at = None
+        for event in incident.get("timeline") or []:
+            if event.get("phase") == "detection" and detection_at is None:
+                detection_at = event.get("at")
+            if event.get("phase") == "root_cause_analysis" and rca_at is None:
+                rca_at = event.get("at")
+        if detection_at is not None and rca_at is not None:
+            investigation_latencies.append(rca_at - detection_at)
+
+    def _validation_outcome(attempt: dict[str, Any]) -> str | None:
+        return (attempt.get("validation") or {}).get("outcome")
+
+    validated = [a for a in executed_attempts if _validation_outcome(a) == "passed"]
     remediation_success_rate = (
         len(validated) / len(executed_attempts) if executed_attempts else None
     )
+
+    first_action_validated = [
+        a for a in first_executed_attempts if _validation_outcome(a) == "passed"
+    ]
+    first_action_success_rate = (
+        len(first_action_validated) / len(first_executed_attempts)
+        if first_executed_attempts
+        else None
+    )
+
+    execution_failures = [
+        a for a in executed_attempts if not (a.get("result") or {}).get("succeeded")
+    ]
+    execution_failure_rate = (
+        len(execution_failures) / len(executed_attempts) if executed_attempts else None
+    )
+
+    applied_attempts = [a for a in executed_attempts if (a.get("result") or {}).get("succeeded")]
+    applied_and_scored = [a for a in applied_attempts if _validation_outcome(a) not in (None, "unavailable")]
+    ineffective = [a for a in applied_and_scored if _validation_outcome(a) != "passed"]
+    ineffective_remediation_rate = (
+        len(ineffective) / len(applied_and_scored) if applied_and_scored else None
+    )
+
+    validation_scored = [
+        a for a in executed_attempts if _validation_outcome(a) not in (None, "unavailable")
+    ]
+    recovery_validation_success_rate = (
+        sum(1 for a in validation_scored if _validation_outcome(a) == "passed")
+        / len(validation_scored)
+        if validation_scored
+        else None
+    )
+
+    denied_attempts = [a for a in verdicted_attempts if not (a.get("verdict") or {}).get("allowed")]
+    policy_rejection_rate = (
+        len(denied_attempts) / len(verdicted_attempts) if verdicted_attempts else None
+    )
+
+    escalation_rate = len(escalated) / total if total else None
 
     diagnosis_judgments = _latest_feedback_per_incident(feedback_rows, "diagnosis")
     diagnosis_accuracy = (
@@ -132,6 +232,9 @@ def performance_summary(request: Request) -> dict[str, Any]:
         "sample_size": {
             "total_incidents": total,
             "executed_attempts": len(executed_attempts),
+            "first_action_attempts": len(first_executed_attempts),
+            "verdicted_attempts": len(verdicted_attempts),
+            "validation_scored_attempts": len(validation_scored),
             "diagnosis_feedback_count": len(diagnosis_judgments),
             "remediation_feedback_count": len(remediation_judgments),
         },
@@ -152,7 +255,30 @@ def performance_summary(request: Request) -> dict[str, Any]:
             "measurement of detection latency to report"
         ),
         "avg_time_to_remediation_seconds": _mean(time_to_first_remediation),
+        "avg_investigation_latency_seconds": _mean(investigation_latencies),
+        "first_action_success_rate": first_action_success_rate,
+        "execution_failure_rate": execution_failure_rate,
+        "ineffective_remediation_rate": ineffective_remediation_rate,
+        "recovery_validation_success_rate": recovery_validation_success_rate,
+        "policy_rejection_rate": policy_rejection_rate,
+        "escalation_rate": escalation_rate,
     }
     if diagnosis_accuracy is None:
         result["diagnosis_feedback_unavailable_reason"] = "no diagnosis feedback recorded yet"
+    if first_action_success_rate is None:
+        result["first_action_success_rate_unavailable_reason"] = "no executed remediation attempts yet"
+    if execution_failure_rate is None:
+        result["execution_failure_rate_unavailable_reason"] = "no executed remediation attempts yet"
+    if ineffective_remediation_rate is None:
+        result["ineffective_remediation_rate_unavailable_reason"] = (
+            "no attempt has both applied successfully and recorded a validation outcome yet"
+        )
+    if recovery_validation_success_rate is None:
+        result["recovery_validation_success_rate_unavailable_reason"] = (
+            "no attempt has recorded a validation outcome yet"
+        )
+    if policy_rejection_rate is None:
+        result["policy_rejection_rate_unavailable_reason"] = "no candidate action has been ruled on yet"
+    if escalation_rate is None:
+        result["escalation_rate_unavailable_reason"] = "no incidents recorded yet"
     return result

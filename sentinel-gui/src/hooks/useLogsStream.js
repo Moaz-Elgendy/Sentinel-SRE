@@ -6,12 +6,21 @@ const MAX_DISPLAYED_LINES = 2000
 /**
  * Sentinel Logs' data source: an initial `GET /api/logs` query (already-
  * persisted lines matching the current filters), then a live SSE tail that
- * appends new lines as Sentinel's own logger actually emits them (see
+ * prepends new lines as Sentinel's own logger actually emits them (see
  * app/core/log_capture.py) — no frontend-invented lines, ever.
  *
- * `paused`: while true, incoming live lines are buffered but NOT appended
+ * Ordering: newest first, top to bottom, throughout. `GET /api/logs`
+ * (app/core/log_capture.py's `query_logs`) already returns most-recent-first
+ * — it reads the live file backward, then older rotated backups — so the
+ * initial page is used exactly as received, with no client-side reversal.
+ * A line arriving live is always newer than everything already loaded, so
+ * it is prepended, never appended.
+ *
+ * `paused`: while true, incoming live lines are buffered but NOT prepended
  * to `lines` — nothing is lost, resuming flushes the buffer. This is a
- * display control only.
+ * display control only. The buffer fills in arrival order (oldest-buffered
+ * first); flushing reverses it before prepending, so the final order is
+ * still strictly newest-first once merged with what was already showing.
  *
  * `clearView()`: empties what is DISPLAYED. Deliberately does not, and
  * cannot, touch the persisted file on the backend — there is no delete
@@ -31,7 +40,10 @@ export function useLogsStream({ level, component, incidentId, q } = {}) {
   useEffect(() => {
     pausedRef.current = paused
     if (!paused && bufferRef.current.length > 0) {
-      setLines((prev) => [...prev, ...bufferRef.current].slice(-MAX_DISPLAYED_LINES))
+      // bufferRef accumulated oldest-arrival-first; reverse it so the most
+      // recently arrived line ends up at index 0, ahead of everything that
+      // was already showing.
+      setLines((prev) => [...[...bufferRef.current].reverse(), ...prev].slice(0, MAX_DISPLAYED_LINES))
       bufferRef.current = []
       setPendingCount(0)
     }
@@ -45,9 +57,9 @@ export function useLogsStream({ level, component, incidentId, q } = {}) {
     listLogs({ level, component, incidentId, q, limit: 200 })
       .then((result) => {
         if (cancelled) return
-        // The API returns most-recent-first; the feed reads top-to-bottom
-        // oldest-first, same convention as the incident audit timeline.
-        setLines([...result.logs].reverse())
+        // The API already returns most-recent-first; use it as-is so the
+        // newest entry is at the top of the feed.
+        setLines(result.logs)
       })
       .catch((err) => {
         if (!cancelled) setError(err)
@@ -65,7 +77,7 @@ export function useLogsStream({ level, component, incidentId, q } = {}) {
         bufferRef.current = [...bufferRef.current, entry].slice(-MAX_DISPLAYED_LINES)
         setPendingCount(bufferRef.current.length)
       } else {
-        setLines((prev) => [...prev, entry].slice(-MAX_DISPLAYED_LINES))
+        setLines((prev) => [entry, ...prev].slice(0, MAX_DISPLAYED_LINES))
       }
     })
     setConnected(true)

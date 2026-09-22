@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 from app.core.metrics import sentinel_policy_denials_total
 from app.models.incident import (
@@ -156,6 +157,16 @@ class PolicyContext:
     # default: a caller that does not supply it gets the previous
     # (per-incident) behaviour.
     other_incident_actions: dict[str, float] = field(default_factory=dict)
+    # The deterministic risk/impact assessment for the candidate this
+    # context accompanies (lifecycle/risk.py), as a plain dict. Purely
+    # informational: `evaluate()` echoes it onto the returned PolicyVerdict
+    # for the audit trail and GUI, but no allow/deny branch below reads it.
+    # Existing policy checks (deny-lists, confidence thresholds,
+    # reversibility, validation availability) already enforce the real
+    # safety boundaries; risk.py's job is to name and surface those factors
+    # in one place, not to duplicate or re-gate them. An old caller that
+    # never sets this field keeps exactly its previous behaviour.
+    risk: dict[str, Any] | None = None
     notes: list[str] = field(default_factory=list)
 
 
@@ -165,6 +176,29 @@ class PolicyEngine:
 
     # -- public API -------------------------------------------------------
     def evaluate(
+        self,
+        incident: Incident,
+        plan: ActionPlan,
+        context: PolicyContext,
+        now: float,
+        human_override: bool = False,
+    ) -> PolicyVerdict:
+        """Authorise or deny one candidate action.
+
+        Thin wrapper around `_evaluate()`: every return path in that method
+        goes through here, so `context.risk` (lifecycle/risk.py's assessment
+        for this exact candidate) is echoed onto the verdict exactly once,
+        regardless of which branch decided allow/deny. Nothing in
+        `_evaluate()` reads `context.risk` — see PolicyContext's own
+        docstring for why the blast-radius gate does not depend on it.
+        """
+        verdict = self._evaluate(
+            incident, plan, context, now, human_override=human_override
+        )
+        verdict.risk = context.risk
+        return verdict
+
+    def _evaluate(
         self,
         incident: Incident,
         plan: ActionPlan,

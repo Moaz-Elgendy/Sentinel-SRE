@@ -23,6 +23,27 @@ export function reinvestigateIncident(incidentId) {
   return client.post(`/api/incidents/${incidentId}/reinvestigate`).then((r) => r.data)
 }
 
+/**
+ * Evidence-backed graph view (sentinel-ai app/lifecycle/causal_graph.py).
+ * Derived at request time from the same stored incident record — never a
+ * separate source of truth, so it can never drift from what the incident
+ * page's other tabs already show.
+ */
+export function getCausalGraph(incidentId) {
+  return client.get(`/api/incidents/${incidentId}/causal-graph`).then((r) => r.data)
+}
+
+/**
+ * What Sentinel's CURRENT rules/decision/risk/policy would conclude from
+ * this incident's already-recorded evidence (sentinel-ai
+ * app/lifecycle/replay.py). Never triggers a live re-investigation and
+ * never executes anything - read-only, like every other incident endpoint.
+ */
+export function getIncidentReplay(incidentId, { fromScratch = false } = {}) {
+  const params = fromScratch ? { from_scratch: true } : {}
+  return client.get(`/api/incidents/${incidentId}/replay`, { params }).then((r) => r.data)
+}
+
 export async function openIncidentDocument(incidentId) {
   const response = await client.get(`/api/incidents/${incidentId}/document`, {
     responseType: 'blob',

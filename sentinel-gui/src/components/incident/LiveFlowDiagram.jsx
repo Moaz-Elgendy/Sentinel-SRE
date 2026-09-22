@@ -113,17 +113,31 @@ export default function LiveFlowDiagram({ incident, phaseMeta }) {
         )}
       </ol>
 
-      {incident.escalated && (
+      {incident.status === 'escalated' && (
         <div className="flow-branch">
           <Icon name="alertTriangle" size={16} className="flow-branch__icon" />
           <div>
             <div className="flow-branch__label">Escalated to SRE</div>
             {/* While escalated, the reason is already shown in the action-required card above. */}
-            {incident.status !== 'escalated' && (
-              <div className="flow-branch__detail">
-                {incident.escalation_detail || 'No safe autonomous action available.'}
-              </div>
-            )}
+          </div>
+        </div>
+      )}
+
+      {/* A resolved/auto_resolved incident that was escalated at some point
+          before it reopened and recovered: this is history, not the current
+          state, so it renders as a quiet, non-alarming note rather than the
+          "Escalated to SRE" branch above (see the v1.3 Escalation Audit —
+          `escalated` alone is not trustworthy once the incident is resolved,
+          but `escalation_record` is still useful, real, past-tense context). */}
+      {isTerminal && incident.status !== 'escalated' && incident.escalation_record?.at && (
+        <div className="flow-branch flow-branch--muted">
+          <Icon name="history" size={16} className="flow-branch__icon" />
+          <div>
+            <div className="flow-branch__label">Previously escalated</div>
+            <div className="flow-branch__detail">
+              {formatClock(incident.escalation_record.at)}
+              {incident.escalation_record.detail ? ` — ${incident.escalation_record.detail}` : ''}
+            </div>
           </div>
         </div>
       )}

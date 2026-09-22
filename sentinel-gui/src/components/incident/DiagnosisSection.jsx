@@ -1,10 +1,29 @@
-import { Microscope } from 'lucide-react'
+import { History, Microscope } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { ConfidenceMeter } from '@/components/sentinel/Meters'
 import { EmptyState } from '@/components/sentinel/States'
+import { TONE_TEXT } from '@/components/sentinel/tone'
 import { actionLabel, isActiveIncident, rootCauseLabel } from '@/utils/incident'
 import { llmStatusLabel } from '@/utils/labels'
 import { CaseStep } from './CaseStep.jsx'
+import { cn } from '@/lib/utils'
+
+// memory.py's `as_supporting_note()` always starts with this exact prefix —
+// kept in sync deliberately. "Seen before" citations are full sentences
+// about a *different* incident, not a short tag about this one, so they get
+// their own list instead of being squeezed into a "Supporting signals" pill,
+// and a tone drawn from the fixed phrases that function produces (escalated
+// / failed / unconfirmed / succeeded), so a skim tells you at a glance
+// whether Sentinel's past attempts on similar incidents actually worked.
+const MEMORY_NOTE_PREFIX = "similar past incident "
+
+function memoryNoteTone(note) {
+  if (note.includes('did not resolve the incident')) return 'bad'
+  if (note.includes('was escalated to a human')) return 'warn'
+  if (note.includes('recovery was not confirmed')) return 'warn'
+  if (note.includes('resolved autonomously via')) return 'ok'
+  return 'neutral'
+}
 
 /** Step 2: what Sentinel believes is happening, how sure it is, and why. */
 export function DiagnosisSection({ incident }) {
@@ -20,6 +39,9 @@ export function DiagnosisSection({ incident }) {
   const usedLlm = h.llm_used
   const rulesConfidence = h.rule_confidence
   const adjusted = usedLlm && rulesConfidence != null && Math.abs(rulesConfidence - h.confidence) >= 0.005
+  const allSupporting = h.supporting ?? []
+  const memoryNotes = allSupporting.filter((s) => s.startsWith(MEMORY_NOTE_PREFIX))
+  const ruleSupporting = allSupporting.filter((s) => !s.startsWith(MEMORY_NOTE_PREFIX))
 
   return (
     <CaseStep step="2" title="What it concluded" description="Sentinel’s diagnosis and reasoning">
@@ -54,15 +76,31 @@ export function DiagnosisSection({ incident }) {
           </div>
         )}
 
-        {h.supporting?.length > 0 && (
+        {ruleSupporting.length > 0 && (
           <div>
             <h3 className="text-xs font-medium text-muted-foreground">Supporting signals</h3>
             <ul className="mt-1.5 flex flex-wrap gap-1.5">
-              {h.supporting.map((s) => (
+              {ruleSupporting.map((s) => (
                 <li key={s}>
                   <Badge variant="outline" className="font-normal">
                     {s}
                   </Badge>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {memoryNotes.length > 0 && (
+          <div>
+            <h3 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              <History className="h-3.5 w-3.5" aria-hidden="true" />
+              Seen before
+            </h3>
+            <ul className="mt-1.5 space-y-1">
+              {memoryNotes.map((s) => (
+                <li key={s} className={cn('text-sm leading-6', TONE_TEXT[memoryNoteTone(s)])}>
+                  {s}
                 </li>
               ))}
             </ul>

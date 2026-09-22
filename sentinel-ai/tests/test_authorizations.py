@@ -190,7 +190,16 @@ def test_full_authorization_flow_resolves_the_incident_via_human_override(
     import app.lifecycle.validation as validation_module
     from app.models.incident import ValidationOutcome, ValidationReport
 
-    async def _fake_validate(self, incident, params, baseline_error_rate):
+    async def _fake_validate(
+        self,
+        incident,
+        params,
+        baseline_error_rate=None,
+        baseline_p95_latency_seconds=None,
+        baseline_cpu_cores=None,
+        baseline_memory_bytes=None,
+        baseline_deployment=None,
+    ):
         return ValidationReport(outcome=ValidationOutcome.PASSED, detail="faked for test")
 
     monkeypatch.setattr(

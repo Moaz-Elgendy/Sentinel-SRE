@@ -1,0 +1,35 @@
+# loki.source.kubernetes tails logs via the Kubernetes API (pods/log
+# subresource), not by reading host log files — so unlike a classic
+# Promtail DaemonSet, this needs no hostPath mounts or privileged
+# access, just API read permissions. Scoped to a Role in citizen-portal
+# only, matching every other RBAC grant in this project (see
+# monitoring/prometheus/rbac.yaml).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alloy
+  namespace: citizen-portal
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: alloy
+  namespace: citizen-portal
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alloy
+  namespace: citizen-portal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: alloy
+subjects:
+  - kind: ServiceAccount
+    name: alloy
+    namespace: citizen-portal

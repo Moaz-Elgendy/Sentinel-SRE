@@ -514,6 +514,18 @@
   font-size: var(--text-sm);
 }
 
+/* Historical note (e.g. "previously escalated, now resolved") — same shape
+   as .flow-branch but neutral in tone, since nothing here needs attention. */
+.flow-branch--muted {
+  border-color: var(--neutral-edge);
+  background: var(--neutral-tint);
+}
+
+.flow-branch--muted .flow-branch__icon,
+.flow-branch--muted .flow-branch__label {
+  color: var(--neutral-solid);
+}
+
 /* Diagnosis */
 .reasoning__headline {
   display: grid;

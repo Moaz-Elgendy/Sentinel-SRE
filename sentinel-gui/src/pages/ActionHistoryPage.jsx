@@ -204,7 +204,7 @@ export default function ActionHistoryPage() {
             </TableHeader>
             <TableBody>
               {pageRows.map((row, i) => (
-                <TableRow key={`${row.incident_id}-${row.at}-${i}`} tabIndex={0} onClick={() => setSelected(row)} onKeyDown={(e) => e.key === 'Enter' && setSelected(row)} className="cursor-pointer focus-visible:bg-muted/60 focus-visible:outline-none">
+                <TableRow key={`${row.incident_id}-${row.at}-${i}`} tabIndex={0} onClick={() => setSelected(row)} onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), setSelected(row))} className="cursor-pointer focus-visible:bg-muted/60 focus-visible:outline-none">
                   <TableCell className="text-muted-foreground">
                     <Timestamp value={row.at} />
                   </TableCell>

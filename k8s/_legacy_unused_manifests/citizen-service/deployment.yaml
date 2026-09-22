@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: citizen-service
+  namespace: citizen-portal
+  labels:
+    app: citizen-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: citizen-service
+  template:
+    metadata:
+      labels:
+        app: citizen-service
+      # Phase 9: annotation-based scrape discovery — see
+      # k8s/monitoring/prometheus/configmap.yaml's kubernetes_sd_configs
+      # (role: pod) relabeling, which matches on exactly these annotations.
+      # No ServiceMonitor CRD / Prometheus Operator yet, consistent with
+      # "plain YAML, no Helm" for this whole k8s/ directory (see Phase 7).
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Migrations + seeding run once here, before any replica starts
+      # serving traffic, instead of in each replica's startup command
+      # (docker-compose's approach) — with 2+ replicas, running
+      # `alembic upgrade head` from every pod on every rollout would race.
+      # Alembic's own migration-lock behavior makes concurrent runs safe,
+      # but there's no reason to pay that cost every time when one
+      # init container covers the whole Deployment per rollout.
+      initContainers:
+        - name: migrate-and-seed
+          image: citizen-service:latest
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "alembic upgrade head && python -m app.seed"]
+          envFrom:
+            - configMapRef:
+                name: citizen-service-config
+            - secretRef:
+                name: citizen-service-secret
+      containers:
+        - name: citizen-service
+          image: citizen-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: citizen-service-config
+            - secretRef:
+                name: citizen-service-secret
+          volumeMounts:
+            - name: uploads
+              mountPath: /data/uploads
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            # /readyz can report "degraded" (still 200) if
+            # notification-service is unreachable — see Phase 6. Only a
+            # non-200 (DB down) should pull this pod out of rotation, and
+            # a couple of consecutive failures avoids flapping on a single
+            # slow health check under load.
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: uploads
+          # NOTE: ReadWriteOnce means this PVC can only be mounted by pods
+          # scheduled on the same node. That's fine for a single-node
+          # kind/minikube cluster (Phase 8's target), where every pod ends
+          # up on the same node anyway — but on a real multi-node cluster,
+          # 2 replicas could get scheduled onto different nodes and one
+          # would fail to mount. Swap for a ReadWriteMany-capable
+          # StorageClass (e.g. NFS, EFS) or move uploads to object storage
+          # before running this beyond a single node.
+          persistentVolumeClaim:
+            claimName: citizen-uploads-pvc
