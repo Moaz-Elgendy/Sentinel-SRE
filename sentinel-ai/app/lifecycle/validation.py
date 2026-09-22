@@ -159,14 +159,27 @@ class ValidationThresholds:
 # Individual check functions. Pure, so test_validation.py can hammer them
 # without a cluster. Each returns (ok, detail).
 # ---------------------------------------------------------------------------
-def check_replicas(deployment: dict[str, Any] | None) -> tuple[bool, str]:
+def check_replicas(
+    deployment: dict[str, Any] | None,
+    baseline_deployment: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     if deployment is None:
         return False, "could not read the Deployment"
     desired = deployment.get("desired_replicas")
     available = deployment.get("available_replicas")
     if desired is None:
         return False, "Deployment has no spec.replicas"
-    if available == desired:
+    ok = available == desired
+    # baseline_deployment is the SAME Deployment's state as investigation.py
+    # captured it before remediation ran (real Evidence, never guessed) — shown
+    # only when we actually have it, so a replica count that was never
+    # observed before the action is never implied to have been.
+    if baseline_deployment is not None:
+        before_available = baseline_deployment.get("available_replicas")
+        before_desired = baseline_deployment.get("desired_replicas")
+        if before_available is not None and before_desired is not None:
+            return ok, f"{before_available}/{before_desired} -> {available}/{desired} replicas available"
+    if ok:
         return True, f"{available}/{desired} replicas available"
     return False, f"only {available}/{desired} replicas available"
 
@@ -263,7 +276,19 @@ def check_error_rate(
     return False, f"error rate {current:.2%} is above {threshold:.2%}"
 
 
-def check_latency(current: float | None, threshold: float) -> tuple[bool, str]:
+def _before_after(label: str, before: float | None, after_text: str) -> str:
+    """Prepend a real 'before -> after' clause when a pre-remediation reading
+    was actually captured during investigation — never fabricated, and
+    silently omitted (not guessed) when Evidence never captured one (e.g. no
+    prior incident evidence, or the metric was unavailable then too)."""
+    if before is None:
+        return after_text
+    return f"{label} {before:.2f} -> {after_text}"
+
+
+def check_latency(
+    current: float | None, threshold: float, baseline: float | None = None
+) -> tuple[bool, str]:
     if current is None:
         # Unlike error rate, an absent latency histogram is common on a
         # low-traffic service that has had no requests since the restart.
@@ -271,28 +296,49 @@ def check_latency(current: float | None, threshold: float) -> tuple[bool, str]:
         # resolution on traffic we cannot generate.
         return True, "p95 latency unavailable (likely no requests since the action)"
     if current <= threshold:
-        return True, f"p95 latency {current:.2f}s is at or below {threshold:.2f}s"
-    return False, f"p95 latency {current:.2f}s is above {threshold:.2f}s"
+        detail = f"p95 latency {current:.2f}s is at or below {threshold:.2f}s"
+    else:
+        detail = f"p95 latency {current:.2f}s is above {threshold:.2f}s"
+    if baseline is not None:
+        detail = f"p95 latency {baseline:.2f}s -> {current:.2f}s (limit {threshold:.2f}s)"
+    return current <= threshold, detail
 
 
-def check_cpu(current: float | None, threshold: float) -> tuple[bool, str]:
+def check_cpu(
+    current: float | None, threshold: float, baseline: float | None = None
+) -> tuple[bool, str]:
     if current is None:
         return True, "CPU unavailable; not treated as a failure"
     if current <= threshold:
-        return True, f"CPU {current:.2f} cores is at or below {threshold:.2f}"
-    return False, (
-        f"CPU {current:.2f} cores is above {threshold:.2f}. This is "
-        "process_cpu_seconds_total, not a cgroup metric — with no cAdvisor here "
-        "it cannot be compared to the container's limit."
-    )
+        detail = f"CPU {current:.2f} cores is at or below {threshold:.2f}"
+    else:
+        detail = (
+            f"CPU {current:.2f} cores is above {threshold:.2f}. This is "
+            "process_cpu_seconds_total, not a cgroup metric — with no cAdvisor here "
+            "it cannot be compared to the container's limit."
+        )
+    if baseline is not None:
+        detail = f"CPU {baseline:.2f} -> {current:.2f} cores (limit {threshold:.2f})" + (
+            "" if current <= threshold else ". Not a cgroup metric; no container limit to compare against."
+        )
+    return current <= threshold, detail
 
 
-def check_memory(current: float | None, threshold: float) -> tuple[bool, str]:
+def check_memory(
+    current: float | None, threshold: float, baseline: float | None = None
+) -> tuple[bool, str]:
     if current is None:
         return True, "memory unavailable; not treated as a failure"
-    if current <= threshold:
-        return True, f"RSS {current / 1e6:.0f} MB is at or below {threshold / 1e6:.0f} MB"
-    return False, f"RSS {current / 1e6:.0f} MB is above {threshold / 1e6:.0f} MB"
+    if baseline is not None:
+        detail = (
+            f"RSS {baseline / 1e6:.0f} MB -> {current / 1e6:.0f} MB "
+            f"(limit {threshold / 1e6:.0f} MB)"
+        )
+    elif current <= threshold:
+        detail = f"RSS {current / 1e6:.0f} MB is at or below {threshold / 1e6:.0f} MB"
+    else:
+        detail = f"RSS {current / 1e6:.0f} MB is above {threshold / 1e6:.0f} MB"
+    return current <= threshold, detail
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +390,10 @@ class RecoveryValidator:
         incident: Incident,
         params: ActionParams,
         baseline_error_rate: float | None = None,
+        baseline_p95_latency_seconds: float | None = None,
+        baseline_cpu_cores: float | None = None,
+        baseline_memory_bytes: float | None = None,
+        baseline_deployment: dict[str, Any] | None = None,
     ) -> ValidationReport:
         """Settle, then poll until pass or timeout."""
         namespace = params.namespace or incident.namespace
@@ -369,7 +419,14 @@ class RecoveryValidator:
         while True:
             attempt += 1
             last_report = await self._single_pass(
-                namespace, deployment, app, baseline_error_rate
+                namespace,
+                deployment,
+                app,
+                baseline_error_rate,
+                baseline_p95_latency_seconds=baseline_p95_latency_seconds,
+                baseline_cpu_cores=baseline_cpu_cores,
+                baseline_memory_bytes=baseline_memory_bytes,
+                baseline_deployment=baseline_deployment,
             )
             last_report.elapsed_seconds = self._now() - started
             if last_report.outcome is ValidationOutcome.PASSED:
@@ -414,6 +471,10 @@ class RecoveryValidator:
         deployment: str,
         app: str | None,
         baseline_error_rate: float | None,
+        baseline_p95_latency_seconds: float | None = None,
+        baseline_cpu_cores: float | None = None,
+        baseline_memory_bytes: float | None = None,
+        baseline_deployment: dict[str, Any] | None = None,
     ) -> ValidationReport:
         """One full evaluation of every check, all gathered concurrently."""
         base_url = self.base_url_resolver(deployment)
@@ -448,7 +509,7 @@ class RecoveryValidator:
 
         # -- Kubernetes --------------------------------------------------
         if "deployment" in tasks:
-            ok, detail = check_replicas(data.get("deployment"))
+            ok, detail = check_replicas(data.get("deployment"), baseline_deployment)
             record("replicas_available", ok, detail)
             ok, detail = check_pods_ready(data.get("pods") or [])
             record("pods_ready", ok, detail)
@@ -477,13 +538,13 @@ class RecoveryValidator:
         )
         record("error_rate", ok, detail)
 
-        ok, detail = check_latency(data.get("p95"), self.thresholds.max_p95_seconds)
+        ok, detail = check_latency(data.get("p95"), self.thresholds.max_p95_seconds, baseline_p95_latency_seconds)
         record("p95_latency", ok, detail)
 
-        ok, detail = check_cpu(data.get("cpu"), self.thresholds.max_cpu_cores)
+        ok, detail = check_cpu(data.get("cpu"), self.thresholds.max_cpu_cores, baseline_cpu_cores)
         record("cpu", ok, detail)
 
-        ok, detail = check_memory(data.get("memory"), self.thresholds.max_memory_bytes)
+        ok, detail = check_memory(data.get("memory"), self.thresholds.max_memory_bytes, baseline_memory_bytes)
         record("memory", ok, detail)
 
         # -- chaos gauges, per pod ---------------------------------------

@@ -174,6 +174,26 @@ CREATE TABLE IF NOT EXISTS config_history (
     created_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_config_history_category ON config_history(category);
+
+-- Sentinel Agent Evaluation (lifecycle/evaluation.py). A run only RECORDS a
+-- chaos scenario's expected outcome and when it was triggered - it never
+-- triggers AWS SSM itself (routers/chaos_scenarios.py already does that,
+-- separately, and needs a live AWS-connected cluster this store has no
+-- dependency on). Resolving a run (finding the incident it produced,
+-- scoring actual vs expected) is derived at read time from the `incidents`
+-- table already above, the same "derive from the store, do not keep a
+-- second copy" choice as lifecycle/causal_graph.py and lifecycle/memory.py
+-- - `body` holds the full result once resolved so it is computed once, not
+-- on every read.
+CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id              TEXT PRIMARY KEY,
+    scenario        TEXT NOT NULL,
+    app             TEXT NOT NULL,
+    triggered_at    REAL NOT NULL,
+    resolved        INTEGER NOT NULL DEFAULT 0,
+    body            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_triggered ON evaluation_runs(triggered_at DESC);
 """
 
 
@@ -396,6 +416,34 @@ class SQLiteStore:
                 latest[key] = max(latest.get(key, 0.0), started)
         return latest
 
+    def list_terminal_incidents_for_app(
+        self, app: str, *, exclude_incident_id: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Finished incidents (resolved/auto_resolved/escalated) for `app`,
+        newest first.
+
+        Feeds lifecycle/memory.py's "has Sentinel seen something like this
+        before" lookup. Terminal-only on purpose: an incident that is still
+        open has no settled root cause or outcome yet, so comparing against
+        it would be comparing against an opinion mid-formation rather than a
+        finished case.
+        """
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                """
+                SELECT body FROM incidents
+                WHERE app = ? AND status IN ('resolved', 'auto_resolved', 'escalated')
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (app, limit),
+            ).fetchall()
+        records = [json.loads(r["body"]) for r in rows]
+        if exclude_incident_id:
+            records = [r for r in records if r.get("id") != exclude_incident_id]
+        return records
+
     def count_open(self) -> int:
         conn = self._require()
         with self._lock:
@@ -575,6 +623,70 @@ class SQLiteStore:
         with self._lock:
             rows = conn.execute(
                 "SELECT body FROM incidents ORDER BY created_at DESC"
+            ).fetchall()
+        return [json.loads(r["body"]) for r in rows]
+
+    def find_incident_after(self, app: str, since: float) -> dict[str, Any] | None:
+        """First incident recorded for `app` at/after `since`.
+
+        Feeds evaluation.py's resolve step: `since` is an evaluation run's
+        trigger time, and the earliest incident on that app afterwards is
+        presumed to be the one the triggered scenario caused. Read-only,
+        same one-connection-one-lock discipline as every other query here.
+        """
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                "SELECT body FROM incidents WHERE app = ? AND created_at >= ? "
+                "ORDER BY created_at ASC LIMIT 1",
+                (app, since),
+            ).fetchone()
+        return json.loads(row["body"]) if row else None
+
+    # ---- Sentinel Agent Evaluation (lifecycle/evaluation.py) -------------
+    def create_evaluation_run(self, record: dict[str, Any]) -> None:
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO evaluation_runs (id, scenario, app, triggered_at, resolved, body)
+                VALUES (?,?,?,?,?,?)
+                """,
+                (
+                    record["id"],
+                    record["scenario"],
+                    record["app"],
+                    record["triggered_at"],
+                    1 if record.get("resolved") else 0,
+                    json.dumps(record, default=str),
+                ),
+            )
+            conn.commit()
+
+    def update_evaluation_run(self, run_id: str, record: dict[str, Any]) -> None:
+        """Overwrite one run's body in place (e.g. once `resolve_run` has
+        linked it to an incident, so the comparison is computed once)."""
+        conn = self._require()
+        with self._lock:
+            conn.execute(
+                "UPDATE evaluation_runs SET resolved = ?, body = ? WHERE id = ?",
+                (1 if record.get("resolved") else 0, json.dumps(record, default=str), run_id),
+            )
+            conn.commit()
+
+    def get_evaluation_run(self, run_id: str) -> dict[str, Any] | None:
+        conn = self._require()
+        with self._lock:
+            row = conn.execute(
+                "SELECT body FROM evaluation_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return json.loads(row["body"]) if row else None
+
+    def list_evaluation_runs(self) -> list[dict[str, Any]]:
+        conn = self._require()
+        with self._lock:
+            rows = conn.execute(
+                "SELECT body FROM evaluation_runs ORDER BY triggered_at DESC"
             ).fetchall()
         return [json.loads(r["body"]) for r in rows]
 

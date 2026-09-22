@@ -43,7 +43,7 @@ from app.core.metrics import (
     sentinel_validation_result_total,
 )
 from app.domain.environment import Environment
-from app.lifecycle import correlation, documentation, investigation, learning, rca
+from app.lifecycle import correlation, documentation, investigation, learning, memory, rca, risk
 from app.lifecycle.evidence_signature import compute_signature, material_changes
 from app.lifecycle.decision import DecisionEngine
 from app.lifecycle.policy import PolicyConfig, PolicyContext, PolicyEngine
@@ -430,7 +430,7 @@ class Orchestrator:
                     "policy thresholds are unchanged."
                 ),
             )
-            context = self._policy_context(incident, findings)
+            context = self._policy_context(incident, findings, plan)
             verdict = self.ctx.policy.evaluate(
                 incident, plan, context, now=time.time(), human_override=True
             )
@@ -521,6 +521,10 @@ class Orchestrator:
                 incident,
                 verdict.adjusted_params or plan.params,
                 baseline_error_rate=evidence.error_rate,
+                baseline_p95_latency_seconds=evidence.p95_latency_seconds,
+                baseline_cpu_cores=evidence.cpu_cores,
+                baseline_memory_bytes=evidence.memory_bytes,
+                baseline_deployment=evidence.deployment,
             )
             attempt.validation = report
             sentinel_validation_result_total.labels(result=report.outcome.value).inc()
@@ -650,6 +654,37 @@ class Orchestrator:
                 )
             self._persist(incident)
 
+            # ---- OPERATIONAL MEMORY ------------------------------------
+            # Informational only: appends citations to hypothesis.supporting
+            # (see lifecycle/memory.py's module docstring for why this can
+            # never influence confidence, root cause, or the action list).
+            if incident.app:
+                try:
+                    current_signature = compute_signature(evidence)
+                    past_records = self.ctx.store.list_terminal_incidents_for_app(
+                        incident.app, exclude_incident_id=incident.id
+                    )
+                    similar = memory.find_similar_incidents(current_signature, past_records)
+                except Exception as exc:  # noqa: BLE001 - memory is never load-bearing
+                    logger.warning(
+                        "operational_memory_lookup_failed", extra={"error_detail": str(exc)[:200]}
+                    )
+                    similar = []
+                if similar:
+                    hypothesis.supporting.extend(s.as_supporting_note() for s in similar)
+                    incident.record(
+                        LifecyclePhase.ROOT_CAUSE_ANALYSIS,
+                        f"{len(similar)} similar past incident(s) found for {incident.app}: "
+                        + "; ".join(s.as_supporting_note() for s in similar),
+                        similar_incidents=[s.to_dict() for s in similar],
+                    )
+                    self._emit(
+                        incident,
+                        f"Operational memory: {len(similar)} similar past incident(s) found",
+                        "operational_memory_checked",
+                    )
+                    self._persist(incident)
+
             # ---- REMEDIATION DECISION ----------------------------------
             incident.status = IncidentStatus.REMEDIATING
             # Passed per call, not assigned onto the shared DecisionEngine:
@@ -687,7 +722,7 @@ class Orchestrator:
             executed_any = False
             resolved = False
             stale_evidence = False
-            for plan in candidates:
+            for candidate_index, plan in enumerate(candidates):
                 lock = self._target_lock(plan)
                 if lock.locked():
                     incident.record(
@@ -711,7 +746,9 @@ class Orchestrator:
                         self._persist(incident)
                         stale_evidence = True
                         break
-                    context = self._policy_context(incident, findings)
+                    context = self._policy_context(
+                        incident, findings, plan, candidate_index
+                    )
                     verdict = self.ctx.policy.evaluate(
                         incident, plan, context, now=time.time()
                     )
@@ -826,6 +863,10 @@ class Orchestrator:
                         incident,
                         verdict.adjusted_params or plan.params,
                         baseline_error_rate=evidence.error_rate,
+                        baseline_p95_latency_seconds=evidence.p95_latency_seconds,
+                        baseline_cpu_cores=evidence.cpu_cores,
+                        baseline_memory_bytes=evidence.memory_bytes,
+                        baseline_deployment=evidence.deployment,
                     )
                     attempt.validation = report
                     sentinel_validation_result_total.labels(result=report.outcome.value).inc()
@@ -1017,7 +1058,11 @@ class Orchestrator:
         return await probe_health(base_url, path=path)
 
     def _policy_context(
-        self, incident: Incident, findings: correlation.CorrelationFindings
+        self,
+        incident: Incident,
+        findings: correlation.CorrelationFindings,
+        plan: ActionPlan | None = None,
+        candidate_index: int = 0,
     ) -> PolicyContext:
         """Translate evidence + findings into the Policy Engine's inputs.
 
@@ -1029,6 +1074,12 @@ class Orchestrator:
         condition — stated here rather than in policy.py because it is a fact
         about the cluster, and policy.py is deliberately free of cluster
         knowledge.
+
+        `plan`/`candidate_index`: when supplied, also computes this exact
+        candidate's deterministic risk/impact assessment (lifecycle/risk.py)
+        and attaches it as `context.risk` — informational only, see
+        PolicyContext's own docstring. Omitted only by callers that have no
+        single candidate in view yet; every real policy check passes both.
         """
         target = incident.target_deployment
         evidence = incident.evidence
@@ -1050,20 +1101,42 @@ class Orchestrator:
             incident.app, since=time.time() - cooldown, exclude_incident_id=incident.id
         )
 
+        rollback_reversible = findings.revision_count >= 2
+        recovery_validation_available = self.ctx.validator.is_available_for(target)
+
+        risk_assessment = None
+        if plan is not None:
+            risk_assessment = risk.assess_risk(
+                incident,
+                plan,
+                candidate_index=candidate_index,
+                rollback_reversible=rollback_reversible,
+                recovery_validation_available=recovery_validation_available,
+            )
+            self._emit(
+                incident,
+                f"Risk assessment for {plan.action.value}: {risk_assessment.level} impact "
+                f"({risk_assessment.blast_radius_scope}, "
+                f"{'reversible' if risk_assessment.reversible else 'not reversible'}, "
+                f"validation {'available' if risk_assessment.validation_available else 'unavailable'})",
+                "risk_assessed",
+            )
+
         return PolicyContext(
             other_incident_actions=other_actions,
             previous_revision_exists=findings.previous_revision is not None,
             deployment_history_count=findings.revision_count,
             last_deploy_age_seconds=findings.recent_deployment_age_seconds,
             deploy_correlates_with_onset=findings.deploy_correlates_with_onset,
-            rollback_reversible=findings.revision_count >= 2,
-            recovery_validation_available=self.ctx.validator.is_available_for(target),
+            rollback_reversible=rollback_reversible,
+            recovery_validation_available=recovery_validation_available,
             current_replicas=current_replicas,
             chaos_surface_available=chaos_surface,
             # Name-based for now. The frozen deny-list in policy.py catches the
             # two Postgres Deployments regardless; this flag exists so a future
             # stateful workload can be excluded without editing that list.
             target_is_stateful=bool(target and "postgres" in target.lower()),
+            risk=risk_assessment.to_dict() if risk_assessment else None,
         )
 
     def _escalate(

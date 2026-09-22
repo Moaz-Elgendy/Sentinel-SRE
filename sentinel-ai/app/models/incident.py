@@ -183,6 +183,17 @@ class DenialReason(str, Enum):
     MISSING_TARGET = "missing_target"
     NO_CHAOS_SURFACE = "no_chaos_surface"
     UNKNOWN_ACTION = "unknown_action"
+    # Reserved, not currently raised by any policy branch: lifecycle/risk.py
+    # can classify a candidate's blast_radius_scope as "beyond_incident_scope"
+    # (its target does not match the incident's own namespace/deployment),
+    # but that classification is surfaced informationally (PolicyContext.risk
+    # / PolicyVerdict.risk) rather than gated here, because test_policy.py's
+    # own test design deliberately constructs plans whose target differs
+    # from the incident under test to exercise the namespace/deployment
+    # deny-list checks in isolation - a hard gate here would deny those
+    # legitimately-scoped checks before they ever ran. Kept as a named,
+    # bounded value in case a future caller wants to enforce it explicitly.
+    BLAST_RADIUS_EXCEEDS_INCIDENT = "blast_radius_exceeds_incident"
 
 
 class EscalationReason(str, Enum):
@@ -405,6 +416,13 @@ class Evidence:
     log_sample_messages: list[str] = field(default_factory=list)
     access_log_line_count: int = 0
 
+    # Logs retrieved from a specifically-identified failing init container
+    # (see investigation.py). Each entry is the dict shape
+    # KubernetesClient.get_container_logs returns: {pod, container, previous,
+    # available, error, lines}. Empty whenever no init container was found
+    # failing — most incidents never touch this.
+    init_container_logs: list[dict[str, Any]] = field(default_factory=list)
+
     # Kubernetes
     deployment: dict[str, Any] | None = None
     pods: list[dict[str, Any]] = field(default_factory=list)
@@ -455,6 +473,7 @@ class Evidence:
             "replicaset_history": self.replicaset_history,
             "restart_count_total": self.restart_count_total,
             "latest_revision_age_seconds": self.latest_revision_age_seconds,
+            "init_container_logs": self.init_container_logs,
             "deploy_commit": self.deploy_commit,
             "health_status": self.health_status,
             "health_http_code": self.health_http_code,
@@ -490,6 +509,7 @@ class Evidence:
             replicaset_history=data.get("replicaset_history") or [],
             restart_count_total=data.get("restart_count_total", 0),
             latest_revision_age_seconds=data.get("latest_revision_age_seconds"),
+            init_container_logs=data.get("init_container_logs") or [],
             deploy_commit=data.get("deploy_commit"),
             health_status=data.get("health_status"),
             health_http_code=data.get("health_http_code"),
@@ -566,6 +586,11 @@ class PolicyVerdict:
     # Policy may *narrow* a plan (e.g. clamp a scale target into the band).
     adjusted_params: ActionParams | None = None
     checks: dict[str, bool] = field(default_factory=dict)
+    # The deterministic risk/impact assessment (lifecycle/risk.py) for this
+    # exact candidate, echoed back onto the verdict so the audit trail and
+    # GUI can show it next to the allow/deny decision it accompanied. Purely
+    # informational: nothing above reads this field to decide anything.
+    risk: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -575,6 +600,7 @@ class PolicyVerdict:
             "detail": self.detail,
             "adjusted_params": self.adjusted_params.to_dict() if self.adjusted_params else None,
             "checks": self.checks,
+            "risk": self.risk,
         }
 
     @classmethod
@@ -592,6 +618,7 @@ class PolicyVerdict:
                 else None
             ),
             checks=data.get("checks") or {},
+            risk=data.get("risk"),
         )
 
 

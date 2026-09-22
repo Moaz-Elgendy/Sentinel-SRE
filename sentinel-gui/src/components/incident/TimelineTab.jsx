@@ -58,7 +58,18 @@ function Row({ event, previous, label, incidentStart }) {
 export function TimelineTab({ incident }) {
   const meta = usePhaseMeta()
   const timeline = incident.timeline ?? []
-  const history = incident.escalation_history ?? []
+  // `escalation_history` only holds escalations from BEFORE the incident's
+  // last reopen (see app/lifecycle/orchestrator.py's reconsider()) — the
+  // most recent escalation stays in `escalation_record` and is only ever
+  // moved into history on a SUBSEQUENT reopen. So an incident escalated
+  // exactly once and then resolved by another path (e.g. Alertmanager
+  // reporting the alert cleared) has an empty `escalation_history` even
+  // though it really was escalated — fold the still-current record in
+  // here too, once it is no longer the active state, so nothing escalated
+  // ever silently disappears from the audit trail.
+  const pastEscalationRecord =
+    incident.status !== 'escalated' && incident.escalation_record?.at ? [incident.escalation_record] : []
+  const history = [...(incident.escalation_history ?? []), ...pastEscalationRecord].sort((a, b) => a.at - b.at)
   return (
     <div className="space-y-4">
       <Panel title="Audit trail" description={`${timeline.length} step${timeline.length === 1 ? '' : 's'} recorded by Sentinel`} flush>
@@ -73,7 +84,7 @@ export function TimelineTab({ incident }) {
         )}
       </Panel>
       {history.length > 0 && (
-        <Panel title="Earlier escalations" description="This incident was escalated before and re-opened" flush>
+        <Panel title="Earlier escalations" description="This incident was escalated at some point during its lifecycle" flush>
           <ul className="divide-y">
             {history.map((record, i) => (
               <li key={`${record.at}-${i}`} className="px-4 py-2.5 text-sm">

@@ -901,13 +901,30 @@ def find_previous_revision(
 ) -> dict[str, Any] | None:
     """Pick the rollback target from a revision-sorted ReplicaSet list.
 
-    With `target_revision` given, return exactly that revision (or None).
-    Without it, return the second-highest revision — "the previous one",
-    which is what `kubectl rollout undo` with no --to-revision does.
+    With `target_revision` given, return exactly that revision (or None) —
+    an explicit, deliberate choice (the autonomous decision engine, or a
+    human-authorized override that named a specific revision) is honoured
+    as asked; `patch_deployment_template`'s `_assert_valid_container_images`
+    call still refuses to apply it if its images are bad, so this can never
+    by itself put a broken template on the cluster.
 
-    Returns None when there is nothing to roll back to. The Policy Engine
-    turns that None into a hard denial rather than letting the Remediation
-    Engine improvise.
+    Without a `target_revision`, this does NOT simply mean "the previous
+    one" (plain `kubectl rollout undo` with no --to-revision). It returns
+    the newest revision strictly older than the current one whose images
+    are not known-invalid — the exact same rule
+    `correlation._find_valid_rollback_candidate` applies when building the
+    autonomous plan. Blindly returning `numbered[1]` regardless of its
+    `images_valid` flag is precisely the citizen-service incident this
+    guards against: a placeholder-image ReplicaSet sitting one revision
+    back from the one that broke, "the previous revision" in name only. A
+    candidate with no `images_valid` key (older evidence, a hand-built test
+    fixture) is treated as valid, so this can only ever make Sentinel skip a
+    target it previously would have blindly used, never reject one it used
+    to accept.
+
+    Returns None when there is nothing SAFE to roll back to. The Policy
+    Engine turns that None into a hard denial rather than letting the
+    Remediation Engine improvise.
     """
     numbered = [rs for rs in replicasets if rs.get("revision") is not None]
     numbered.sort(key=lambda r: r["revision"], reverse=True)
@@ -916,9 +933,10 @@ def find_previous_revision(
             if rs["revision"] == target_revision:
                 return rs
         return None
-    if len(numbered) < 2:
-        return None
-    return numbered[1]
+    for rs in numbered[1:]:
+        if rs.get("images_valid", True):
+            return rs
+    return None
 
 
 # Written here so the Role can be authored without reverse-engineering the

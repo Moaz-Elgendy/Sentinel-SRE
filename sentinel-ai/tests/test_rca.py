@@ -19,6 +19,10 @@ from __future__ import annotations
 
 import json
 
+import inspect
+
+from app.lifecycle import correlation as correlation_module
+from app.lifecycle import rca as rca_module
 from app.lifecycle.correlation import CorrelationFindings
 from app.lifecycle.rca import (
     LLM_CONFIDENCE_CEILING,
@@ -424,3 +428,27 @@ def test_action_parse_rejects_injection_shaped_strings():
     # And it does accept the exact values, including surrounding whitespace
     # and casing, which is the only leniency allowed.
     assert RemediationAction.parse(" Restart_Deployment ") is RemediationAction.RESTART_DEPLOYMENT
+
+
+# ---------------------------------------------------------------------------
+# Scenario isolation (GUI/Phase-2-4 brief section 15/38): the chaos/demo
+# harness (app/routers/chaos_scenarios.py) knows scenario names, expected
+# outcomes and test ids so it can drive AWS SSM and a demonstration UI. RCA
+# and correlation must never see any of that as privileged truth — a
+# "memory_leak" scenario label must not become the diagnosis; only real
+# evidence (metrics, logs, Kubernetes state, chaos gauges) may. This is a
+# structural regression test, not a behavioural one: every other test in
+# this module already proves analyse() reaches its conclusions from Evidence/
+# CorrelationFindings alone, with no scenario field anywhere in sight. This
+# test guards that property from a future edit reintroducing it by accident.
+def test_rca_and_correlation_never_reference_scenario_metadata():
+    forbidden = ("scenario_name", "scenario_id", "expected_outcome", "test_instruction")
+    for module in (rca_module, correlation_module):
+        source = inspect.getsource(module)
+        for token in forbidden:
+            assert token not in source, (
+                f"{module.__name__} references {token!r} — scenario/test-harness "
+                "metadata must never be read by RCA or correlation, only real "
+                "collected evidence (see chaos_scenarios.py for where that "
+                "metadata legitimately belongs instead)."
+            )

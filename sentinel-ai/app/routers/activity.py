@@ -1,134 +1,48 @@
 """
-Sentinel Live — "what is Sentinel doing RIGHT NOW", as distinct from a
-single incident's own detail page (see routers/incidents.py). One endpoint:
+Sentinel Live — the GUI's "what is Sentinel doing right now" panel.
 
   GET /api/activity/status
 
-Real state only, derived from the actual store and the actual connector
-clients — never fabricated. There is deliberately no SSE endpoint of its
-own here: this page's real-time updates reuse the EXISTING `/api/events`
-stream (see routers/events.py, core/events.py) exactly per the "reuse the
-existing SSE implementation, do not introduce a second real-time channel"
-constraint — `Orchestrator._persist` already publishes an `incident_updated`
-event after every real lifecycle phase transition, now enriched (see that
-function) with the actual timeline message just recorded, so the frontend's
-live activity feed is built entirely from genuine backend events plus this
-status endpoint for the initial paint and the idle/monitoring state.
+One read-only endpoint, same shape of contract as routers/dashboard.py: never
+invent a status. If Sentinel has a real open (non-terminal) incident, report
+exactly what that incident's own timeline says (phase, last message, recent
+history) — nothing paraphrased. Otherwise report "monitoring" or "degraded"
+depending on whether any of the four things Sentinel watches (Prometheus,
+Loki, Kubernetes, Alertmanager) is actually reachable right now, the same
+honest-connectivity approach as PrometheusClient.ping/LokiClient.ping (see
+app/clients/prometheus.py, app/clients/loki.py) rather than assuming
+"configured" means "up".
+
+Alertmanager has no dedicated client (Sentinel is only ever pushed TO by
+Alertmanager via routers/alerts.py — it never queries it), so this hits
+Alertmanager's own `/-/healthy` endpoint directly, the same convention
+Prometheus and Loki's clients already use.
 """
 from __future__ import annotations
 
-import logging
-import time
+import asyncio
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.core.deps import get_current_admin
-from app.models.incident import IncidentStatus
+from app.models.incident import Incident, IncidentStatus
 
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/activity", tags=["activity"])
+router = APIRouter(
+    prefix="/api/activity", tags=["activity"], dependencies=[Depends(get_current_admin)]
+)
 
-_TERMINAL_STATUSES = {
-    IncidentStatus.RESOLVED.value,
-    IncidentStatus.ESCALATED.value,
-    IncidentStatus.AUTO_RESOLVED.value,
-}
+# How many of the most recent timeline entries to surface for the
+# "investigating" state — enough to show recent progress without dragging
+# the whole (potentially long) history over the wire on every poll.
+RECENT_TIMELINE_LIMIT = 10
 
-# Short TTL cache for the connectivity probes below. Several open GUI tabs
-# polling `/api/activity/status` (this endpoint has no push equivalent for
-# the idle-state watcher grid — only incident activity rides the SSE bus)
-# should not turn into a connectivity check per client per poll.
-_watcher_cache: dict[str, Any] = {"at": 0.0, "watchers": None}
-_WATCHER_CACHE_TTL_SECONDS = 5.0
+# Non-terminal == still being worked, per IncidentStatus.is_terminal.
+_ACTIVE_STATUSES = tuple(s.value for s in IncidentStatus if not s.is_terminal)
 
 
-async def _ping_alertmanager(url: str) -> bool:
-    """Alertmanager is push-primary here (it calls Sentinel's webhook, not
-    the other way around — see routers/alerts.py), so unlike Prometheus/Loki
-    this is not "are we able to query it", just "is it up", for the
-    Watching panel's connectivity indicator."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{url.rstrip('/')}/-/healthy")
-        return resp.status_code == 200
-    except httpx.HTTPError:
-        return False
-
-
-async def _watchers(ctx: Any) -> list[dict[str, Any]]:
-    now = time.time()
-    if _watcher_cache["watchers"] is not None and now - _watcher_cache["at"] < _WATCHER_CACHE_TTL_SECONDS:
-        return _watcher_cache["watchers"]
-
-    prom_connected, loki_connected, am_connected = False, False, False
-    try:
-        prom_connected = await ctx.prom.ping()
-    except Exception:  # noqa: BLE001 - a connectivity probe must never 500 this page
-        pass
-    try:
-        loki_connected = await ctx.loki.ping()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        am_connected = await _ping_alertmanager(ctx.settings.alertmanager_url)
-    except Exception:  # noqa: BLE001
-        pass
-
-    watchers = [
-        {"name": "Prometheus", "connected": prom_connected},
-        {"name": "Loki", "connected": loki_connected},
-        {"name": "Kubernetes", "connected": bool(ctx.k8s.available)},
-        {"name": "Alertmanager", "connected": am_connected},
-    ]
-    _watcher_cache["watchers"] = watchers
-    _watcher_cache["at"] = now
-    return watchers
-
-
-def _find_active_incidents(store: Any) -> list[dict[str, Any]]:
-    """EVERY non-terminal incident, newest-updated first. The GUI used to be
-    told about only one, which made two simultaneous incidents look like one."""
-    candidates = [
-        incident
-        for incident in store.list_incidents(limit=50)
-        if incident.get("status") not in _TERMINAL_STATUSES
-    ]
-    candidates.sort(key=lambda i: i.get("updated_at", 0), reverse=True)
-    return candidates
-
-
-def _reasoner_status(ctx: Any) -> dict[str, Any]:
-    """Provider health as a CONDITION (never an incident): see
-    reasoning/health.py."""
-    reasoner = getattr(ctx, "reasoner", None)
-    if reasoner is None:
-        return {"status": "not_configured"}
-    snap = reasoner.health.snapshot()
-    snap["provider"] = reasoner.label
-    return snap
-
-
-def _find_active_incident(store: Any) -> dict[str, Any] | None:
-    """The newest non-terminal incident, if any. `list_incidents` is
-    already ordered newest-created-first; a handful of incidents is the
-    realistic scale here (this is an SRE control room, not a ticketing
-    system), so scanning that page in Python rather than adding a new
-    indexed query is the appropriately simple choice."""
-    candidates = [
-        incident
-        for incident in store.list_incidents(limit=20)
-        if incident.get("status") not in _TERMINAL_STATUSES
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda i: i.get("updated_at", 0), reverse=True)
-    return candidates[0]
-
-
-@router.get("/status", dependencies=[Depends(get_current_admin)])
-async def get_activity_status(request: Request) -> dict[str, Any]:
+def _require_context(request: Request) -> Any:
     ctx = getattr(request.app.state, "context", None)
     store = getattr(request.app.state, "store", None)
     if ctx is None or store is None:
@@ -136,60 +50,100 @@ async def get_activity_status(request: Request) -> dict[str, Any]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Sentinel is not fully started yet",
         )
+    return ctx
 
-    active_all = _find_active_incidents(store)
-    active = active_all[0] if active_all else None
-    reasoner_status = _reasoner_status(ctx)
-    if active is not None:
-        timeline = active.get("timeline") or []
-        last_entry = timeline[-1] if timeline else None
-        return {
-            "state": "investigating",
-            "incident_id": active.get("id"),
-            "alertname": active.get("alertname"),
-            "severity": active.get("severity"),
-            "status": active.get("status"),
-            "phase": last_entry.get("phase") if last_entry else None,
-            "message": last_entry.get("message") if last_entry else "Investigating",
-            "since": active.get("created_at"),
-            "updated_at": active.get("updated_at"),
-            # Recent history backfills the live feed on page load; further
-            # updates arrive over the existing `/api/events` SSE stream.
-            "recent_timeline": timeline[-20:],
-            # Additive: every in-flight incident, so concurrent incidents are
-            # visible as separate entries. The single-incident keys above are
-            # unchanged for existing clients.
-            "active_incidents": [
-                {
-                    "incident_id": i.get("id"),
-                    "alertname": i.get("alertname"),
-                    "app": i.get("app"),
-                    "severity": i.get("severity"),
-                    "status": i.get("status"),
-                    "phase": (i.get("timeline") or [{}])[-1].get("phase"),
-                    "message": (i.get("timeline") or [{}])[-1].get("message"),
-                    "updated_at": i.get("updated_at"),
-                }
-                for i in active_all
-            ],
-            "reasoner": reasoner_status,
-        }
 
-    incidents = store.list_incidents(limit=1)
-    last_activity = incidents[0].get("updated_at") if incidents else None
+def _active_incidents(store: Any) -> list[dict[str, Any]]:
+    """All non-terminal incidents right now (any status that is not
+    resolved/escalated/auto_resolved)."""
+    return store.list_by_statuses(_ACTIVE_STATUSES)
+
+
+def _find_active_incident(candidates: list[dict[str, Any]]) -> Incident | None:
+    """The most recently updated of an already-fetched set of non-terminal
+    incidents, if any.
+
+    `store.list_by_statuses` returns oldest-first (it is built for startup
+    recovery); this endpoint wants the newest one, so sort here rather than
+    add a second, endpoint-specific ordering to the store.
+    """
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda d: d.get("updated_at") or 0.0)
+    return Incident.from_dict(latest)
+
+
+async def _ping_alertmanager(base_url: str) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{base_url.rstrip('/')}/-/healthy")
+        return resp.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+async def _watchers(ctx: Any) -> list[dict[str, Any]]:
+    prom_ok, loki_ok, alertmanager_ok = await asyncio.gather(
+        ctx.prom.ping(),
+        ctx.loki.ping(),
+        _ping_alertmanager(ctx.settings.alertmanager_url),
+    )
+    return [
+        {"name": "Prometheus", "connected": prom_ok},
+        {"name": "Loki", "connected": loki_ok},
+        {"name": "Kubernetes", "connected": ctx.k8s.available},
+        {"name": "Alertmanager", "connected": alertmanager_ok},
+    ]
+
+
+def _last_activity(store: Any) -> float | None:
+    incidents = store.list_all_incidents_for_analytics()
+    if not incidents:
+        return None
+    return max((i.get("updated_at") or 0.0) for i in incidents)
+
+
+def _reasoner_status(ctx: Any) -> dict[str, Any]:
+    """Same provider-health snapshot rca.py already tracks (see
+    app/reasoning/health.py) — surfaced here so Sentinel Live can show
+    REASONER_UNAVAILABLE without polling a separate endpoint. `enabled=False`
+    (no provider configured — the fully-supported rules-only mode) is
+    distinguished from a configured-but-failing provider.
+    """
+    if ctx.reasoner is None:
+        return {"enabled": False, "label": None, "status": "disabled"}
+    return {"enabled": True, "label": ctx.reasoner.label, **ctx.reasoner.health.snapshot()}
+
+
+@router.get("/status")
+async def activity_status(request: Request) -> dict[str, Any]:
+    ctx = _require_context(request)
+    store = request.app.state.store
 
     watchers = await _watchers(ctx)
-    degraded = [w["name"] for w in watchers if not w["connected"]]
+    active_incidents = _active_incidents(store)
+    active = _find_active_incident(active_incidents)
+    reasoner = _reasoner_status(ctx)
+
+    if active is not None:
+        recent = active.timeline[-RECENT_TIMELINE_LIMIT:]
+        last_message = recent[-1].message if recent else ""
+        return {
+            "state": "investigating",
+            "incident_id": active.id,
+            "alertname": active.alertname,
+            "phase": active.phase.value,
+            "message": last_message,
+            "recent_timeline": [e.to_dict() for e in recent],
+            "watchers": watchers,
+            "reasoner": reasoner,
+            "active_incidents": len(active_incidents),
+        }
 
     return {
-        "state": "degraded" if degraded else "monitoring",
-        "message": (
-            f"{', '.join(degraded)} connection unavailable"
-            if degraded
-            else "Waiting for an incident"
-        ),
+        "state": "monitoring" if any(w["connected"] for w in watchers) else "degraded",
         "watchers": watchers,
-        "last_activity": last_activity,
-        "active_incidents": [],
-        "reasoner": reasoner_status,
+        "last_activity": _last_activity(store),
+        "reasoner": reasoner,
+        "active_incidents": len(active_incidents),
     }

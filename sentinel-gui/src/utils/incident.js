@@ -10,8 +10,17 @@ export const TERMINAL_STATUSES = new Set(['resolved', 'escalated', 'auto_resolve
 
 export const isActiveIncident = (incident) => !TERMINAL_STATUSES.has(incident.status)
 export const isResolvedIncident = (incident) => incident.status === 'resolved' || incident.status === 'auto_resolved'
-/** `escalated` is cleared by the backend when an authorized action starts executing. */
-export const isAwaitingHuman = (incident) => incident.escalated === true || incident.status === 'escalated'
+/**
+ * `escalated` is cleared by the backend when an authorized action starts
+ * executing or a reopened incident is reconsidered — but a resolved
+ * (or auto_resolved) STATUS is the one field the backend always keeps
+ * authoritative, so it wins over a possibly-stale `escalated` flag left
+ * behind by, e.g., an Alertmanager "resolved" notification arriving for
+ * an incident that was sitting escalated (see the Escalation Audit in
+ * the v1.3 report). A resolved incident is never "awaiting a human",
+ * whatever the boolean says.
+ */
+export const isAwaitingHuman = (incident) => !isResolvedIncident(incident) && (incident.escalated === true || incident.status === 'escalated')
 export const incidentStatus = (incident) => effectiveIncidentStatus(incident)
 
 /** One human sentence for what is wrong; the alert's own summary when it has one. */
@@ -40,7 +49,7 @@ export function endedAt(incident) {
 /** "Elapsed" while open, "Took" once closed, and for an escalation the time Sentinel needed to reach it. */
 export function durationLabel(incident) {
   if (isActiveIncident(incident)) return 'Elapsed'
-  return incident.escalated ? 'Time to escalate' : 'Duration'
+  return isAwaitingHuman(incident) ? 'Time to escalate' : 'Duration'
 }
 
 export function incidentDuration(incident, nowSeconds = Date.now() / 1000) {
@@ -111,10 +120,16 @@ export function lifecycleStages(incident, meta, nowSeconds = Date.now() / 1000) 
 
   const final = lastAttempt(incident)
   const finalExecuted = lastExecuted(incident)
-  const policyBlocked = terminal && incident.escalated && final?.verdict && final.verdict.allowed === false
+  // Checked against the raw `status === 'escalated'` (the incident's
+  // authoritative end state), not the `escalated` boolean alone: once an
+  // incident is resolved, any policy rejection or validation failure
+  // recorded on its LAST attempt is history, not a description of how it
+  // ended, and must not repaint a resolved incident's rail as blocked/failed.
+  const endedEscalated = incident.status === 'escalated'
+  const policyBlocked = terminal && endedEscalated && final?.verdict && final.verdict.allowed === false
   const executionFailed = Boolean(finalExecuted) && finalExecuted.result?.succeeded === false
   const validationFailed =
-    Boolean(finalExecuted?.validation) && !isValidationPassed(finalExecuted) && Boolean(incident.escalated)
+    Boolean(finalExecuted?.validation) && !isValidationPassed(finalExecuted) && endedEscalated
 
   return order.map((id) => {
     const reached = byStage.get(id)
@@ -141,10 +156,12 @@ export function lifecycleStages(incident, meta, nowSeconds = Date.now() / 1000) 
 
 /** The trailing node of the rail: where the incident ended up (or will). */
 export function lifecycleOutcome(incident) {
-  if (incident.escalated) return { id: 'escalation', label: 'Needs you', state: 'attention' }
+  // Resolved status wins outright — see isAwaitingHuman's note on why a
+  // resolved incident must never render as "needs you" again.
   if (isResolvedIncident(incident)) {
     return { id: 'resolved', label: incident.status === 'auto_resolved' ? 'Cleared' : 'Recovered', state: 'ok' }
   }
+  if (isAwaitingHuman(incident)) return { id: 'escalation', label: 'Needs you', state: 'attention' }
   return { id: 'resolved', label: 'Recovered', state: 'pending' }
 }
 
@@ -159,20 +176,28 @@ export function reinvestigationCount(incident) {
 export function incidentOutcome(incident, nowSeconds = Date.now() / 1000) {
   const executed = lastExecuted(incident)
   const duration = incidentDuration(incident, nowSeconds)
-  if (incident.escalated) {
-    return { kind: 'awaiting', tone: 'warn', title: 'Waiting for an SRE', detail: incident.escalation_detail ?? null }
-  }
+  // Resolved status is authoritative over `escalated` — see isAwaitingHuman.
   if (incident.status === 'resolved') {
+    const wasEscalated = Boolean(incident.escalation_record?.at)
     if (executed && isValidationPassed(executed)) {
       return {
         kind: 'recovered',
         tone: 'ok',
         title: isHumanAuthorized(executed) ? 'Recovered with SRE authorization' : 'Recovered autonomously',
-        detail: executed.validation?.detail ?? null,
+        detail: executed.validation?.detail ?? (wasEscalated ? 'Previously escalated; a re-check confirmed recovery.' : null),
         duration,
       }
     }
-    return { kind: 'recovered', tone: 'ok', title: 'Resolved', detail: null, duration }
+    return {
+      kind: 'recovered',
+      tone: 'ok',
+      title: 'Resolved',
+      detail: wasEscalated ? 'Previously escalated; later resolved.' : null,
+      duration,
+    }
+  }
+  if (isAwaitingHuman(incident)) {
+    return { kind: 'awaiting', tone: 'warn', title: 'Waiting for an SRE', detail: incident.escalation_detail ?? null }
   }
   if (incident.status === 'auto_resolved') {
     return {

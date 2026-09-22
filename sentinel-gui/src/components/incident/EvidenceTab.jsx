@@ -17,6 +17,15 @@ function Section({ title, description, children, count, flush = true }) {
   )
 }
 
+function SummaryStat({ label, value, tone }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-xs text-muted-foreground">{label}</dt>
+      <dd className={cn('tnum mt-0.5 truncate text-sm font-medium', tone && TONE_TEXT[tone])}>{value}</dd>
+    </div>
+  )
+}
+
 /** Everything Sentinel collected, verbatim, for when the summary isn't enough. */
 export function EvidenceTab({ incident }) {
   const ev = incident.evidence
@@ -33,11 +42,34 @@ export function EvidenceTab({ incident }) {
   const deliveries = Object.entries(ev.notification_deliveries ?? {})
   const injections = Object.entries(ev.chaos_injections ?? {})
 
+  const podsReady = pods.filter((p) => p.ready).length
+  const restartsTotal = pods.reduce((sum, p) => sum + (p.restart_count || 0), 0)
+  const warnEvents = events.filter((e) => e.type === 'Warning').length
+  const hasDeployment = deployment && Object.keys(deployment).length > 0
+
   return (
     <div className="space-y-4">
       <p className="text-xs text-muted-foreground">
         Collected <Timestamp value={ev.collected_at} /> ({formatTimestamp(ev.collected_at)}).
       </p>
+
+      {/* At-a-glance summary before the raw detail below — same numbers the
+          tables show in full, just surfaced so a reader doesn't have to
+          scan every row to get the gist. */}
+      <dl className="grid grid-cols-2 gap-x-6 gap-y-3 rounded-md border bg-muted/20 px-4 py-3 sm:grid-cols-4">
+        {hasDeployment && (
+          <SummaryStat
+            label="Replicas"
+            value={`${deployment.available_replicas ?? '—'}/${deployment.desired_replicas ?? '—'}`}
+            tone={deployment.available_replicas != null && deployment.desired_replicas != null && deployment.available_replicas < deployment.desired_replicas ? 'warn' : undefined}
+          />
+        )}
+        <SummaryStat label="Pods ready" value={pods.length ? `${podsReady}/${pods.length}` : '—'} tone={pods.length > 0 && podsReady < pods.length ? 'bad' : undefined} />
+        <SummaryStat label="Pod restarts" value={pods.length ? restartsTotal : '—'} tone={restartsTotal > 0 ? 'warn' : undefined} />
+        <SummaryStat label="K8s events" value={events.length} tone={warnEvents > 0 ? 'warn' : undefined} />
+        {revisions.length > 0 && <SummaryStat label="Revisions seen" value={revisions.length} />}
+        {samples.length > 0 && <SummaryStat label="Log samples" value={samples.length} />}
+      </dl>
 
       <div className="grid gap-4 xl:grid-cols-2">
         <Section title="Pods" count={pods.length} description="State when evidence was collected">
@@ -148,10 +180,10 @@ export function EvidenceTab({ incident }) {
       </Section>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        {((deployment && Object.keys(deployment).length > 0) || checks.length > 0) && (
+        {(hasDeployment || checks.length > 0) && (
           <Section title="Deployment and health" flush={false}>
             <div className="space-y-3">
-              {deployment && Object.keys(deployment).length > 0 && (
+              {hasDeployment && (
                 <dl className="grid grid-cols-3 gap-3 text-sm">
                   {[
                     ['Desired', deployment.desired_replicas],

@@ -5,7 +5,10 @@ import { extractErrorMessage } from '@/api/client'
 import { openIncidentDocument } from '@/api/incidents'
 import { AttentionPanel } from '@/components/incident/AttentionPanel'
 import { DecisionSection } from '@/components/incident/DecisionSection'
+import { DecisionSummaryCard } from '@/components/incident/DecisionSummaryCard'
 import { DiagnosisSection } from '@/components/incident/DiagnosisSection'
+import { CausalGraphTab } from '@/components/incident/CausalGraphTab'
+import { ReplayTab } from '@/components/incident/ReplayTab'
 import { EvidenceTab } from '@/components/incident/EvidenceTab'
 import { FactsPanel } from '@/components/incident/FactsPanel'
 import { FeedbackTab } from '@/components/incident/FeedbackTab'
@@ -33,7 +36,7 @@ import { cn } from '@/lib/utils'
 import { formatSpan } from '@/utils/format'
 import { durationLabel, incidentDuration, incidentHeadline, incidentOutcome, incidentStatus, isActiveIncident, isAwaitingHuman } from '@/utils/incident'
 
-const TABS = ['investigation', 'evidence', 'timeline', 'logs', 'feedback']
+const TABS = ['investigation', 'evidence', 'graph', 'replay', 'timeline', 'logs', 'feedback']
 
 function OutcomeStrip({ incident, now }) {
   const outcome = incidentOutcome(incident, now / 1000)
@@ -153,12 +156,16 @@ export default function IncidentDetailPage() {
         <OutcomeStrip incident={incident} now={now} />
       </Panel>
 
+      <DecisionSummaryCard incident={incident} />
+
       {awaiting && <AttentionPanel incident={incident} onChanged={() => setRefreshKey((k) => k + 1)} key={`${incident.id}-${refreshKey}`} />}
 
       <Tabs value={tab} onValueChange={(next) => { const copy = new URLSearchParams(params); if (next === 'investigation') copy.delete('tab'); else copy.set('tab', next); setParams(copy, { replace: true }) }}>
         <TabsList variant="line" className="h-9 w-full justify-start border-b px-0">
           <TabsTrigger value="investigation" className="flex-none px-3">Investigation</TabsTrigger>
           <TabsTrigger value="evidence" className="flex-none px-3">Evidence</TabsTrigger>
+          <TabsTrigger value="graph" className="flex-none px-3">Causal graph</TabsTrigger>
+          <TabsTrigger value="replay" className="flex-none px-3">Replay</TabsTrigger>
           <TabsTrigger value="timeline" className="flex-none px-3">
             Timeline <span className="tnum rounded bg-muted px-1 text-[11px] text-muted-foreground">{incident.timeline?.length ?? 0}</span>
           </TabsTrigger>
@@ -180,6 +187,12 @@ export default function IncidentDetailPage() {
         </TabsContent>
         <TabsContent value="evidence" className="pt-4">
           <EvidenceTab incident={incident} />
+        </TabsContent>
+        <TabsContent value="graph" className="pt-4">
+          {tab === 'graph' && <CausalGraphTab key={incident.id} incidentId={incident.id} />}
+        </TabsContent>
+        <TabsContent value="replay" className="pt-4">
+          {tab === 'replay' && <ReplayTab key={incident.id} incidentId={incident.id} />}
         </TabsContent>
         <TabsContent value="timeline" className="pt-4">
           <TimelineTab incident={incident} />

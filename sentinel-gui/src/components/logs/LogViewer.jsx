@@ -1,4 +1,4 @@
-import { ArrowDownToLine, ChevronRight, Eraser, Pause, Play, ScrollText, SearchX } from 'lucide-react'
+import { ArrowUpToLine, ChevronRight, Eraser, Pause, Play, ScrollText, SearchX } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { extractErrorMessage } from '@/api/client'
@@ -115,17 +115,20 @@ export function LogViewer({ incidentId: pinnedIncidentId, className, height = 'h
 
   const hasFilter = Boolean(level !== 'any' || component || (!pinnedIncidentId && incidentFilter) || query)
 
-  // Follow the tail like `tail -f`; scrolling up by hand turns following off.
+  // Newest entries render at the TOP, so "following" means staying
+  // pinned to scrollTop 0 as new lines arrive — the inverse of a
+  // classic `tail -f`. Scrolling down away from the top turns
+  // following off.
   useEffect(() => {
     const el = scrollRef.current
-    if (follow && el) el.scrollTop = el.scrollHeight
+    if (follow && el) el.scrollTop = 0
   }, [lines, follow, loading])
 
   function onScroll() {
     const el = scrollRef.current
     if (!el) return
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48
-    setFollow((current) => (current === atBottom ? current : atBottom))
+    const atTop = el.scrollTop < 48
+    setFollow((current) => (current === atTop ? current : atTop))
   }
 
   function clearFilters() {
@@ -210,8 +213,8 @@ export function LogViewer({ incidentId: pinnedIncidentId, className, height = 'h
           )}
         </div>
         {!follow && lines.length > 0 && (
-          <Button size="sm" variant="secondary" className="absolute right-4 bottom-3 shadow-md" onClick={() => setFollow(true)}>
-            <ArrowDownToLine /> Jump to latest
+          <Button size="sm" variant="secondary" className="absolute top-3 right-4 shadow-md" onClick={() => setFollow(true)}>
+            <ArrowUpToLine /> Jump to latest
           </Button>
         )}
       </div>

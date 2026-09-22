@@ -1,0 +1,66 @@
+# Plain YAML, no Prometheus Operator / ServiceMonitor CRDs yet — consistent
+# with the rest of k8s/ (see Phase 7's "no Helm yet" note). Target
+# discovery is annotation-based: citizen-service and notification-service's
+# pod templates carry prometheus.io/scrape=true, prometheus.io/port=8000,
+# prometheus.io/path=/metrics (see their deployment.yaml files) and the
+# relabel_configs below match on exactly those annotations.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: citizen-portal
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ["alertmanager:9093"]
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      # Prometheus scraping itself.
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # citizen-service, notification-service — discovered by annotation,
+      # not hardcoded pod names, so this keeps working as replicas scale
+      # up/down or get rescheduled.
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - citizen-portal
+        relabel_configs:
+          # Only keep pods that opted in via prometheus.io/scrape=true.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Use prometheus.io/path if set, default to /metrics otherwise.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          # Rewrite the scrape address to <pod_ip>:<prometheus.io/port>.
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          # Surface useful labels on every series: which app, pod, namespace.
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: replace
+            target_label: app

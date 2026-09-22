@@ -79,9 +79,17 @@ export function isLiveStatus(status) {
   return LIVE.has(statusKey(status))
 }
 
-// The list views have always shown "Escalated" whenever the escalated flag is
-// set, regardless of the underlying status field. Keep that rule in one place.
+// A resolved (or auto_resolved) STATUS is authoritative and wins outright:
+// the backend can leave a stale `escalated: true` on an incident it later
+// resolved by another path (e.g. Alertmanager reporting the alert cleared
+// while the incident was sitting escalated) without also clearing that
+// flag — see the v1.3 Escalation Audit. Otherwise, the list views have
+// always shown "Escalated" whenever the escalated flag is set, regardless
+// of the underlying status field; keep that rule for the non-resolved case.
+const RESOLVED_STATUSES = new Set(['resolved', 'auto_resolved'])
+
 export function effectiveIncidentStatus(incident) {
+  if (RESOLVED_STATUSES.has(incident.status)) return incident.status
   return incident.escalated ? 'escalated' : incident.status
 }
 

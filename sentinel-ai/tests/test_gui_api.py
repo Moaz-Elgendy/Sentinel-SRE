@@ -306,6 +306,131 @@ def test_incidents_list_omits_heavy_fields_but_detail_includes_them(gui_client):
 
 
 # ---------------------------------------------------------------------------
+# Incident replay / what-if simulation
+# ---------------------------------------------------------------------------
+def test_replay_endpoint_requires_auth(gui_client):
+    client, _login = gui_client
+    assert client.get("/api/incidents/INC-x/replay").status_code == 403
+
+
+def test_replay_endpoint_on_a_nonexistent_incident_is_404(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.get("/api/incidents/does-not-exist/replay", headers=headers)
+    assert resp.status_code == 404
+
+
+def test_replay_endpoint_is_wired_end_to_end_against_a_real_incident(gui_client):
+    """Full-app smoke test: exercises every `ctx.*` attribute the endpoint
+    reads (settings, policy, validator, chaos) against the real object graph
+    main.py builds, which a module-level replay.py test cannot catch (a typo
+    in an attribute name there would only ever surface here)."""
+    client, login = gui_client
+    headers = login(client)
+    incident_id = _fire_alert(client, fingerprint="replay-fp-1")
+    _wait_for_terminal(client, headers, incident_id)
+
+    resp = client.get(f"/api/incidents/{incident_id}/replay", headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["incident_id"] == incident_id
+    assert body["from_scratch"] is False
+    assert "candidates" in body
+    assert "would_escalate" in body
+    assert "hypothesis" in body
+
+    resp2 = client.get(
+        f"/api/incidents/{incident_id}/replay",
+        params={"from_scratch": "true"},
+        headers=headers,
+    )
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["from_scratch"] is True
+
+
+# ---------------------------------------------------------------------------
+# Sentinel Agent Evaluation
+# ---------------------------------------------------------------------------
+def test_evaluation_endpoints_require_auth(gui_client):
+    client, _login = gui_client
+    assert client.post("/api/evaluation/runs", json={"scenario": "memory-leak"}).status_code == 403
+    assert client.get("/api/evaluation/runs").status_code == 403
+    assert client.get("/api/evaluation/summary").status_code == 403
+
+
+def test_creating_a_run_for_an_unknown_scenario_is_404(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post(
+        "/api/evaluation/runs", json={"scenario": "does-not-exist"}, headers=headers
+    )
+    assert resp.status_code == 404
+
+
+def test_creating_a_run_for_the_suite_scenario_is_rejected(gui_client):
+    client, login = gui_client
+    headers = login(client)
+    resp = client.post("/api/evaluation/runs", json={"scenario": "all"}, headers=headers)
+    assert resp.status_code == 422
+
+
+def test_evaluation_run_lifecycle_end_to_end(gui_client):
+    """Full-app smoke test: create a run for a scenario with known ground
+    truth, using its default app (no request override needed), then confirm
+    it shows up pending in both /runs and /summary."""
+    client, login = gui_client
+    headers = login(client)
+
+    resp = client.post(
+        "/api/evaluation/runs", json={"scenario": "memory-leak"}, headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    run = resp.json()
+    assert run["scenario"] == "memory-leak"
+    assert run["app"] == "citizen-service"
+    assert run["expected_root_cause"] == "memory_leak"
+    assert run["resolved"] is False
+
+    listing = client.get("/api/evaluation/runs", headers=headers).json()
+    assert listing["count"] == 1
+    assert listing["runs"][0]["id"] == run["id"]
+    # No incident has happened yet on this app, so it is still pending -
+    # never silently scored as wrong.
+    assert listing["runs"][0]["resolved"] is False
+
+    summary = client.get("/api/evaluation/summary", headers=headers).json()
+    assert summary["sample_size"]["total_runs"] == 1
+    assert summary["sample_size"]["pending_runs"] == 1
+    assert summary["sample_size"]["concluded_runs"] == 0
+
+
+def test_evaluation_run_resolves_against_a_real_incident(gui_client):
+    """Fires a real alert (same helper the incident tests use) on the same
+    app an evaluation run is watching, and confirms the run resolves and
+    scores itself once that incident reaches a terminal state - proving the
+    store-level linking (find_incident_after) actually works end to end."""
+    client, login = gui_client
+    headers = login(client)
+
+    run = client.post(
+        "/api/evaluation/runs", json={"scenario": "db-outage"}, headers=headers
+    ).json()
+
+    incident_id = _fire_alert(client, fingerprint="eval-link-fp-1", app="citizen-service")
+    _wait_for_terminal(client, headers, incident_id)
+
+    listing = client.get("/api/evaluation/runs", headers=headers).json()
+    resolved = next(r for r in listing["runs"] if r["id"] == run["id"])
+    assert resolved["resolved"] is True
+    assert resolved["incident_id"] == incident_id
+    # No Kubernetes/Prometheus/Loki reachable in this test environment (see
+    # test_full_flow_escalated_incident_is_consistent_across_gui_endpoints),
+    # so the real RCA outcome will not be chaos_database_fault - the point
+    # here is only that linking and scoring ran, not what they concluded.
+    assert resolved["root_cause_correct"] is False
+
+
+# ---------------------------------------------------------------------------
 # Diagnosis / remediation feedback (Phase C)
 # ---------------------------------------------------------------------------
 def test_feedback_endpoints_require_auth(gui_client):
@@ -444,6 +569,145 @@ def test_performance_diagnosis_accuracy_is_null_with_no_feedback(gui_client):
     perf = client.get("/api/performance/summary", headers=headers).json()
     assert perf["diagnosis_accuracy"] is None
     assert perf["diagnosis_feedback_unavailable_reason"] == "no diagnosis feedback recorded yet"
+
+
+def test_performance_evaluation_metrics_distinguish_failure_modes(gui_client):
+    """Seeds hand-crafted incidents directly into the store (bypassing the
+    live lifecycle, which this test environment cannot drive through a real
+    remediation — no Kubernetes/Prometheus reachable) so each of the new
+    rates can be pinned to an exact expected number, not just "not null"."""
+    from app.models.incident import (
+        ActionParams,
+        ActionPlan,
+        AttemptRecord,
+        Evidence,
+        Incident,
+        IncidentStatus,
+        LifecyclePhase,
+        PolicyVerdict,
+        RemediationAction,
+        RemediationResult,
+        Severity,
+        TimelineEvent,
+        ValidationOutcome,
+        ValidationReport,
+    )
+
+    client, login = gui_client
+    headers = login(client)
+    store = client.app.state.store
+
+    def plan(action=RemediationAction.RESTART_DEPLOYMENT):
+        return ActionPlan(
+            action=action,
+            params=ActionParams(namespace="citizen-portal", deployment="citizen-service"),
+            confidence=0.95,
+            rationale="test",
+        )
+
+    def verdict(allowed):
+        return PolicyVerdict(allowed=allowed, action=RemediationAction.RESTART_DEPLOYMENT)
+
+    def result(succeeded):
+        return RemediationResult(
+            action=RemediationAction.RESTART_DEPLOYMENT,
+            params=plan().params,
+            succeeded=succeeded,
+            started_at=1_700_000_100.0,
+        )
+
+    def validation(outcome):
+        return ValidationReport(outcome=outcome) if outcome else None
+
+    def timeline(created_at, rca_offset):
+        return [
+            TimelineEvent(phase=LifecyclePhase.DETECTION, message="detected", at=created_at),
+            TimelineEvent(
+                phase=LifecyclePhase.ROOT_CAUSE_ANALYSIS, message="diagnosed",
+                at=created_at + rca_offset,
+            ),
+        ]
+
+    # A: one denied candidate, then one executed+validated-passed candidate.
+    # first_executed_attempt = the passed one -> counts toward
+    # first_action_success_rate; verdicted_attempts gets both (1 denied / 2).
+    incident_a = Incident(
+        id="INC-PERF-A", fingerprint="fp-a", alertname="HighHTTPErrorRate",
+        severity=Severity.CRITICAL, app="citizen-service", namespace="citizen-portal",
+        status=IncidentStatus.RESOLVED, created_at=1_700_000_000.0, resolved_at=1_700_000_200.0,
+        evidence=Evidence(), timeline=timeline(1_700_000_000.0, 4.0),
+        attempts=[
+            AttemptRecord(plan=plan(), verdict=verdict(False), result=None),
+            AttemptRecord(plan=plan(), verdict=verdict(True), result=result(True),
+                          validation=validation(ValidationOutcome.PASSED)),
+        ],
+    )
+    # B: executed, applied fine, but validation failed - "ineffective", not
+    # an execution failure.
+    incident_b = Incident(
+        id="INC-PERF-B", fingerprint="fp-b", alertname="HighHTTPErrorRate",
+        severity=Severity.CRITICAL, app="citizen-service", namespace="citizen-portal",
+        status=IncidentStatus.ESCALATED, escalated=True,
+        created_at=1_700_001_000.0, resolved_at=1_700_001_300.0,
+        evidence=Evidence(), timeline=timeline(1_700_001_000.0, 6.0),
+        attempts=[
+            AttemptRecord(plan=plan(), verdict=verdict(True), result=result(True),
+                          validation=validation(ValidationOutcome.FAILED)),
+        ],
+    )
+    # C: the action itself failed to apply - an execution failure, distinct
+    # from B's "applied but ineffective".
+    incident_c = Incident(
+        id="INC-PERF-C", fingerprint="fp-c", alertname="HighHTTPErrorRate",
+        severity=Severity.CRITICAL, app="citizen-service", namespace="citizen-portal",
+        status=IncidentStatus.ESCALATED, escalated=True,
+        created_at=1_700_002_000.0,
+        evidence=Evidence(), timeline=[],
+        attempts=[AttemptRecord(plan=plan(), verdict=verdict(True), result=result(False))],
+    )
+    # D: applied fine, but validation was UNAVAILABLE - must be excluded
+    # from both the ineffective-remediation and recovery-validation rates,
+    # not counted against Sentinel either way.
+    incident_d = Incident(
+        id="INC-PERF-D", fingerprint="fp-d", alertname="HighHTTPErrorRate",
+        severity=Severity.CRITICAL, app="citizen-service", namespace="citizen-portal",
+        status=IncidentStatus.RESOLVED,
+        created_at=1_700_003_000.0, resolved_at=1_700_003_100.0,
+        evidence=Evidence(), timeline=[],
+        attempts=[
+            AttemptRecord(plan=plan(), verdict=verdict(True), result=result(True),
+                          validation=validation(ValidationOutcome.UNAVAILABLE)),
+        ],
+    )
+    for incident in (incident_a, incident_b, incident_c, incident_d):
+        store.upsert_incident(incident.to_dict())
+
+    perf = client.get("/api/performance/summary", headers=headers).json()
+
+    # first_action_success_rate: incidents A, B, C, D each have exactly one
+    # FIRST executed attempt; only A's passed validation -> 1 of 4.
+    assert perf["first_action_success_rate"] == 0.25
+    # execution_failure_rate: of 4 executed attempts total (A's second
+    # attempt, B, C, D), only C's failed to apply -> 1 of 4.
+    assert perf["execution_failure_rate"] == 0.25
+    # ineffective_remediation_rate: of attempts that applied successfully
+    # AND had a scored validation outcome (A-passed, B-failed; D is
+    # excluded as unavailable, C never applied) -> B is the 1 ineffective
+    # one of 2 scored.
+    assert perf["ineffective_remediation_rate"] == 0.5
+    # recovery_validation_success_rate: same denominator as above (A, B) -
+    # A passed, B did not -> 1 of 2.
+    assert perf["recovery_validation_success_rate"] == 0.5
+    # policy_rejection_rate: 5 verdicted attempts total (A's denied + A's
+    # allowed + B + C + D), 1 denied -> 1 of 5.
+    assert perf["policy_rejection_rate"] == 0.2
+    # escalation_rate: B and C are escalated, of 4 incidents -> 0.5.
+    assert perf["escalation_rate"] == 0.5
+    # avg_investigation_latency_seconds: only A (4s) and B (6s) recorded a
+    # detection+RCA timeline -> mean 5.0.
+    assert perf["avg_investigation_latency_seconds"] == 5.0
+    assert perf["sample_size"]["verdicted_attempts"] == 5
+    assert perf["sample_size"]["validation_scored_attempts"] == 2
 
 
 # ---------------------------------------------------------------------------
