@@ -27,17 +27,34 @@ from .conftest import executed_attempt, make_plan
 
 
 class _FakeStore:
-    """Minimal store: only the two read-only methods replay touches."""
+    """Minimal store: the read-only methods replay touches."""
 
-    def __init__(self, other_actions=None, action_stats=None):
+    def __init__(self, other_actions=None, action_stats=None, terminal_incidents=None):
         self._other_actions = other_actions or {}
         self._action_stats = action_stats or {}
+        self._terminal_incidents = terminal_incidents or []
 
     def recent_executed_actions(self, app, since, exclude_incident_id=None):
         return dict(self._other_actions)
 
     def action_stats(self, root_cause):
         return self._action_stats.get(root_cause, {})
+
+    def list_terminal_incidents_for_app(self, app, exclude_incident_id=None):
+        return list(self._terminal_incidents)
+
+
+class _FakeStoreWithoutMemorySupport:
+    """A store that predates operational memory (no
+    `list_terminal_incidents_for_app` at all) — replay must still degrade
+    gracefully rather than crash, exactly like its existing handling of any
+    other memory lookup failure."""
+
+    def recent_executed_actions(self, app, since, exclude_incident_id=None):
+        return {}
+
+    def action_stats(self, root_cause):
+        return {}
 
 
 def _replay(incident, *, store=None, from_scratch=False, **overrides):
@@ -227,3 +244,66 @@ def test_replay_never_mutates_the_incident():
     assert incident.attempts == before_attempts
     assert incident.timeline == before_timeline
     assert incident.status == before_status
+
+
+# ---------------------------------------------------------------------------
+# Operational memory bias in replay (task #35 — no parallel systems: replay
+# must apply the SAME combined bias the live orchestrator does, not just
+# learning.py's half of it, or "what would Sentinel decide?" would silently
+# disagree with what Sentinel actually would decide).
+# ---------------------------------------------------------------------------
+def _similar_past_record(incident_id: str, *, evidence: Evidence, succeeded: bool) -> dict:
+    return {
+        "id": incident_id,
+        "created_at": 1.0,
+        "escalated": False,
+        "hypothesis": {"root_cause": "bad_deployment"},
+        "attempts": [
+            {
+                "plan": {"action": "rollback_deployment", "params": {}},
+                "result": {"succeeded": succeeded},
+                "validation": {"outcome": "passed" if succeeded else "failed"},
+            }
+        ],
+        "evidence": evidence.to_dict(),
+    }
+
+
+def test_replay_applies_memory_bias_from_similar_past_incidents():
+    now = time.time()
+    incident = _bad_deployment_incident(now)
+    # Two past incidents whose evidence closely resembles this one, both of
+    # which tried a rollback and it did not resolve anything.
+    past = [
+        _similar_past_record("INC-PAST-1", evidence=incident.evidence, succeeded=False),
+        _similar_past_record("INC-PAST-2", evidence=incident.evidence, succeeded=False),
+    ]
+    store = _FakeStore(terminal_incidents=past)
+
+    baseline = _replay(incident)
+    with_memory = _replay(incident, store=store)
+
+    assert with_memory.memory_bias.get("rollback_deployment") is not None
+    assert with_memory.memory_bias["rollback_deployment"] < 1.0
+    rollback_baseline = next(c for c in baseline.candidates if c.action == "rollback_deployment")
+    rollback_with_memory = next(c for c in with_memory.candidates if c.action == "rollback_deployment")
+    assert rollback_with_memory.confidence < rollback_baseline.confidence
+
+
+def test_replay_memory_bias_is_empty_with_no_similar_past_incidents():
+    now = time.time()
+    incident = _bad_deployment_incident(now)
+    result = _replay(incident, store=_FakeStore())
+    assert result.memory_bias == {}
+
+
+def test_replay_degrades_gracefully_when_the_store_predates_operational_memory():
+    """A store missing `list_terminal_incidents_for_app` entirely (an older
+    integration, or a bug) must not crash replay — the same
+    never-load-bearing guarantee memory.py's live orchestrator call has."""
+    now = time.time()
+    incident = _bad_deployment_incident(now)
+    result = _replay(incident, store=_FakeStoreWithoutMemorySupport())
+    assert result.memory_bias == {}
+    assert result.candidates  # replay still produced a real result
+    assert any("operational memory lookup failed" in n for n in result.notes)

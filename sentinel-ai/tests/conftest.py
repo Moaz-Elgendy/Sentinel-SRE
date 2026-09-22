@@ -237,6 +237,21 @@ class FakeKubernetes:
         )
         return {"replicas": replicas, "generation": 4}
 
+    async def patch_deployment_env_var(self, namespace, name, container, key, value):
+        self.writes.append(
+            (
+                "set_env_var",
+                {"namespace": namespace, "name": name, "container": container, "key": key, "value": value},
+            )
+        )
+        return {"key": key, "generation": 5}
+
+    async def remove_deployment_env_var(self, namespace, name, container, key):
+        self.writes.append(
+            ("unset_env_var", {"namespace": namespace, "name": name, "container": container, "key": key}),
+        )
+        return {"key": key, "generation": 6}
+
 
 class FakeChaos:
     def __init__(self, configured=True, succeed=True):

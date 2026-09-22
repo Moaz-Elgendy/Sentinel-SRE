@@ -127,6 +127,29 @@ def record_incident_outcomes(incident: Incident, store) -> list[dict[str, object
     return written
 
 
+def merge_bias(*biases: dict[str, float]) -> dict[str, float]:
+    """Combine independent bounded bias sources (this module's outcome bias,
+    memory.py's similarity bias) into the single dict `DecisionEngine.
+    candidates()` accepts.
+
+    Multiplies the per-action multipliers together rather than averaging or
+    picking the minimum: each source is already bounded to
+    `[its own floor, 1.0]` and independently justified (see each source's own
+    docstring), so a product of several such factors is still bounded above
+    by 1.0 and can only ever move confidence down further, never cancel out
+    another source's caution. An action with no opinion from a given source
+    is treated as a neutral 1.0 from that source, never as a penalty — only
+    sources that actually have something to say about an action affect it.
+    """
+    merged: dict[str, float] = {}
+    for action in {a for bias in biases for a in bias}:
+        multiplier = 1.0
+        for bias in biases:
+            multiplier *= bias.get(action, 1.0)
+        merged[action] = multiplier
+    return merged
+
+
 def load_bias(root_cause: RootCause, store) -> dict[str, float]:
     """Read the bias for a root cause. Empty dict on any failure."""
     try:

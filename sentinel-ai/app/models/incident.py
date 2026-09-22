@@ -183,6 +183,11 @@ class DenialReason(str, Enum):
     MISSING_TARGET = "missing_target"
     NO_CHAOS_SURFACE = "no_chaos_surface"
     UNKNOWN_ACTION = "unknown_action"
+    # Deep Investigation only (lifecycle/deep_investigation.py's
+    # apply_llm_response already refuses to even construct a proposal naming
+    # such a key; this is policy.py's independent second check on the same
+    # rule — see PolicyEngine.evaluate_deep_proposal).
+    SENSITIVE_ENV_VAR_KEY = "sensitive_env_var_key"
     # Reserved, not currently raised by any policy branch: lifecycle/risk.py
     # can classify a candidate's blast_radius_scope as "beyond_incident_scope"
     # (its target does not match the incident's own namespace/deployment),
@@ -623,6 +628,33 @@ class PolicyVerdict:
 
 
 @dataclass
+class DeepPolicyVerdict:
+    """The Policy Engine's verdict on a Deep Investigation proposal —
+    deliberately a SEPARATE type from `PolicyVerdict` rather than reusing it
+    with a placeholder `action`: `PolicyVerdict.action` is typed
+    `RemediationAction` (the closed, rule-vetted set) and nothing here is
+    from that set. An `allowed=True` verdict means "eligible to be shown to
+    a human for authorization" — it is never itself an authorisation to
+    execute. See lifecycle/policy.py's `evaluate_deep_proposal`.
+    """
+
+    allowed: bool
+    action_type: NovelActionType
+    reason: DenialReason | None = None
+    detail: str = ""
+    checks: dict[str, bool] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "allowed": self.allowed,
+            "action_type": self.action_type.value,
+            "reason": self.reason.value if self.reason else None,
+            "detail": self.detail,
+            "checks": self.checks,
+        }
+
+
+@dataclass
 class RemediationResult:
     action: RemediationAction
     params: ActionParams
@@ -662,6 +694,33 @@ class RemediationResult:
             duration_seconds=data.get("duration_seconds", 0.0),
             before=data.get("before") or {},
         )
+
+
+@dataclass
+class DeepRemediationResult:
+    """Mirrors `RemediationResult`, for the same reason `DeepPolicyVerdict`
+    mirrors `PolicyVerdict` rather than reusing it: `action_type` is a
+    `NovelActionType`, not a `RemediationAction`."""
+
+    action_type: NovelActionType
+    target: DeepActionTarget
+    succeeded: bool
+    detail: str = ""
+    dry_run: bool = False
+    started_at: float = field(default_factory=time.time)
+    duration_seconds: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type.value,
+            "target": self.target.to_dict(),
+            "succeeded": self.succeeded,
+            "detail": self.detail,
+            "dry_run": self.dry_run,
+            "started_at": self.started_at,
+            "started_at_iso": iso(self.started_at),
+            "duration_seconds": self.duration_seconds,
+        }
 
 
 @dataclass
@@ -729,6 +788,210 @@ class AttemptRecord:
             result=RemediationResult.from_dict(data.get("result")),
             validation=ValidationReport.from_dict(data.get("validation")),
             at=data.get("at", time.time()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# DEEP LLM INVESTIGATION / NOVEL TYPED REMEDIATION
+#
+#   RCA -> Decision -> Policy -> (known remediation) -> Validate
+#                          |
+#                          `-> insufficient -> **Deep Investigation** (bounded,
+#                              read-only, evidence-only) -> structured proposal
+#                              -> deep policy check -> human authorization
+#                              (always required - this is never autonomous,
+#                              unlike the four known actions) -> typed
+#                              execution -> Validate
+#
+# Everything below follows rca.py's "the LLM writes prose, Python decides"
+# boundary, one step further: here the LLM does not even choose among a
+# rule-engine-approved set, it PROPOSES a novel action from scratch. That
+# means every field of what it returns is untrusted until validated, and the
+# blast radius of what it can even propose is closed by construction:
+# `NovelActionType` is a small, explicit enum, never a free-form string, and
+# `DeepActionTarget` has no field that could carry a shell command, a
+# manifest, or an arbitrary API call - only the same narrow
+# namespace/deployment/container/key/value shape typed remediation actually
+# executes through (see lifecycle/deep_investigation.py and
+# clients/kubernetes_client.py's patch_deployment_env_var /
+# remove_deployment_env_var). A proposal is never executed directly from the
+# model's output: apply_llm_response() (deep_investigation.py) re-validates
+# every field against the incident it was generated for, and
+# PolicyEngine.evaluate_deep_proposal() (lifecycle/policy.py) gates it with
+# the same frozen deny-lists, allow-lists, action cap and cooldown as every
+# other remediation - plus a confidence floor and a human authorization
+# requirement that the four known actions do not carry.
+# ---------------------------------------------------------------------------
+class NovelActionType(str, Enum):
+    """The complete, closed set of typed operations a Deep Investigation
+    proposal may request. Deliberately small: each member maps to exactly
+    one narrowly-scoped KubernetesClient write method, never a generic
+    "patch this manifest" escape hatch (see that module's own docstring on
+    why no such method exists). Extending this set means adding a new
+    KubernetesClient method, a new RemediationEngine dispatch branch and a
+    new PolicyEngine precondition together - never on its own.
+    """
+
+    SET_ENV_VAR = "set_env_var"
+    UNSET_ENV_VAR = "unset_env_var"
+
+    @classmethod
+    def parse(cls, raw: Any) -> "NovelActionType | None":
+        """Same strict, tolerant-of-casing parse as RemediationAction.parse -
+        deliberately duplicated rather than shared, so a change to one enum's
+        parsing can never silently affect the other's trust boundary."""
+        if not isinstance(raw, str):
+            return None
+        if any(ch in raw for ch in ("\n", "\r", "\t")):
+            return None
+        candidate = raw.strip().lower()
+        for member in cls:
+            if member.value == candidate:
+                return member
+        return None
+
+
+class DeepProposalStatus(str, Enum):
+    SUGGESTED = "suggested"
+    AUTHORIZED = "authorized"
+    EXECUTING = "executing"
+    EXECUTED = "executed"
+    VALIDATED = "validated"
+    FAILED = "failed"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+@dataclass
+class DeepActionTarget:
+    """The closed, typed parameter shape for a novel remediation action.
+
+    No field here can carry a shell command, a file path outside a
+    container's declared env, or an arbitrary Kubernetes object reference -
+    only exactly what `patch_deployment_env_var` / `remove_deployment_env_var`
+    take. `previous_value` is captured by Python (from live evidence, not
+    from the model) at proposal-build time so the action is always
+    revertible without asking the model to remember what it saw.
+    """
+
+    namespace: str | None = None
+    deployment: str | None = None
+    container: str | None = None
+    key: str | None = None
+    value: str | None = None
+    previous_value: str | None = None
+    previous_value_existed: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "namespace": self.namespace,
+            "deployment": self.deployment,
+            "container": self.container,
+            "key": self.key,
+            "value": self.value,
+            "previous_value": self.previous_value,
+            "previous_value_existed": self.previous_value_existed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "DeepActionTarget":
+        data = data or {}
+        return cls(
+            namespace=data.get("namespace"),
+            deployment=data.get("deployment"),
+            container=data.get("container"),
+            key=data.get("key"),
+            value=data.get("value"),
+            previous_value=data.get("previous_value"),
+            previous_value_existed=bool(data.get("previous_value_existed", False)),
+        )
+
+
+@dataclass
+class DeepRemediationProposal:
+    """A structured, bounded proposal from the Deep LLM Investigation path.
+
+    Every prose field (`problem`, `reason`, `expected_effect`,
+    `validation_plan`) is exactly that - prose, for a human to read. Nothing
+    in this dataclass is itself an authorisation: `status` starts at
+    SUGGESTED and can only reach AUTHORIZED through a human clicking
+    authorize (routers/authorizations.py), exactly like the existing
+    temporary-SRE-authorization flow for the four known actions - this
+    proposal is never autonomous.
+    """
+
+    id: str
+    incident_id: str
+    created_at: float
+    problem: str
+    root_cause: str
+    action_type: NovelActionType
+    target: DeepActionTarget
+    reason: str
+    expected_effect: str
+    risk_level: str  # "low" | "moderate" | "high" - computed by Python (lifecycle/risk.py-style table), never by the model
+    risk_reasoning: list[str] = field(default_factory=list)
+    reversible: bool = True
+    validation_plan: str = ""
+    confidence: float = 0.0
+    status: DeepProposalStatus = DeepProposalStatus.SUGGESTED
+    rendered_command: str = ""  # display-only, generated FROM this struct - never executed
+    llm_raw: str = ""  # the raw model response, kept for audit
+    llm_label: str = ""  # e.g. "openai:gpt-4o-mini" - which provider produced this
+    rejected_reason: str | None = None
+    authorization_id: str | None = None
+    result_detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "incident_id": self.incident_id,
+            "created_at": self.created_at,
+            "created_at_iso": iso(self.created_at),
+            "problem": self.problem,
+            "root_cause": self.root_cause,
+            "action_type": self.action_type.value,
+            "target": self.target.to_dict(),
+            "reason": self.reason,
+            "expected_effect": self.expected_effect,
+            "risk_level": self.risk_level,
+            "risk_reasoning": self.risk_reasoning,
+            "reversible": self.reversible,
+            "validation_plan": self.validation_plan,
+            "confidence": self.confidence,
+            "status": self.status.value,
+            "rendered_command": self.rendered_command,
+            "llm_raw": self.llm_raw[:4000],
+            "llm_label": self.llm_label,
+            "rejected_reason": self.rejected_reason,
+            "authorization_id": self.authorization_id,
+            "result_detail": self.result_detail,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DeepRemediationProposal":
+        return cls(
+            id=data["id"],
+            incident_id=data["incident_id"],
+            created_at=data.get("created_at", time.time()),
+            problem=data.get("problem", ""),
+            root_cause=data.get("root_cause", ""),
+            action_type=NovelActionType(data["action_type"]),
+            target=DeepActionTarget.from_dict(data.get("target")),
+            reason=data.get("reason", ""),
+            expected_effect=data.get("expected_effect", ""),
+            risk_level=data.get("risk_level", "high"),
+            risk_reasoning=list(data.get("risk_reasoning") or []),
+            reversible=data.get("reversible", True),
+            validation_plan=data.get("validation_plan", ""),
+            confidence=data.get("confidence", 0.0),
+            status=DeepProposalStatus(data.get("status", "suggested")),
+            rendered_command=data.get("rendered_command", ""),
+            llm_raw=data.get("llm_raw", ""),
+            llm_label=data.get("llm_label", ""),
+            rejected_reason=data.get("rejected_reason"),
+            authorization_id=data.get("authorization_id"),
+            result_detail=data.get("result_detail", ""),
         )
 
 
@@ -805,6 +1068,17 @@ class Incident:
     hypothesis: Hypothesis | None = None
     attempts: list[AttemptRecord] = field(default_factory=list)
     timeline: list[TimelineEvent] = field(default_factory=list)
+
+    # Deep LLM Investigation proposals (see the block above this class).
+    # Append-only: a rejected or expired proposal stays in the list as its
+    # own audit record rather than being overwritten, the same
+    # never-destroy-history choice as `escalation_history`.
+    deep_proposals: list[DeepRemediationProposal] = field(default_factory=list)
+    # Bounds how many times ONE incident may trigger a Deep Investigation
+    # call, independent of MAX_LIFECYCLE_CYCLES: a pathological incident that
+    # keeps re-escalating must not keep spending LLM calls on new proposals
+    # forever (see orchestrator.py's `_maybe_deep_investigate`).
+    deep_investigation_count: int = 0
 
     escalated: bool = False
     escalation_reason: EscalationReason | None = None
@@ -890,6 +1164,8 @@ class Incident:
             "hypothesis": self.hypothesis.to_dict() if self.hypothesis else None,
             "attempts": [a.to_dict() for a in self.attempts],
             "timeline": [e.to_dict() for e in self.timeline],
+            "deep_proposals": [p.to_dict() for p in self.deep_proposals],
+            "deep_investigation_count": self.deep_investigation_count,
             "escalated": self.escalated,
             "escalation_reason": self.escalation_reason.value if self.escalation_reason else None,
             "escalation_detail": self.escalation_detail,
@@ -961,6 +1237,10 @@ class Incident:
             hypothesis=Hypothesis.from_dict(data.get("hypothesis")),
             attempts=[AttemptRecord.from_dict(a) for a in data.get("attempts") or []],
             timeline=[TimelineEvent.from_dict(e) for e in data.get("timeline") or []],
+            deep_proposals=[
+                DeepRemediationProposal.from_dict(p) for p in data.get("deep_proposals") or []
+            ],
+            deep_investigation_count=data.get("deep_investigation_count", 0),
             escalated=data.get("escalated", False),
             escalation_reason=(
                 EscalationReason(data["escalation_reason"])

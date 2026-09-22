@@ -44,9 +44,11 @@ application that can actually break, in several distinguishable ways, on demand.
 - [Observability architecture](#observability-architecture)
 - [Sentinel architecture](#sentinel-architecture)
 - [Autonomous remediation](#autonomous-remediation)
+- [Deep investigation & novel remediation](#deep-investigation--novel-remediation)
 - [Rollback capability](#rollback-capability)
 - [The incident lifecycle](#the-incident-lifecycle)
 - [A worked example incident](#a-worked-example-incident)
+- [Operational learning & incident replay](#operational-learning--incident-replay)
 - [Chaos engineering scenarios](#chaos-engineering-scenarios)
 - [CI/CD](#cicd)
 - [Security model](#security-model)
@@ -332,7 +334,12 @@ structured parameters (namespace, deployment, target revision) — never a comma
 ordinary application code that could contain a mistake.** See [Security model](#security-model).
 
 Incident history is kept in SQLite on a node-local volume, which feeds the LEARNING phase and is
-also why Sentinel runs as a single replica (see [Limitations](#limitations)).
+also why Sentinel runs as a single replica (see [Limitations](#limitations)). That same history is
+also what the [Operational learning & incident replay](#operational-learning--incident-replay)
+feedback loop reads from, and what a diagram this size cannot show: when the Policy Engine rejects
+every candidate the Decision Engine offers (or the four actions above are exhausted without a
+validated recovery), Sentinel reaches for one more, narrower tool before it gives up and escalates
+— see [Deep investigation & novel remediation](#deep-investigation--novel-remediation).
 
 ## Autonomous remediation
 
@@ -364,6 +371,87 @@ If validation fails, Sentinel re-investigates, takes the next candidate off the 
 and re-validates. When the candidates are exhausted or the per-incident action cap is reached, it
 escalates. An agent that keeps inventing new things to try against a service that is not
 recovering is strictly worse than one that stops and pages a human.
+
+## Deep investigation & novel remediation
+
+The four actions above are Sentinel's entire *autonomous* vocabulary — bounded, rule-vetted, and
+executed with no human in the loop. Deep Investigation
+([`lifecycle/deep_investigation.py`](sentinel-ai/app/lifecycle/deep_investigation.py)) is a
+separate, narrower capability that exists for exactly one situation: **known remediation turned
+out to be insufficient** (no candidate action existed, every candidate was denied by policy, the
+per-incident action cap was reached, or the lifecycle exhausted its retry cycles without a
+validated recovery) and the incident is about to escalate to a human anyway. Rather than escalate
+with only "nothing in the rulebook worked," Sentinel asks its configured LLM for one bounded,
+typed, **human-authorizable** proposal to attach to that escalation. It never changes whether or
+how the incident escalates — it only enriches an escalation that was already happening.
+
+**What the model can propose is closed to two operations**, `NovelActionType.SET_ENV_VAR` and
+`UNSET_ENV_VAR` on one environment variable of one container — chosen because it is the smallest
+concrete action space wider than the four fixed ones, and because "this workload came up
+misconfigured" is a real, otherwise-unremediable class of incident. Everything the model returns
+is prose or these two narrow fields; there is no way for its output to parse into anything else:
+
+- The target namespace and deployment are **never taken from the model** — they are hard-pinned to
+  the incident's own target, exactly as recorded before the LLM was ever called.
+- The named container must actually exist in the evidence already gathered for this incident.
+- The environment variable **key** is checked against the same
+  `SENSITIVE_ENV_KEY_MARKERS` list (`password`, `secret`, `token`, `key`, `credential`, `private`,
+  `auth`, matched case-insensitively as a substring) that
+  [`kubernetes_client.py`](sentinel-ai/app/clients/kubernetes_client.py) already redacts by when
+  reading a Deployment's env — a proposal naming a credential-shaped key is refused at
+  construction time, before it is ever stored or shown to anyone.
+- Confidence is clamped to `[0, 1]`, and risk is computed independently by Sentinel
+  (`_assess_deep_risk`) — never "low", and never taken from the model — because a proposal that
+  reached this path was, by definition, never vetted by the Policy Engine's rules the way the four
+  known actions are.
+- The call itself is a single request with no tool use, no multi-turn loop, and no way for the
+  model to ask for a follow-up call; the raw response size is capped
+  (`DEEP_INVESTIGATION_OUTPUT_MAX_CHARS`, 4000 by default) before Sentinel even attempts to parse
+  it as JSON.
+- Anything that fails any check — malformed JSON, an unparseable action name, an out-of-range
+  field, a missing required prose field, a sensitive-looking key, a malformed key name — is
+  rejected outright. `apply_llm_response` never patches a bad response into something usable; it
+  returns nothing, and Sentinel escalates exactly as if the LLM had not answered at all.
+
+**A confidence-clearing proposal is still not an authorization to act.** The Policy Engine's
+`evaluate_deep_proposal` re-derives eligibility from scratch — the proposal's target must match the
+incident's own target exactly (`DenialReason.BLAST_RADIUS_EXCEEDS_INCIDENT` otherwise), the
+deployment must not be on the frozen deny-list, the per-incident action cap is shared with the four
+known actions, and confidence must clear **0.97** — deliberately higher than every known-action
+threshold, including rollback's 0.95, because this path was never rule-vetted. The environment-key
+check is re-run here too, independently of the construction-time check, under its own
+`DenialReason.SENSITIVE_ENV_VAR_KEY`. Crucially, clearing every one of these checks still only
+produces `allowed=True`, meaning *eligible for a human to authorize* — unlike the four known
+actions, there is no confidence-override path here, at any confidence.
+
+**Execution requires an explicit, one-time SRE authorization.** An eligible proposal is surfaced on
+the escalated incident (`GET /api/incidents/{id}/deep-proposals`, and in `sentinel-gui`'s Deep
+Investigation panel) and sits in `status: suggested` until an authenticated admin calls
+`POST /api/incidents/{id}/deep-proposals/{id}/authorize`. That reuses the same short-lived
+temporary-authorization mechanism and single-writer incident lease the four known actions' manual
+authorization already uses — there is no separate, less-audited path. Only then does
+`RemediationEngine.execute_deep()` run, and it re-checks the allow-list, the deny-list, and the
+sensitive-key rule **a third time**, independently of both `apply_llm_response` and the Policy
+Engine, as the last gate before the one Kubernetes write it is permitted to make
+(`patch_deployment_env_var` / `remove_deployment_env_var` — no generic write method exists). After
+execution, the incident re-enters RECOVERY VALIDATION exactly like any other action; a failure is
+recorded on the proposal and the incident continues to escalate, it does not retry the same
+proposal automatically.
+
+**The proposal's `rendered_command`** (a display-only `kubectl set env ...` string an SRE reads
+before deciding) is never executed by Sentinel — it exists only so a human can see, in familiar
+terms, what authorizing this proposal would do. Every field in it is `shlex.quote()`-d, so a
+model-proposed value containing shell metacharacters (`x; rm -rf /`, `` `curl evil` ``) renders as
+an inert quoted literal rather than something a shell would act on if copy-pasted into a real
+terminal.
+
+**This is off by default in the sense that matters:** with no LLM configured (no API key), or with
+its provider's circuit breaker open from recent failures, `investigate_deep` returns nothing and
+Sentinel escalates exactly as it did before this feature existed —
+`deep_investigation_enabled=true` is the default, but the feature is inert without a reasoner.
+Deep Investigation is bounded to `deep_investigation_max_per_incident` (1 by default) LLM calls per
+incident, independent of the lifecycle's own retry cycles, so a pathological incident cannot keep
+spending new calls indefinitely.
 
 ## Rollback capability
 
@@ -430,7 +518,28 @@ DETECTION  →  INVESTIGATION  →  CORRELATION  →  ROOT CAUSE ANALYSIS
 11. **LEARNING** — the incident is written to the store so patterns across incidents are visible,
     not just the most recent one.
 
-On a failed remediation the loop re-enters at INVESTIGATION. On exhaustion it escalates.
+On a failed remediation the loop re-enters at INVESTIGATION. On exhaustion — no candidate action,
+every candidate denied, the action cap reached, or the retry cycles exhausted without a validated
+recovery — it escalates, and immediately before that escalation Sentinel also runs [Deep
+investigation](#deep-investigation--novel-remediation) once, to see whether a bounded, typed,
+human-authorizable proposal can be attached to it.
+
+**Surviving a restart mid-lifecycle.** Sentinel runs as a single replica (see
+[Limitations](#limitations)), so a process restart while an incident is `OPEN` or `INVESTIGATING`
+is a real failure mode, not a hypothetical one — every prior phase of this project simply left such
+an incident stuck in that status forever, with no lifecycle task left to move it. On startup,
+`IncidentManager.recover_interrupted()` reconciles every incident still in an active status against
+what the previous process actually managed to do: one with **no remediation action yet executed**
+is resumed from where it left off, **exactly once** — the resumption is recorded on the incident's
+own timeline, so a Sentinel that keeps crash-looping cannot resume the same incident forever. Any
+other in-flight incident — one where an action had already been executed, or one already resumed
+once before — is closed as `ESCALATED` with `escalation_reason: interrupted_by_restart`, explicitly
+because Sentinel will not blindly re-attempt or re-validate an action a human has not confirmed the
+current state of. A `POST`/`PUT` correlating with an already-`ESCALATED` incident is similarly rate
+limited: automatic re-investigation only happens for a reason in `AUTO_RECONSIDERABLE_REASONS`, at
+most `max_incident_reopens` times (3 by default) per incident, and only after
+`escalated_reconsider_min_interval_seconds` has passed since the last one — past that, only a human
+re-opening it manually tries again.
 
 ## A worked example incident
 
@@ -497,6 +606,64 @@ recognised pattern rather than a fresh mystery.
 have pointed at `citizen-postgres` — which is on the frozen deny-list. Sentinel would have
 escalated to a human with its full diagnosis attached and taken no action at all. That is the
 correct answer, not a gap in coverage.
+
+## Operational learning & incident replay
+
+Every incident has always been persisted to SQLite once it closes (the LEARNING phase in [The
+incident lifecycle](#the-incident-lifecycle)). On its own, that is auditing, not learning — a
+record that nothing later reads back changes nothing about what Sentinel decides next time. Two
+mechanisms now close that loop, both bounded and both dampening-only: neither can ever make
+Sentinel *more* confident than its evidence and rules already say, only less.
+
+**Aggregated learning, by root cause**
+([`lifecycle/learning.py`](sentinel-ai/app/lifecycle/learning.py)). For the current incident's
+root cause, Sentinel looks at how often each candidate action actually resolved *past* incidents
+with that same root cause. With at least `MIN_SAMPLES_FOR_BIAS` (3) prior attempts of an action,
+its historical success rate maps to a multiplier between `MAX_PENALTY_MULTIPLIER` (0.85) and `1.0`
+— a perfect track record leaves confidence untouched, a poor one pulls it down, and an action with
+too little history is left neutral (multiplier `1.0`) rather than guessed at.
+
+**Operational Memory, by incident similarity**
+([`lifecycle/memory.py`](sentinel-ai/app/lifecycle/memory.py)). Separately, Sentinel finds past
+incidents whose *evidence signature* resembles this one (not just the same root cause label) and
+weights each by how similar it actually was. With at least `MIN_SIMILAR_SAMPLES_FOR_BIAS` (2)
+weighted samples for a candidate action, the same shape of calculation produces a second
+multiplier, floored at `MEMORY_MAX_PENALTY_MULTIPLIER` (0.92) — deliberately a gentler ceiling than
+aggregated learning's, because a handful of similar-but-not-identical incidents is a noisier signal
+than a root cause's whole history and should be trusted proportionally less.
+
+**The two are combined multiplicatively** (`learning.merge_bias`), a missing action in either
+source treated as neutral (`1.0`), and the *combined* bias — never either alone — is what the
+Decision Engine actually applies to candidate ordering and confidence. The product of two
+multipliers each already bounded to ≤1.0 is itself always ≤1.0: this can only ever make Sentinel
+more cautious about a candidate with a poor track record, never more willing to try one that
+weak evidence alone would not already support. Every incident's timeline records all three values —
+the aggregated bias, the memory bias, and the combined result — so which of the two, if either,
+affected a given decision is always auditable after the fact, not just asserted.
+
+**Incident Replay** ([`lifecycle/replay.py`](sentinel-ai/app/lifecycle/replay.py)) answers "what
+would Sentinel decide about this incident right now, given everything it has learned since" by
+recomputing findings and candidates without touching the incident's own persisted decision — and it
+deliberately runs the identical bias computation the live orchestrator does (same lookups, same
+`merge_bias` call), so replaying an incident can never silently disagree with what a live run would
+actually do. If Operational Memory's lookup fails during a replay, that failure is recorded as a
+note on the result and replay degrades to aggregated-learning-only, rather than raising.
+
+**The Causal Incident Graph**
+([`lifecycle/causal_graph.py`](sentinel-ai/app/lifecycle/causal_graph.py)) — the structured
+timeline-to-graph view used for incident visualisation — includes a Deep Investigation proposal as
+the same kind of `action`/`outcome` node the four known actions already get, distinguished only by
+`detail.source` (`"known_action"` vs `"deep_investigation"`), rather than as a separate parallel
+view Sentinel would have to keep in sync by hand. The graph's final resolution edge is based on
+whichever of a known attempt or a deep proposal actually has the latest outcome timestamp, not on
+one or the other exclusively.
+
+**Sentinel Agent Evaluation** ([`lifecycle/evaluation.py`](sentinel-ai/app/lifecycle/evaluation.py))
+— which scores root-cause and action correctness against a scenario's known ground truth, where one
+exists (see [Chaos engineering scenarios](#chaos-engineering-scenarios)) — only ever scores the
+*first* executed action on an incident. A Deep Investigation proposal can never be first by
+construction (it is only ever produced immediately before an escalation that known remediation has
+already failed to prevent), so its presence never distorts that score.
 
 ## Chaos engineering scenarios
 
@@ -622,7 +789,25 @@ meaningless.
 
 **Chaos.** Autonomous remediation still only resets faults; it does not create them as part of
 incident handling. The separate GUI-driven scenario runner is an operator action guarded by
-`CHAOS_ADMIN_TOKEN` and an allow-list of known `scripts/incident-scenarios.sh` scenario names.
+`CHAOS_ADMIN_TOKEN` and an allow-list of known `scripts/incident-scenarios.sh` scenario names — a
+wrong or missing token is a **404**, not a 401/403, so an unauthenticated caller cannot even confirm
+the endpoint exists. `namespace`, the one field of that request an operator controls, is
+`shlex.quote()`-d before it reaches the shell script SSM runs on the node, so it cannot break out
+of its own argument no matter what is in it.
+
+**Deep Investigation is additive, not a second execution path with weaker rules.** The LLM's output
+there is checked against the same closed action enum, the same frozen deny-list, the same
+per-incident action cap, and the same "no target the model chose, only the incident's own target"
+rule as everything else in this section — see [Deep investigation & novel
+remediation](#deep-investigation--novel-remediation) for the specifics, including the
+sensitive-environment-variable-key gate that is checked independently three times (proposal
+construction, policy eligibility, and immediately before the cluster write) rather than once, and
+the confidence bar it must clear (0.97) being higher than any of the four known actions', with no
+override path at any confidence. It never executes without an explicit human authorization, and a
+prompt-injection attempt riding in on log or evidence content that the model repeats back in a
+prose field (`reason`, `problem`, and so on) is still just prose — it has no path to skip
+validation, policy, or authorization, because none of those layers trust anything the model says
+about itself.
 
 **`sentinel-gui` admin access.** Sign-in uses a separate admin-account system (unrelated to
 citizen-service's citizen auth), and every GUI-facing route requires that admin JWT except the
@@ -655,8 +840,11 @@ export CHAOS_ADMIN_TOKEN=<the token set in both services' Secrets>
 ./scripts/incident-scenarios.sh all
 ```
 
-On AWS, the same scenarios can be started from the portal's **Chaos** page instead of opening an
-SSM shell yourself. In the external-control-plane topology, deploy the K3s stack with the frontend
+On AWS, the same scenarios can be started from **Sentinel's Control Center** (`sentinel-gui`)'s
+**Chaos** page instead of opening an SSM shell yourself — this is the *only* chaos control surface
+in the UI; there is no equivalent page in the citizen-facing `frontend/`, deliberately, so an
+operator has exactly one place to look. In the external-control-plane topology, deploy the K3s
+stack with the frontend
 proxy pointed at the standalone Sentinel EC2 private IP:
 
 ```bash
@@ -796,6 +984,18 @@ default — Sentinel still detects, investigates, correlates, decides, remediate
 the root-cause narrative is rule-generated. Nothing degrades silently; the incident records
 `llm_used=false`. But "AI-powered" is doing less work in that configuration than the phrase
 suggests, and the honest framing is that the LLM enriches an analysis the rules already produce.
+**Deep Investigation depends on that same optional LLM even more directly: with none configured, or
+with its provider's circuit breaker open, it silently produces no proposal at all** and every
+incident escalates exactly as it did before the feature existed — there is no rule-based fallback
+for this one, because there is nothing rule-based to fall back to for a failure mode the four known
+actions do not already cover.
+
+**Deep Investigation and the learning/memory feedback loop are unit-tested with the LLM, Kubernetes
+and store layers stubbed, like everything else in this project — not verified against a real
+cluster or a real model provider.** The same "claims about code, not about observed behaviour"
+caveat above applies to every number and threshold quoted in [Deep investigation & novel
+remediation](#deep-investigation--novel-remediation) and [Operational learning & incident
+replay](#operational-learning--incident-replay).
 
 **Local development has no Sentinel.** `sentinel-ai` and `sentinel-gui` exist only on the optional
 standalone Sentinel EC2 instance, so the fastest environment to bring up is also the one where the

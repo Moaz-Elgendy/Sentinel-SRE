@@ -43,7 +43,16 @@ from app.core.metrics import (
     sentinel_validation_result_total,
 )
 from app.domain.environment import Environment
-from app.lifecycle import correlation, documentation, investigation, learning, memory, rca, risk
+from app.lifecycle import (
+    correlation,
+    deep_investigation,
+    documentation,
+    investigation,
+    learning,
+    memory,
+    rca,
+    risk,
+)
 from app.lifecycle.evidence_signature import compute_signature, material_changes
 from app.lifecycle.decision import DecisionEngine
 from app.lifecycle.policy import PolicyConfig, PolicyContext, PolicyEngine
@@ -53,6 +62,8 @@ from app.models.incident import (
     ActionParams,
     ActionPlan,
     AttemptRecord,
+    DeepProposalStatus,
+    DeepRemediationResult,
     EscalationReason,
     Evidence,
     Incident,
@@ -564,6 +575,273 @@ class Orchestrator:
         finally:
             set_incident_id(None)
 
+    async def authorize_and_remediate_deep(
+        self, incident: Incident, proposal_id: str, authorization_id: str
+    ) -> Incident:
+        """Execute exactly ONE human-authorised Deep Investigation proposal.
+
+        Mirrors `authorize_and_remediate` deliberately closely — same
+        single-attempt bound, same re-investigate-with-fresh-evidence step,
+        same "re-run the gate one more time before writing" discipline — but
+        for a `DeepRemediationProposal` rather than one of the four known
+        actions. Called ONLY by routers/authorizations.py's deep-proposal
+        endpoint, ONLY after it has confirmed a real, unexpired, unconsumed
+        temporary authorization exists for this exact (incident, proposal).
+        As with the known-action path, this method trusts that check
+        happened but does NOT trust it to mean "skip safety checks": it
+        calls `PolicyEngine.evaluate_deep_proposal` again, fresh, which can
+        still refuse (the target allow-list, deny-list and action cap are
+        re-checked against whatever the incident looks like right now, not
+        whatever it looked like when the proposal was first suggested).
+
+        Evidence is re-collected fresh for the same reason
+        `authorize_and_remediate` re-collects it: cluster state may have
+        moved on since the proposal was generated, and re-validating the
+        container/key against stale evidence would be exactly the kind of
+        unverifiable guess this codebase avoids elsewhere.
+        """
+        set_incident_id(incident.id)
+        try:
+            proposal = next(
+                (p for p in incident.deep_proposals if p.id == proposal_id), None
+            )
+            if proposal is None:
+                incident.status = IncidentStatus.ESCALATED
+                incident.record(
+                    LifecyclePhase.ESCALATION,
+                    f"Authorization {authorization_id} named deep proposal {proposal_id}, "
+                    "which no longer exists on this incident. No action taken.",
+                )
+                self._persist(incident)
+                return incident
+
+            incident.status = IncidentStatus.INVESTIGATING
+            evidence = await self._investigate(incident, LifecyclePhase.RE_INVESTIGATION)
+            incident.evidence = evidence
+            self._persist(incident)
+
+            deep_verdict = self.ctx.policy.evaluate_deep_proposal(incident, proposal)
+            incident.record(
+                LifecyclePhase.POLICY_CHECK,
+                f"[deep proposal {proposal_id}, authorization {authorization_id}] "
+                f"{proposal.action_type.value}: "
+                + ("ALLOWED" if deep_verdict.allowed else "DENIED")
+                + f" — {deep_verdict.detail}",
+                action_type=proposal.action_type.value,
+                allowed=deep_verdict.allowed,
+                denial_reason=deep_verdict.reason.value if deep_verdict.reason else None,
+                checks=deep_verdict.checks,
+                authorization_id=authorization_id,
+            )
+
+            if not deep_verdict.allowed:
+                proposal.status = DeepProposalStatus.REJECTED
+                proposal.rejected_reason = deep_verdict.detail
+                incident.status = IncidentStatus.ESCALATED
+                self._persist(incident)
+                return incident
+
+            proposal.status = DeepProposalStatus.EXECUTING
+            proposal.authorization_id = authorization_id
+            incident.record(
+                LifecyclePhase.AUTONOMOUS_EXECUTION,
+                f"executing deep proposal {proposal_id} ({proposal.action_type.value}) under "
+                f"human authorization {authorization_id}"
+                + (" (DRY_RUN)" if self.ctx.remediation.dry_run else ""),
+                target=proposal.target.to_dict(),
+            )
+            self._persist(incident)
+
+            try:
+                result: DeepRemediationResult = await self.ctx.remediation.execute_deep(
+                    proposal.target, deep_verdict
+                )
+            except RemediationRefused as exc:
+                logger.error(
+                    "deep_remediation_refused_after_authorisation",
+                    extra={
+                        "proposal_id": proposal_id,
+                        "authorization_id": authorization_id,
+                        "error_detail": str(exc)[:200],
+                    },
+                )
+                proposal.status = DeepProposalStatus.FAILED
+                proposal.result_detail = str(exc)[:300]
+                incident.status = IncidentStatus.ESCALATED
+                incident.record(
+                    LifecyclePhase.ESCALATION,
+                    f"The Remediation Engine refused a deep action the Policy Engine "
+                    f"authorised under {authorization_id}: {exc}. This is an internal "
+                    "inconsistency in Sentinel, not a normal denial.",
+                    reason=EscalationReason.REMEDIATION_ERROR.value,
+                )
+                self._persist(incident)
+                return await self._finish(incident)
+
+            self.ctx.store.consume_temporary_authorization(
+                authorization_id,
+                consumed_at=time.time(),
+                consumed_result="executed_" + ("succeeded" if result.succeeded else "failed"),
+            )
+            proposal.result_detail = result.detail
+            incident.record(
+                LifecyclePhase.AUTONOMOUS_EXECUTION,
+                f"deep proposal {proposal_id} ({proposal.action_type.value}) "
+                + ("succeeded" if result.succeeded else "FAILED")
+                + f": {result.detail}",
+                succeeded=result.succeeded,
+                dry_run=result.dry_run,
+                duration_seconds=result.duration_seconds,
+            )
+            self._persist(incident)
+
+            if not result.succeeded:
+                proposal.status = DeepProposalStatus.FAILED
+                incident.status = IncidentStatus.ESCALATED
+                self._persist(incident)
+                return await self._finish(incident)
+
+            proposal.status = DeepProposalStatus.EXECUTED
+            incident.status = IncidentStatus.VALIDATING
+            incident.record(
+                LifecyclePhase.RECOVERY_VALIDATION,
+                "waiting for the settle period, then polling until recovery or timeout "
+                f"({self.ctx.validator.thresholds.timeout_seconds}s)",
+            )
+            report = await self.ctx.validator.validate(
+                incident,
+                ActionParams(namespace=proposal.target.namespace, deployment=proposal.target.deployment),
+                baseline_error_rate=evidence.error_rate,
+            )
+            sentinel_validation_result_total.labels(result=report.outcome.value).inc()
+            incident.record(
+                LifecyclePhase.RECOVERY_VALIDATION,
+                f"validation {report.outcome.value}: {report.detail}",
+                outcome=report.outcome.value,
+                failed_checks=report.failed_checks,
+                skipped_checks=report.skipped_checks,
+                elapsed_seconds=report.elapsed_seconds,
+            )
+            self._persist(incident)
+
+            if report.outcome in (ValidationOutcome.PASSED, ValidationOutcome.DEGRADED):
+                proposal.status = DeepProposalStatus.VALIDATED
+                incident.status = IncidentStatus.RESOLVED
+                incident.resolved_at = time.time()
+            else:
+                # Single, bounded attempt — like authorize_and_remediate, this
+                # does not loop into a further autonomous try with an
+                # already-consumed grant. Re-investigation/escalation is what
+                # a human does next, not this method.
+                proposal.status = DeepProposalStatus.FAILED
+                incident.status = IncidentStatus.ESCALATED
+
+            return await self._finish(incident)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("deep_authorization_internal_error")
+            incident.status = IncidentStatus.ESCALATED
+            incident.record(
+                LifecyclePhase.ESCALATION,
+                f"Sentinel hit an internal error while executing deep proposal "
+                f"authorization {authorization_id}: {type(exc).__name__}: {str(exc)[:300]}. "
+                "A human must take over.",
+                reason=EscalationReason.INTERNAL_ERROR.value,
+            )
+            self._persist(incident)
+            return incident
+        finally:
+            set_incident_id(None)
+
+    async def _maybe_deep_investigate(
+        self, incident: Incident, findings: "correlation.CorrelationFindings"
+    ) -> None:
+        """Called immediately before an escalation that means "known
+        remediation is insufficient" (no candidates, every candidate
+        denied, the action cap reached, or the lifecycle exhausted its
+        cycles without validating). Never changes WHETHER or HOW the
+        incident escalates — this only enriches an escalation that was
+        already happening with a bounded, typed, human-authorizable
+        proposal. See lifecycle/deep_investigation.py's module docstring
+        for the trust boundary this reaches through.
+        """
+        settings = self.ctx.settings
+        if not getattr(settings, "deep_investigation_enabled", True):
+            return
+        max_per_incident = getattr(settings, "deep_investigation_max_per_incident", 1)
+        if incident.deep_investigation_count >= max_per_incident:
+            return
+        if incident.evidence is None or incident.hypothesis is None:
+            return
+        if not incident.target_deployment:
+            return
+
+        incident.deep_investigation_count += 1
+        attempted_summary = sorted(
+            {
+                f"{a.plan.action.value}: "
+                + ("succeeded" if (a.result and a.result.succeeded) else "not executed or failed")
+                for a in incident.attempts
+            }
+        )
+        self._emit(
+            incident,
+            "Deep Investigation: known remediation was insufficient; asking the configured "
+            "reasoner for a bounded, typed proposal",
+            "deep_investigation_started",
+        )
+        proposal = await deep_investigation.investigate_deep(
+            incident,
+            incident.evidence,
+            incident.hypothesis,
+            attempted_summary,
+            reasoner=self.ctx.reasoner,
+            output_max_chars=getattr(settings, "deep_investigation_output_max_chars", 4000),
+        )
+        if proposal is None:
+            incident.record(
+                LifecyclePhase.ESCALATION,
+                "Deep Investigation did not produce an authorizable proposal (no reasoner "
+                "configured, the provider was unavailable, or the response failed "
+                "validation); continuing to escalate as usual.",
+            )
+            self._persist(incident)
+            return
+
+        deep_verdict = self.ctx.policy.evaluate_deep_proposal(incident, proposal)
+        if not deep_verdict.allowed:
+            proposal.status = DeepProposalStatus.REJECTED
+            proposal.rejected_reason = deep_verdict.detail
+            incident.deep_proposals.append(proposal)
+            incident.record(
+                LifecyclePhase.ESCALATION,
+                f"Deep Investigation produced a proposal but it was rejected by policy: "
+                f"{deep_verdict.detail}",
+                action_type=proposal.action_type.value,
+                denial_reason=deep_verdict.reason.value if deep_verdict.reason else None,
+            )
+            self._persist(incident)
+            return
+
+        incident.deep_proposals.append(proposal)
+        incident.record(
+            LifecyclePhase.ESCALATION,
+            f"Deep Investigation proposal ready for human authorization: {proposal.problem} "
+            f"-> {proposal.action_type.value} on {proposal.target.container}/{proposal.target.key} "
+            f"(confidence {proposal.confidence:.2f}, risk {proposal.risk_level}). This does NOT "
+            "execute automatically — an SRE must authorise it.",
+            proposal_id=proposal.id,
+            action_type=proposal.action_type.value,
+            confidence=proposal.confidence,
+            risk_level=proposal.risk_level,
+        )
+        self._emit(
+            incident,
+            f"Deep Investigation: proposal {proposal.id} ready for authorization "
+            f"({proposal.action_type.value})",
+            "deep_investigation_proposal_ready",
+        )
+        self._persist(incident)
+
     async def _run_inner(self, incident: Incident) -> Incident:
         sentinel_incidents_total.labels(
             severity=incident.severity.value, root_cause="pending"
@@ -655,9 +933,14 @@ class Orchestrator:
             self._persist(incident)
 
             # ---- OPERATIONAL MEMORY ------------------------------------
-            # Informational only: appends citations to hypothesis.supporting
-            # (see lifecycle/memory.py's module docstring for why this can
-            # never influence confidence, root cause, or the action list).
+            # Two effects, both bounded: citations appended to
+            # hypothesis.supporting (pure prose, for a human to read), and a
+            # confidence multiplier built from those same similarity matches
+            # (see lifecycle/memory.py's module docstring for why this is
+            # safe — capped at MEMORY_MAX_PENALTY_MULTIPLIER..1.0, so it can
+            # only ever make Sentinel more cautious, never less, exactly
+            # like learning.py's own bias below).
+            similar: list[memory.SimilarIncident] = []
             if incident.app:
                 try:
                     current_signature = compute_signature(evidence)
@@ -684,14 +967,18 @@ class Orchestrator:
                         "operational_memory_checked",
                     )
                     self._persist(incident)
+            memory_bias = memory.build_similarity_bias(similar)
 
             # ---- REMEDIATION DECISION ----------------------------------
             incident.status = IncidentStatus.REMEDIATING
             # Passed per call, not assigned onto the shared DecisionEngine:
             # concurrent incidents must not share mutable decision state.
+            # Two independent bounded feedback signals — see learning.py's
+            # merge_bias() docstring for why multiplying them is safe.
             learning_bias = learning.load_bias(hypothesis.root_cause, self.ctx.store)
+            combined_bias = learning.merge_bias(learning_bias, memory_bias)
             candidates = self.ctx.decision.candidates(
-                incident, hypothesis, findings, learning_bias=learning_bias
+                incident, hypothesis, findings, learning_bias=combined_bias
             )
             incident.record(
                 LifecyclePhase.REMEDIATION_DECISION,
@@ -699,10 +986,13 @@ class Orchestrator:
                 + (", ".join(c.action.value for c in candidates) or "none"),
                 candidates=[c.to_dict() for c in candidates],
                 learning_bias=learning_bias,
+                memory_bias=memory_bias,
+                combined_bias=combined_bias,
             )
             self._persist(incident)
 
             if not candidates:
+                await self._maybe_deep_investigate(incident, findings)
                 self._escalate(
                     incident,
                     EscalationReason.NO_SAFE_ACTION,
@@ -936,6 +1226,7 @@ class Orchestrator:
                         if a.verdict and a.verdict.reason
                     }
                 )
+                await self._maybe_deep_investigate(incident, findings)
                 self._escalate(
                     incident,
                     EscalationReason.NO_SAFE_ACTION,
@@ -948,6 +1239,7 @@ class Orchestrator:
                 break
 
             if incident.action_count >= self.ctx.settings.max_actions_per_incident:
+                await self._maybe_deep_investigate(incident, findings)
                 self._escalate(
                     incident,
                     EscalationReason.ACTION_CAP_REACHED,
@@ -960,6 +1252,7 @@ class Orchestrator:
                 break
         else:
             # while-loop exhausted without break.
+            await self._maybe_deep_investigate(incident, findings)
             self._escalate(
                 incident,
                 EscalationReason.VALIDATION_FAILED,

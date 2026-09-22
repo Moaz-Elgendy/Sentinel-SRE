@@ -218,3 +218,147 @@ def _require_incident_exists(request: Request, incident_id: str) -> None:
     store = request.app.state.store
     if store.get_incident(incident_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="incident not found")
+
+
+# ---------------------------------------------------------------------------
+# Deep Investigation proposals — human authorization of a novel typed action
+# (lifecycle/deep_investigation.py, models/incident.py's NovelActionType).
+#
+#   GET  /api/incidents/{incident_id}/deep-proposals
+#   POST /api/incidents/{incident_id}/deep-proposals/{proposal_id}/authorize
+#
+# Deliberately the SAME shape as the known-action authorize endpoint above,
+# reusing the same `temporary_authorizations` table (no schema change: the
+# `action` column stores "deep_remediation:<proposal_id>", unique per
+# proposal so it can never collide with a known action's own authorization
+# row) and the same IncidentManager single-writer lease. The differences are
+# exactly the differences between the two proposal shapes: there is no
+# `action` field to pick from a menu (the proposal already names its own
+# action_type/target — that is the whole point of "structured, not
+# free-form"), and there is no `human_override`-style confidence bypass:
+# `PolicyEngine.evaluate_deep_proposal` has its own confidence floor with no
+# override parameter at all (see that method's docstring).
+# ---------------------------------------------------------------------------
+AUTHORIZE_DEEP_ACTION_PREFIX = "deep_remediation:"
+
+
+async def _run_deep_authorization(
+    orchestrator: Any, incident: Incident, proposal_id: str, authorization_id: str,
+    incident_id: str, manager: Any,
+) -> None:
+    """Background wrapper. Always releases the incident lease — identical
+    pattern to `_run_authorization` above."""
+    try:
+        await orchestrator.authorize_and_remediate_deep(incident, proposal_id, authorization_id)
+    finally:
+        if manager is not None:
+            manager.release(incident_id)
+
+
+@router.get("/{incident_id}/deep-proposals")
+def list_deep_proposals(incident_id: str, request: Request) -> dict[str, Any]:
+    incident_dict = request.app.state.store.get_incident(incident_id)
+    if incident_dict is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="incident not found")
+    return {
+        "incident_id": incident_id,
+        "deep_proposals": incident_dict.get("deep_proposals") or [],
+    }
+
+
+@router.post(
+    "/{incident_id}/deep-proposals/{proposal_id}/authorize",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def authorize_deep_proposal(
+    incident_id: str,
+    proposal_id: str,
+    request: Request,
+    background: BackgroundTasks,
+    current_admin: dict = Depends(get_current_admin),
+) -> dict[str, Any]:
+    incident_dict = _require_escalated_incident(request, incident_id)
+
+    proposal = next(
+        (p for p in (incident_dict.get("deep_proposals") or []) if p.get("id") == proposal_id),
+        None,
+    )
+    if proposal is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no deep proposal {proposal_id!r} on this incident",
+        )
+    if proposal.get("status") != "suggested":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"deep proposal {proposal_id} has status {proposal.get('status')!r}, not "
+                "'suggested'; it has already been authorised, executed, or rejected"
+            ),
+        )
+
+    from app.routers.alerts import get_incident_manager  # noqa: PLC0415
+
+    manager = get_incident_manager(request)
+    if manager is not None and manager.is_running(incident_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="a lifecycle or authorized remediation is already running for this incident",
+        )
+
+    orchestrator = getattr(request.app.state, "orchestrator", None)
+    store = request.app.state.store
+    if orchestrator is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sentinel is not fully started yet"
+        )
+
+    incident = Incident.from_dict(incident_dict)
+    if manager is not None and not manager.try_acquire(incident):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="a lifecycle or authorized remediation is already running for this incident",
+        )
+
+    authorization_id = f"authz-{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    try:
+        store.create_temporary_authorization(
+            authorization_id=authorization_id,
+            incident_id=incident_id,
+            action=f"{AUTHORIZE_DEEP_ACTION_PREFIX}{proposal_id}",
+            params_json=json.dumps(proposal.get("target") or {}),
+            granted_by=current_admin["id"],
+            granted_at=now,
+            expires_at=now + AUTHORIZATION_TTL_SECONDS,
+        )
+    except Exception:
+        if manager is not None:
+            manager.release(incident_id)
+        raise
+    logger.info(
+        "deep_proposal_authorization_granted",
+        extra={
+            "incident_id": incident_id,
+            "proposal_id": proposal_id,
+            "action_type": proposal.get("action_type"),
+            "authorization_id": authorization_id,
+            "granted_by": current_admin["id"],
+        },
+    )
+
+    background.add_task(
+        _run_deep_authorization, orchestrator, incident, proposal_id, authorization_id,
+        incident_id, manager,
+    )
+
+    return {
+        "authorization_id": authorization_id,
+        "incident_id": incident_id,
+        "proposal_id": proposal_id,
+        "action_type": proposal.get("action_type"),
+        "scope": "this proposal only",
+        "permanent_policy_changed": False,
+        "expires_at": now + AUTHORIZATION_TTL_SECONDS,
+        "detail": "processing in the background; poll GET /api/incidents/{id} for progress",
+    }

@@ -50,10 +50,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.clients.kubernetes_client import SENSITIVE_ENV_KEY_MARKERS
 from app.core.metrics import sentinel_policy_denials_total
 from app.models.incident import (
     ActionParams,
     ActionPlan,
+    DeepPolicyVerdict,
+    DeepRemediationProposal,
     DenialReason,
     Incident,
     PolicyVerdict,
@@ -81,6 +84,10 @@ class PolicyConfig:
     confidence_restart: float = 0.90
     confidence_scale: float = 0.90
     confidence_chaos_reset: float = 0.90
+    # Deep Investigation / novel typed remediation — see this field's
+    # Settings-level docstring (app/core/config.py) for why it is higher
+    # than every threshold above.
+    confidence_deep_remediation: float = 0.97
     min_replicas: int = 1
     max_replicas: int = 3
     max_actions_per_incident: int = 3
@@ -99,6 +106,9 @@ class PolicyConfig:
             confidence_restart=s.confidence_threshold_restart,  # type: ignore[attr-defined]
             confidence_scale=s.confidence_threshold_scale,  # type: ignore[attr-defined]
             confidence_chaos_reset=s.confidence_threshold_chaos_reset,  # type: ignore[attr-defined]
+            confidence_deep_remediation=getattr(
+                s, "confidence_threshold_deep_remediation", 0.97
+            ),
             min_replicas=s.min_replicas,  # type: ignore[attr-defined]
             max_replicas=s.max_replicas,  # type: ignore[attr-defined]
             max_actions_per_incident=s.max_actions_per_incident,  # type: ignore[attr-defined]
@@ -402,6 +412,173 @@ class PolicyEngine:
             detail="restart authorised: target allow-listed, within action cap and "
             "cooldown, confidence above threshold",
             checks=checks,
+        )
+
+    # -- Deep Investigation / novel typed remediation ----------------------
+    def evaluate_deep_proposal(
+        self, incident: Incident, proposal: DeepRemediationProposal
+    ) -> DeepPolicyVerdict:
+        """Gate a Deep Investigation proposal for ELIGIBILITY, never for
+        autonomous execution — there is no allowed=True branch anywhere in
+        this method that means "execute this". An eligible proposal is
+        still only ever executed after a human explicitly authorises it
+        (routers/authorizations.py -> orchestrator.authorize_and_remediate_deep),
+        exactly once, exactly for this proposal.
+
+        Reuses the SAME frozen deny-lists, allow-lists and action cap as
+        `evaluate()` — a novel action is not exempt from any of Sentinel's
+        existing boundaries just because it came from a different code path
+        (see the module docstring's "no parallel systems" principle) — plus
+        one check none of the four known actions have: the proposal's
+        target must equal EXACTLY the incident's own namespace/deployment.
+        For the four known actions that would be an unusual thing to
+        enforce here (test_policy.py deliberately constructs off-target
+        plans to exercise the deny-list checks in isolation — see
+        DenialReason.BLAST_RADIUS_EXCEEDS_INCIDENT's own comment above), but
+        a Deep Investigation proposal has no such legitimate reason to ever
+        name a different target: `deep_investigation.apply_llm_response`
+        already pins the target to the incident's own before this method
+        ever sees it, so this check is defence in depth against a proposal
+        object constructed some other way (e.g. a future caller, a bug),
+        not something real proposals are expected to fail.
+        """
+        checks: dict[str, bool] = {}
+        namespace = proposal.target.namespace
+        deployment = proposal.target.deployment
+
+        if not namespace or not deployment:
+            return self._deny_deep(
+                proposal, DenialReason.MISSING_TARGET,
+                "proposal has no namespace and/or deployment target", checks,
+            )
+
+        if namespace != incident.namespace or deployment != incident.target_deployment:
+            checks["target_matches_incident"] = False
+            return self._deny_deep(
+                proposal, DenialReason.BLAST_RADIUS_EXCEEDS_INCIDENT,
+                f"proposal targets {namespace}/{deployment}, which is not this incident's "
+                f"own workload ({incident.namespace}/{incident.target_deployment}); a Deep "
+                "Investigation proposal may never act outside the incident that generated it",
+                checks,
+            )
+        checks["target_matches_incident"] = True
+
+        key = proposal.target.key or ""
+        if any(marker in key.lower() for marker in SENSITIVE_ENV_KEY_MARKERS):
+            # Independent re-check of the same rule
+            # deep_investigation.apply_llm_response already applies at
+            # construction time (see SENSITIVE_ENV_KEY_MARKERS's own
+            # docstring for why this is checked at three separate points).
+            # A proposal reaching this method should never actually fail
+            # this — it is defence in depth against a proposal built some
+            # other way, the same posture BLAST_RADIUS_EXCEEDS_INCIDENT's
+            # own comment above describes for the target-match check.
+            checks["env_var_key_not_sensitive"] = False
+            return self._deny_deep(
+                proposal, DenialReason.SENSITIVE_ENV_VAR_KEY,
+                f"proposal's environment variable {key!r} looks like a credential or "
+                "secret (matches a sensitive-key marker); Sentinel will never propose "
+                "or execute a mutation to a variable that looks like one, autonomous "
+                "or human-authorised",
+                checks,
+            )
+        checks["env_var_key_not_sensitive"] = True
+
+        if namespace in self.config.denied_namespaces:
+            checks["namespace_not_frozen_denied"] = False
+            return self._deny_deep(
+                proposal, DenialReason.NAMESPACE_FROZEN_DENY,
+                f"namespace {namespace} is on the non-configurable deny-list", checks,
+            )
+        checks["namespace_not_frozen_denied"] = True
+
+        if deployment in self.config.denied_deployments:
+            checks["deployment_not_frozen_denied"] = False
+            return self._deny_deep(
+                proposal, DenialReason.DEPLOYMENT_FROZEN_DENY,
+                f"{deployment} is on the non-configurable deny-list (stateful workload); "
+                "Sentinel will never propose or execute a mutation against it, autonomous "
+                "or human-authorised",
+                checks,
+            )
+        checks["deployment_not_frozen_denied"] = True
+
+        if namespace not in self.config.allowed_namespaces:
+            checks["namespace_allowed"] = False
+            return self._deny_deep(
+                proposal, DenialReason.NAMESPACE_NOT_ALLOWED,
+                f"namespace {namespace} is not in ALLOWED_NAMESPACES", checks,
+            )
+        checks["namespace_allowed"] = True
+
+        if deployment not in self.config.allowed_deployments:
+            checks["deployment_allowed"] = False
+            return self._deny_deep(
+                proposal, DenialReason.DEPLOYMENT_NOT_ALLOWED,
+                f"deployment {deployment} is not in ALLOWED_DEPLOYMENTS", checks,
+            )
+        checks["deployment_allowed"] = True
+
+        if incident.action_count >= self.config.max_actions_per_incident:
+            checks["action_cap"] = False
+            return self._deny_deep(
+                proposal, DenialReason.ACTION_CAP_REACHED,
+                f"this incident has already executed {incident.action_count} action(s) "
+                f"(cap {self.config.max_actions_per_incident}); a novel action does not get "
+                "a separate budget",
+                checks,
+            )
+        checks["action_cap"] = True
+
+        if proposal.confidence < self.config.confidence_deep_remediation:
+            checks["confidence"] = False
+            return self._deny_deep(
+                proposal, DenialReason.CONFIDENCE_TOO_LOW,
+                f"proposal confidence {proposal.confidence:.2f} is below the "
+                f"{self.config.confidence_deep_remediation:.2f} threshold required for a "
+                "novel action to even be offered to a human for authorization "
+                "(there is no human-override path for this check — an under-confident "
+                "proposal is never shown, not merely never auto-executed)",
+                checks,
+            )
+        checks["confidence"] = True
+
+        return DeepPolicyVerdict(
+            allowed=True,
+            action_type=proposal.action_type,
+            detail=(
+                f"proposal eligible for human authorization: target matches the incident's "
+                f"own workload, is allow-listed, confidence {proposal.confidence:.2f} >= "
+                f"{self.config.confidence_deep_remediation:.2f}, and the action cap has "
+                "room. This does NOT execute anything — a human must still explicitly "
+                "authorise it."
+            ),
+            checks=checks,
+        )
+
+    @staticmethod
+    def _deny_deep(
+        proposal: DeepRemediationProposal,
+        reason: DenialReason,
+        detail: str,
+        checks: dict[str, bool],
+    ) -> DeepPolicyVerdict:
+        sentinel_policy_denials_total.labels(
+            action=f"deep:{proposal.action_type.value}", reason=reason.value
+        ).inc()
+        logger.warning(
+            "deep_policy_denied",
+            extra={
+                "action_type": proposal.action_type.value,
+                "denial_reason": reason.value,
+                "namespace": proposal.target.namespace,
+                "deployment": proposal.target.deployment,
+                "confidence": proposal.confidence,
+            },
+        )
+        return DeepPolicyVerdict(
+            allowed=False, action_type=proposal.action_type, reason=reason,
+            detail=detail, checks=checks,
         )
 
     # -- per-action preconditions -----------------------------------------

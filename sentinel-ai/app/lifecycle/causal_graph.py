@@ -29,9 +29,20 @@ what KIND of link it is, and the kinds are never blurred:
                     `llm_note` fields) - never raw LLM chain-of-thought,
                     because those fields never held that in the first place.
   * "action"      - a remediation candidate: proposed, and (if a verdict
-                    exists) allowed or denied, with the real reason.
+                    exists) allowed or denied, with the real reason. Covers
+                    both a known RemediationAction the Decision Engine
+                    proposed and a Deep Investigation's
+                    DeepRemediationProposal (lifecycle/deep_investigation.py)
+                    — the same kind, because from this graph's perspective
+                    both are "something Sentinel proposed doing about this
+                    incident"; `detail.source` says which, and a deep
+                    proposal's `detail.status` carries its own richer
+                    lifecycle (suggested/authorized/.../rejected) rather than
+                    the known-action allowed/denied shape.
   * "outcome"     - what actually happened after an action executed:
-                    RemediationResult + ValidationReport.
+                    RemediationResult + ValidationReport, or (for a Deep
+                    Investigation proposal) the equivalent DeepRemediationResult
+                    + ValidationReport once a human has authorised it.
 
 A GUI (or any other consumer) can therefore render fact edges as solid lines
 and correlation/hypothesis edges as visually distinct from them, without this
@@ -41,7 +52,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.models.incident import Incident
+from app.models.incident import DeepProposalStatus, Incident
 
 
 def _add_node(
@@ -273,8 +284,14 @@ def build_causal_graph(incident: Incident) -> dict[str, Any]:
                 _add_edge(edges, target, hypothesis_id, "hypothesis", "supports", evidence=list(h.supporting))
         _add_edge(edges, alert_id, hypothesis_id, "hypothesis", "explains")
 
-    # Actions and outcomes: one pair of nodes per attempt, in order.
+    # Actions and outcomes: one pair of nodes per attempt, in order. Tracks
+    # the most recent outcome BY TIME (not just the last attempt in the
+    # list), because a Deep Investigation proposal — appended below — can
+    # execute after every known-action attempt and become the incident's
+    # real final outcome; whichever happened last is what the closing
+    # "resolves" / "did not fully resolve" edge must point from.
     previous_outcome_id: str | None = None
+    last_outcome_at: float | None = None
     for i, attempt in enumerate(incident.attempts):
         plan = attempt.plan
         action_id = _add_node(
@@ -285,6 +302,7 @@ def build_causal_graph(incident: Incident) -> dict[str, Any]:
             plan.action.value.replace("_", " "),
             at=attempt.at,
             detail={
+                "source": "known_action",
                 "confidence": plan.confidence,
                 "rationale": plan.rationale,
                 "namespace": plan.params.namespace,
@@ -324,7 +342,76 @@ def build_causal_graph(incident: Incident) -> dict[str, Any]:
             },
         )
         _add_edge(edges, action_id, outcome_id, "action", "executed")
-        previous_outcome_id = outcome_id
+        if last_outcome_at is None or attempt.result.started_at >= last_outcome_at:
+            previous_outcome_id = outcome_id
+            last_outcome_at = attempt.result.started_at
+
+    # Deep Investigation proposals: the same action/outcome shape as above,
+    # reusing this graph rather than a parallel view (see this module's own
+    # "no parallel systems" design note). A proposal is generated only once
+    # known remediation was insufficient (lifecycle/deep_investigation.py),
+    # so it hangs off the same hypothesis node, not off the last known
+    # action — a deep proposal is a response to the diagnosis being
+    # insufficient to act on safely, not a continuation of one specific
+    # rejected attempt.
+    for proposal in incident.deep_proposals:
+        target = proposal.target
+        deep_action_id = _add_node(
+            nodes,
+            seen,
+            f"deep_action:{proposal.id}",
+            "action",
+            proposal.action_type.value.replace("_", " "),
+            at=proposal.created_at,
+            detail={
+                "source": "deep_investigation",
+                "status": proposal.status.value,
+                "confidence": proposal.confidence,
+                "risk_level": proposal.risk_level,
+                "reason": proposal.reason,
+                "namespace": target.namespace,
+                "deployment": target.deployment,
+                "container": target.container,
+                "env_var": target.key,
+                "rejected_reason": proposal.rejected_reason or "",
+            },
+        )
+        if hypothesis_id:
+            _add_edge(
+                edges, hypothesis_id, deep_action_id, "hypothesis",
+                "insufficient for known remediation; deep investigation proposed",
+            )
+
+        if proposal.status not in (
+            DeepProposalStatus.EXECUTED,
+            DeepProposalStatus.VALIDATED,
+            DeepProposalStatus.FAILED,
+        ):
+            # Still suggested (or authorized/executing at the moment of this
+            # snapshot), or rejected by policy before ever touching the
+            # cluster — either way, nothing happened yet to have an outcome.
+            continue
+
+        deep_outcome_id = _add_node(
+            nodes,
+            seen,
+            f"deep_outcome:{proposal.id}",
+            "outcome",
+            "recovered" if proposal.status == DeepProposalStatus.VALIDATED else "outcome",
+            # DeepRemediationProposal has no separate "executed at" field —
+            # created_at is the closest available timestamp, and since this
+            # is a single, short-lived, human-authorized action (see
+            # AUTHORIZATION_TTL_SECONDS in routers/authorizations.py) it is
+            # never far from when execution actually happened.
+            at=proposal.created_at,
+            detail={
+                "result_detail": proposal.result_detail,
+            },
+        )
+        _add_edge(edges, deep_action_id, deep_outcome_id, "action", "executed")
+        if last_outcome_at is None or proposal.created_at >= last_outcome_at:
+            previous_outcome_id = deep_outcome_id
+            last_outcome_at = proposal.created_at
 
     if previous_outcome_id:
         _add_edge(

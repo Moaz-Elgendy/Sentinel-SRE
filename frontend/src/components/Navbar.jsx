@@ -22,9 +22,6 @@ export default function Navbar() {
           <NavLink to="/services" className="navbar-link">
             Services
           </NavLink>
-          <NavLink to="/chaos" className="navbar-link">
-            Chaos
-          </NavLink>
           {isAuthenticated && (
             <NavLink to="/requests" className="navbar-link">
               My Requests

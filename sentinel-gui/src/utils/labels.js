@@ -37,6 +37,37 @@ export const DENIAL_REASON = {
   missing_target: 'No target identified',
   no_chaos_surface: 'No chaos control surface',
   unknown_action: 'Unknown action',
+  blast_radius_exceeds_incident: 'Targets outside this incident’s own workload',
+  sensitive_env_var_key: 'Targets a credential-like variable',
+}
+
+// Deep Investigation's closed action set (models/incident.py's
+// NovelActionType) — deliberately just two members; see that enum's
+// docstring for why it never grows without touching the typed dispatch too.
+export const NOVEL_ACTION = {
+  set_env_var: 'Set environment variable',
+  unset_env_var: 'Remove environment variable',
+}
+
+// lifecycle/deep_investigation.py's `_assess_deep_risk` — never "low": a
+// proposal that reached a human always carries at least "moderate" because
+// it was never rule-vetted the way the four known actions are.
+export const RISK_LEVEL = {
+  low: 'Low risk',
+  moderate: 'Moderate risk',
+  high: 'High risk',
+}
+export const RISK_LEVEL_TONE = { low: 'ok', moderate: 'warn', high: 'bad' }
+
+export const DEEP_PROPOSAL_STATUS = {
+  suggested: 'Awaiting authorization',
+  authorized: 'Authorized',
+  executing: 'Executing',
+  executed: 'Executed',
+  validated: 'Validated',
+  failed: 'Failed',
+  rejected: 'Rejected',
+  expired: 'Expired',
 }
 
 // Policy Engine checks (lifecycle/policy.py). `true` = passed.
@@ -81,3 +112,6 @@ export const escalationReasonLabel = (key) => ESCALATION_REASON[key] ?? sentence
 export const denialReasonLabel = (key) => DENIAL_REASON[key] ?? sentenceCase(key)
 export const policyCheckLabel = (key) => POLICY_CHECK[key] ?? sentenceCase(key)
 export const llmStatusLabel = (key) => LLM_STATUS[key] ?? sentenceCase(key)
+export const novelActionLabel = (key) => NOVEL_ACTION[key] ?? sentenceCase(key)
+export const riskLevelLabel = (key) => RISK_LEVEL[key] ?? sentenceCase(key)
+export const deepProposalStatusLabel = (key) => DEEP_PROPOSAL_STATUS[key] ?? sentenceCase(key)

@@ -70,8 +70,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.lifecycle import correlation, learning, rca, risk
+from app.lifecycle import correlation, learning, memory, rca, risk
 from app.lifecycle.decision import DecisionEngine
+from app.lifecycle.evidence_signature import compute_signature
 from app.lifecycle.policy import PolicyContext, PolicyEngine
 from app.models.incident import Incident
 
@@ -123,6 +124,7 @@ class ReplayResult:
     recorded_root_cause: str | None
     hypothesis_root_cause_changed: bool
     learning_bias: dict[str, float]
+    memory_bias: dict[str, float]
     candidates: list[CandidateReplay]
     chosen_action: str | None
     would_escalate: bool
@@ -138,6 +140,7 @@ class ReplayResult:
             "recorded_root_cause": self.recorded_root_cause,
             "hypothesis_root_cause_changed": self.hypothesis_root_cause_changed,
             "learning_bias": self.learning_bias,
+            "memory_bias": self.memory_bias,
             "candidates": [c.to_dict() for c in self.candidates],
             "chosen_action": self.chosen_action,
             "would_escalate": self.would_escalate,
@@ -156,6 +159,7 @@ def _empty_result(incident: Incident, *, from_scratch: bool, replayed_at: float,
         recorded_root_cause=recorded.root_cause.value if recorded else None,
         hypothesis_root_cause_changed=False,
         learning_bias={},
+        memory_bias={},
         candidates=[],
         chosen_action=None,
         would_escalate=True,
@@ -181,9 +185,22 @@ def replay_incident(
     evidence. Never executes, never calls a live client. See module
     docstring for the full set of design decisions behind this.
 
-    `store` needs only the two read-only methods this already calls in
-    production (`recent_executed_actions`, and whatever `learning.load_bias`
-    calls) — the same `SQLiteStore` the orchestrator already holds.
+    `store` needs only the read-only methods this already calls in
+    production (`recent_executed_actions`, whatever `learning.load_bias`
+    calls, and `list_terminal_incidents_for_app` for the same operational-
+    memory similarity lookup the live orchestrator does) — the same
+    `SQLiteStore` the orchestrator already holds. Both `learning_bias` and
+    `memory_bias` read the store's CURRENT accumulated history, not a
+    snapshot from when this incident actually ran. That is a deliberate,
+    pre-existing choice (`learning_bias` already worked this way): this
+    module answers "what would Sentinel decide about this evidence, using
+    everything it has learned since" rather than "what would Sentinel have
+    decided at the time" — the latter would need a second historical store
+    snapshot this codebase does not keep. `memory_bias` follows the same
+    rule for consistency, and combining the two the same way the live
+    orchestrator does (`learning.merge_bias`) is what keeps replay an
+    honest preview of live behaviour rather than a second, drifting
+    implementation of it.
     `recovery_validation_available`/`chaos_surface_available` are plain
     booleans the caller computes once for this incident's fixed target
     (`RecoveryValidator.is_available_for(target)`, and the chaos-surface
@@ -231,6 +248,20 @@ def replay_incident(
 
     learning_bias = learning.load_bias(hypothesis.root_cause, store)
 
+    memory_bias: dict[str, float] = {}
+    if incident.app:
+        try:
+            current_signature = compute_signature(evidence)
+            past_records = store.list_terminal_incidents_for_app(
+                incident.app, exclude_incident_id=incident.id
+            )
+            similar = memory.find_similar_incidents(current_signature, past_records)
+            memory_bias = memory.build_similarity_bias(similar)
+        except Exception as exc:  # noqa: BLE001 - memory is never load-bearing, even in replay
+            notes.append(f"operational memory lookup failed during replay: {str(exc)[:200]}")
+            memory_bias = {}
+    combined_bias = learning.merge_bias(learning_bias, memory_bias)
+
     decision_incident = incident
     if from_scratch and incident.attempts:
         decision_incident = dataclasses.replace(incident, attempts=[])
@@ -240,7 +271,7 @@ def replay_incident(
         )
 
     plans = DecisionEngine(min_replicas=min_replicas, max_replicas=max_replicas).candidates(
-        decision_incident, hypothesis, findings, learning_bias=learning_bias
+        decision_incident, hypothesis, findings, learning_bias=combined_bias
     )
 
     if not plans:
@@ -253,6 +284,7 @@ def replay_incident(
             recorded_root_cause=recorded_root_cause,
             hypothesis_root_cause_changed=root_cause_changed,
             learning_bias=learning_bias,
+            memory_bias=memory_bias,
             candidates=[],
             chosen_action=None,
             would_escalate=True,
@@ -325,6 +357,7 @@ def replay_incident(
         recorded_root_cause=recorded_root_cause,
         hypothesis_root_cause_changed=root_cause_changed,
         learning_bias=learning_bias,
+        memory_bias=memory_bias,
         candidates=candidate_replays,
         chosen_action=chosen_action,
         would_escalate=chosen_action is None,
