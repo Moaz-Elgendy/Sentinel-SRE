@@ -657,6 +657,36 @@ jobs:
       contents: read
       id-token: write
     steps:
+      # fetch-depth: 0 so the diff below can reach github.event.before, even
+      # on a push that is more than one commit ahead of the previous run.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect k8s manifest changes
+        id: k8s-diff
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+
+          # All-zeros `before` happens on a repo's first push or a
+          # force-push whose old tip is gone — there is nothing sane to
+          # diff against. Treat it as "changed": syncing+applying the
+          # current manifests unconditionally is always correct, it is
+          # only sometimes unnecessary.
+          if [ -z "${before}" ] || [ "${before}" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${before}" 2>/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "no usable previous commit to diff against; treating k8s/ as changed"
+          elif git diff --quiet "${before}" "${{ github.sha }}" -- k8s/; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no changes under k8s/ in this push"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "k8s/ changed:"
+            git diff --name-only "${before}" "${{ github.sha }}" -- k8s/
+          fi
+
       - name: Assume AWS role via OIDC
         uses: aws-actions/configure-aws-credentials@v5
         with:
@@ -664,7 +694,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-deploy-${{ github.run_id }}
 
-      - name: Sync sentinel-deploy.sh on the node (best-effort)
+      - name: Sync scripts/ on the node (best-effort)
         id: sync
         run: |
           set -euo pipefail
@@ -672,8 +702,8 @@ jobs:
           command_id=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Sync sentinel-deploy.sh to ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}" \
-            --parameters commands="/usr/local/bin/sentinel-deploy.sh sync ${GITHUB_SHA}" \
+            --comment "Sync scripts/ to ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}" \
+            --parameters commands="/usr/local/bin/sentinel-deploy.sh sync-scripts ${GITHUB_SHA}" \
             --query "Command.CommandId" --output text)
 
           echo "SSM command: ${command_id}"
@@ -698,10 +728,11 @@ jobs:
             --query StandardErrorContent --output text || true
 
           if [ "${status}" != "Success" ]; then
-            echo "::warning::sentinel-deploy.sh sync did not succeed (status: ${status})." \
-              "images mode will still run against whatever version of the script is" \
-              "currently installed on the node. If this is the very first run after" \
-              "adding 'sync' mode, this is expected once — see docs/aws-deployment.md."
+            echo "::warning::scripts/ sync did not succeed (status: ${status})." \
+              "The deploy step below will still run against whatever version of" \
+              "scripts/ is currently on the node. If this is the very first run" \
+              "after adding 'sync-scripts' mode, this is expected once — see" \
+              "docs/aws-deployment.md."
           fi
           # Deliberately always exit 0: sync is a best-effort freshness step,
           # never a gate on the deploy that follows.
@@ -711,11 +742,25 @@ jobs:
         run: |
           set -euo pipefail
 
+          # k8s/ changed this push -> sync only the tracked *.yaml under
+          # k8s/ from this commit (never the live k8s/overlays/aws/secrets/
+          # *.env — those are gitignored/untracked, so `git checkout` can't
+          # touch them) and apply the rendered overlay. Otherwise this is a
+          # normal code-only push: `set image` only, same as before, so the
+          # ReplicaSet history Sentinel relies on is unaffected either way.
+          if [ "${{ steps.k8s-diff.outputs.changed }}" = "true" ]; then
+            deploy_cmd="/usr/local/bin/sentinel-deploy.sh sync-manifests ${GITHUB_SHA} && /usr/local/bin/sentinel-deploy.sh apply-manifests ${GITHUB_SHA}"
+            comment="Deploy ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID} (k8s manifests changed)"
+          else
+            deploy_cmd="/usr/local/bin/sentinel-deploy.sh images ${GITHUB_SHA}"
+            comment="Deploy ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}"
+          fi
+
           command_id=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}" \
-            --parameters commands="/usr/local/bin/sentinel-deploy.sh images ${GITHUB_SHA}" \
+            --comment "${comment}" \
+            --parameters commands="${deploy_cmd}" \
             --query "Command.CommandId" --output text)
 
           echo "command_id=${command_id}" >> "$GITHUB_OUTPUT"
@@ -757,8 +802,12 @@ jobs:
 
       - name: Note what this job does and does not prove
         run: |
+          if [ "${{ steps.k8s-diff.outputs.changed }}" = "true" ]; then
+            echo "k8s/ changed this push: manifests were synced and applied (sync-manifests + apply-manifests)."
+          else
+            echo "No k8s/ changes this push: only image tags were updated (images mode)."
+          fi
           cat <<'EOF'
-          The new image tags have been applied to the Deployments.
 
           This does NOT assert the rollout became healthy, and that is
           deliberate: a bad deployment is a scenario this project exists to

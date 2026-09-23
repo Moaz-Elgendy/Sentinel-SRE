@@ -3,15 +3,64 @@
 # node, or refresh this script itself on the node.
 #
 # Usage:
-#   sentinel-deploy.sh images <git-sha>   # roll the app/Sentinel images to <git-sha>
-#   sentinel-deploy.sh apply <git-sha>    # git checkout <git-sha> + kubectl apply -k
-#   sentinel-deploy.sh sync  <git-sha>    # refresh THIS script on the node from <git-sha>
+#   sentinel-deploy.sh images         <git-sha>  # roll the app/Sentinel images to <git-sha>
+#   sentinel-deploy.sh apply          <git-sha>  # full git checkout <git-sha> + kubectl apply -k
+#   sentinel-deploy.sh sync-manifests <git-sha>  # refresh ONLY k8s/**/*.yaml from <git-sha>
+#   sentinel-deploy.sh apply-manifests <git-sha> # render+substitute+apply whatever is on disk now
+#   sentinel-deploy.sh sync-scripts   <git-sha>  # replace scripts/ (incl. deletions) from <git-sha>
+#   sentinel-deploy.sh sync  <git-sha>    # refresh THIS script on the node from <git-sha> (narrow;
+#                                          # superseded for CI's purposes by sync-scripts above,
+#                                          # kept for any existing manual/documented use)
 #
-# "images" is the normal CI path: it changes only the container images,
-# which produces a clean new ReplicaSet and therefore real rollout history
-# for Sentinel to correlate against and roll back to.
+# "images" is the normal CI path when a push touches no k8s/ files: it
+# changes only the container images, which produces a clean new ReplicaSet
+# and therefore real rollout history for Sentinel to correlate against and
+# roll back to.
 #
-# "apply" is for manifest changes and requires the checkout in ${REPO_DIR}.
+# "apply" is the original manifest-change path: a full `git checkout
+# --detach` of the WHOLE repository at ${REPO_DIR}, then render+apply. Left
+# in place for manual/operator use over SSM (see docs/aws-deployment.md) —
+# it still works exactly as before.
+#
+# "sync-manifests" + "apply-manifests" are the CI-automated manifest-change
+# path (see .github/workflows/ci-cd.yml's deploy-to-k3s job), split into two
+# steps deliberately narrower than "apply":
+#   * sync-manifests does `git checkout <sha> -- k8s` — this touches ONLY
+#     tracked files under k8s/, never anything else in the repo (no
+#     citizen-service/, no infra/terraform/, etc). `git checkout <path>`
+#     only ever writes paths that are tracked by git, so this can never
+#     touch k8s/overlays/aws/secrets/*.env — those are gitignored
+#     (untracked) precisely so a manifest sync can never overwrite the real,
+#     live secret values on the node. Only the *.env.example templates are
+#     tracked, and syncing them is harmless.
+#     Known limitation, accepted deliberately: `git checkout -- <path>` only
+#     adds/updates files, it cannot remove one that no longer exists at
+#     <sha> — an orphaned manifest can linger on disk. That is judged safe
+#     because Kustomize only ever reads files a kustomization.yaml actually
+#     lists as a resource; an unreferenced leftover file is inert. The
+#     alternative (wipe k8s/ and re-extract) is NOT used here, because it
+#     would also delete the live secrets/*.env sitting inside
+#     k8s/overlays/aws/secrets/ — exactly what must never happen.
+#   * apply-manifests does the render+substitute+apply from whatever is
+#     already on disk at ${REPO_DIR}/k8s — it does NOT check anything out
+#     itself, so it must be run right after sync-manifests.
+#
+# "sync-scripts" keeps scripts/ current on the node. Two things read it live
+# at runtime, not just at deploy time:
+#   * The external Sentinel EC2's chaos-scenario runner SSMs into THIS node
+#     and runs `cd /opt/sentinel-sre && ./scripts/incident-scenarios.sh ...`
+#     on demand, whenever an operator triggers a scenario from the Sentinel
+#     GUI (see sentinel-ai/app/routers/chaos_scenarios.py). A stale copy
+#     here silently runs old scenario logic.
+#   * scripts/deploy-aws.sh and scripts/generate-aws-secrets.sh are the
+#     documented manual-operator entry points (docs/aws-deployment.md),
+#     invoked directly from this checkout over an SSM session.
+# Unlike k8s/, scripts/ has no untracked subtree that must be protected, so
+# it is safe to fully replace: `git archive <sha> -- scripts | tar -x`
+# extracts exactly what is in that commit — including removing a file that
+# was deleted there, which `git checkout -- <path>` cannot do. This also
+# reinstalls /usr/local/bin/sentinel-deploy.sh, so it supersedes the
+# original narrow "sync" mode below for CI's purposes.
 #
 # "sync" exists because this script is installed on the node once, at first
 # boot, by Terraform (see infra/terraform/user_data.sh.tftpl, which embeds
@@ -43,8 +92,8 @@
 set -euo pipefail
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-MODE="${1:?usage: sentinel-deploy.sh <images|apply|sync> <git-sha>}"
-SHA="${2:?usage: sentinel-deploy.sh <images|apply|sync> <git-sha>}"
+MODE="${1:?usage: sentinel-deploy.sh <images|apply|sync-manifests|apply-manifests|sync-scripts|sync> <git-sha>}"
+SHA="${2:?usage: sentinel-deploy.sh <images|apply|sync-manifests|apply-manifests|sync-scripts|sync> <git-sha>}"
 
 # Fixed for this environment — mirrors infra/terraform/variables.tf's
 # app_namespace/project_name defaults and ec2.tf's repo_dir. These three
@@ -54,6 +103,49 @@ SHA="${2:?usage: sentinel-deploy.sh <images|apply|sync> <git-sha>}"
 NS="citizen-portal"
 PREFIX="sentinel-sre-demo"
 REPO_DIR="/opt/sentinel-sre"
+
+# Shared by "apply" and "apply-manifests": render k8s/overlays/aws with
+# Kustomize, substitute the four placeholders with values discovered from
+# this instance (never hardcoded), fail loudly if any placeholder survives,
+# then apply the rendered output. Assumes ${REPO_DIR}/k8s is already at the
+# manifests the caller wants applied — it does not check anything out
+# itself. Must be run from ${REPO_DIR}.
+render_and_apply() {
+  local sha="$1"
+  local token aws_region aws_account_id public_ip ecr_registry sentinel_api_upstream rendered
+
+  token="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')"
+  aws_region="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
+    http://169.254.169.254/latest/meta-data/placement/region)"
+  aws_account_id="$(aws sts get-caller-identity --query Account --output text --region "${aws_region}")"
+  public_ip="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
+    http://169.254.169.254/latest/meta-data/public-ipv4)"
+  ecr_registry="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com"
+  # Same default as deploy-aws.sh: the in-cluster topology's Service DNS
+  # name. Set SENTINEL_API_UPSTREAM in the environment before calling this
+  # for the external-control-plane topology — see docs/aws-deployment.md.
+  sentinel_api_upstream="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
+
+  rendered="$(mktemp)"
+  trap 'rm -f "${rendered}"' RETURN
+  kubectl kustomize k8s/overlays/aws \
+    | sed -e "s|ACCOUNT_ID\.dkr\.ecr\.REGION\.amazonaws\.com|${ecr_registry}|g" \
+          -e "s|:PLACEHOLDER|:${sha}|g" \
+          -e "s|PUBLIC_IP_PLACEHOLDER|${public_ip}|g" \
+          -e "s|SENTINEL_API_UPSTREAM_PLACEHOLDER|${sentinel_api_upstream}|g" \
+    > "${rendered}"
+
+  # Fail-loud guard: a survived placeholder must stop the deploy, not
+  # silently reach the cluster.
+  if grep -qE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${rendered}"; then
+    echo "ERROR: unsubstituted placeholders remain in the rendered manifests:" >&2
+    grep -nE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${rendered}" >&2
+    return 1
+  fi
+
+  kubectl apply -f "${rendered}"
+}
 
 case "${MODE}" in
   images)
@@ -118,39 +210,9 @@ case "${MODE}" in
     # reach Sentinel at all — alerts fire and never become incidents, and
     # nothing about that looks like a deploy failure. This mode must not
     # skip the substitution step deploy-aws.sh already gets right.
-    token="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' \
-      -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')"
-    AWS_REGION="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
-      http://169.254.169.254/latest/meta-data/placement/region)"
-    AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region "${AWS_REGION}")"
-    PUBLIC_IP="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
-      http://169.254.169.254/latest/meta-data/public-ipv4)"
-    ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-    # Same default as deploy-aws.sh: the in-cluster topology's Service DNS
-    # name. Set SENTINEL_API_UPSTREAM in the environment before calling this
-    # (e.g. `SENTINEL_API_UPSTREAM=http://<sentinel-private-ip>:8080 sudo -E
-    # sentinel-deploy.sh apply <sha>`) for the external-control-plane
-    # topology — see docs/aws-deployment.md.
-    SENTINEL_API_UPSTREAM="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
-
-    RENDERED="$(mktemp)"
-    trap 'rm -f "${RENDERED}"' EXIT
-    kubectl kustomize k8s/overlays/aws \
-      | sed -e "s|ACCOUNT_ID\.dkr\.ecr\.REGION\.amazonaws\.com|${ECR_REGISTRY}|g" \
-            -e "s|:PLACEHOLDER|:${SHA}|g" \
-            -e "s|PUBLIC_IP_PLACEHOLDER|${PUBLIC_IP}|g" \
-            -e "s|SENTINEL_API_UPSTREAM_PLACEHOLDER|${SENTINEL_API_UPSTREAM}|g" \
-      > "${RENDERED}"
-
-    # Same fail-loud guard as deploy-aws.sh: a survived placeholder must
-    # stop the deploy, not silently reach the cluster.
-    if grep -qE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${RENDERED}"; then
-      echo "ERROR: unsubstituted placeholders remain in the rendered manifests:" >&2
-      grep -nE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${RENDERED}" >&2
+    if ! render_and_apply "${SHA}"; then
       exit 1
     fi
-
-    kubectl apply -f "${RENDERED}"
 
     # A manifest-changing deploy is exactly the moment to also refresh this
     # script from the checkout, since the checkout is already at ${SHA}.
@@ -159,6 +221,56 @@ case "${MODE}" in
     if [ -f scripts/sentinel-deploy.sh ]; then
       install -m 0755 scripts/sentinel-deploy.sh /usr/local/bin/sentinel-deploy.sh
     fi
+    ;;
+  sync-manifests)
+    # CI-automated, narrower sibling of "apply": refresh ONLY tracked files
+    # under k8s/ from the checkout at ${SHA}. `git checkout <sha> -- k8s`
+    # writes exactly the tracked paths under k8s/ and nothing outside it —
+    # no citizen-service/, no infra/terraform/, no HEAD move. Because git
+    # checkout of a pathspec only ever touches paths git tracks, and
+    # k8s/overlays/aws/secrets/*.env is gitignored (untracked — only the
+    # *.env.example templates are tracked), this can never overwrite the
+    # real, live secret values already on the node. Run apply-manifests
+    # immediately after this to actually apply what was just synced.
+    if [ ! -d "${REPO_DIR}/.git" ]; then
+      echo "ERROR: ${REPO_DIR} is not a git checkout; cannot sync." >&2
+      echo "See docs/aws-deployment.md for populating it (private repo)." >&2
+      exit 1
+    fi
+    cd "${REPO_DIR}"
+    git fetch --all --tags --quiet
+    git checkout --quiet "${SHA}" -- k8s
+    echo "k8s manifests synced to ${SHA} (secrets/*.env untouched — untracked):"
+    git show --stat --oneline "${SHA}" -- k8s | head -n -1 || true
+    ;;
+  apply-manifests)
+    # Render+substitute+apply whatever is currently on disk at
+    # ${REPO_DIR}/k8s/overlays/aws. Deliberately does NOT check anything out
+    # itself — pair this with sync-manifests immediately before it (CI
+    # always calls them back to back; see ci-cd.yml's deploy-to-k3s job).
+    cd "${REPO_DIR}"
+    if ! render_and_apply "${SHA}"; then
+      exit 1
+    fi
+    ;;
+  sync-scripts)
+    # Fully replace scripts/ from the checkout at ${SHA} — additions,
+    # edits, AND deletions (see the header comment for why this is safe
+    # here but not for k8s/). Then reinstall the deploy script itself, same
+    # as the original narrow "sync" mode did.
+    if [ ! -d "${REPO_DIR}/.git" ]; then
+      echo "ERROR: ${REPO_DIR} is not a git checkout; cannot sync." >&2
+      echo "See docs/aws-deployment.md for populating it (private repo)." >&2
+      exit 1
+    fi
+    cd "${REPO_DIR}"
+    git fetch --all --tags --quiet
+    rm -rf scripts
+    git archive "${SHA}" -- scripts | tar -x
+    if [ -f scripts/sentinel-deploy.sh ]; then
+      install -m 0755 scripts/sentinel-deploy.sh /usr/local/bin/sentinel-deploy.sh
+    fi
+    echo "scripts/ synced to ${SHA} (including deletions)"
     ;;
   sync)
     # Refresh /usr/local/bin/sentinel-deploy.sh itself from the repository
@@ -182,10 +294,11 @@ case "${MODE}" in
     ;;
 esac
 
-# Deliberately NOT waiting for rollout success here (images/apply modes). A
-# bad deployment is a scenario this project exists to demonstrate: CI's job
-# is to deploy, and Sentinel's job is to notice and remediate. Blocking CI
-# on rollout status would mask exactly the failure mode we want observed.
-if [ "${MODE}" != "sync" ]; then
+# Deliberately NOT waiting for rollout success here (images/apply/
+# apply-manifests modes). A bad deployment is a scenario this project
+# exists to demonstrate: CI's job is to deploy, and Sentinel's job is to
+# notice and remediate. Blocking CI on rollout status would mask exactly
+# the failure mode we want observed.
+if [ "${MODE}" != "sync" ] && [ "${MODE}" != "sync-manifests" ] && [ "${MODE}" != "sync-scripts" ]; then
   kubectl -n "${NS}" get deployments -o wide
 fi
