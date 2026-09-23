@@ -267,6 +267,23 @@ class KubernetesClient:
                 {
                     "name": c.name,
                     "env": _redacted_env(c.env or []),
+                    # Added for the Deep Investigation typed remediation DSL
+                    # (models/incident.py's NovelActionType /
+                    # deep_investigation.apply_llm_response): a proposal to
+                    # change one container's image, or to override its
+                    # command/args, needs the CURRENT value of that exact
+                    # field, per container, to validate against and to
+                    # capture as `previous_*` for revert — the top-level
+                    # `images` list above is container-order-only and not
+                    # keyed by name, which is not enough once a Deployment
+                    # can have more than one container carrying independent
+                    # evidence. `command`/`args` are the container's own
+                    # override (empty list if unset — never `None` vs `[]`
+                    # ambiguity leaking through the API client), never
+                    # resolved through a shell.
+                    "image": c.image,
+                    "command": list(c.command or []),
+                    "args": list(c.args or []),
                 }
                 for c in (spec.template.spec.containers or [])
             ],
@@ -917,6 +934,153 @@ class KubernetesClient:
         )
         return {"key": key, "generation": result.metadata.generation}
 
+    # ---- Deep Investigation / novel typed remediation: the four newer
+    # DSL operations (see models/incident.py's NovelActionType). Same posture
+    # as patch_deployment_env_var/remove_deployment_env_var above: each is a
+    # strategic-merge patch naming exactly ONE container by its merge key
+    # (`name`), touching exactly the one field this method exists for, and
+    # nothing else on that container or any other one.
+    async def patch_deployment_container_image(
+        self, namespace: str, name: str, container: str, image: str
+    ) -> dict[str, Any]:
+        """Change one container's image — the write side of
+        UPDATE_CONTAINER_IMAGE.
+
+        Refuses (raises `InvalidContainerImage`, caught by RemediationEngine
+        exactly like `InvalidRollbackTemplate` is) to send a syntactically
+        invalid or placeholder image reference, using the SAME
+        `_looks_like_a_valid_image_reference` check `patch_deployment_template`
+        already applies to a rollback's source template. This is defence in
+        depth: `deep_investigation.apply_llm_response` and
+        `RemediationEngine.execute_deep` both already validate the image
+        independently before this is ever called — this is the last gate
+        immediately before the write, not the only one.
+        """
+        self._require()
+        if not _looks_like_a_valid_image_reference(image):
+            raise InvalidContainerImage(
+                f"refusing to patch {namespace}/{name} container {container}: "
+                f"{image!r} is not a plausible container image reference"
+            )
+        body = {
+            "spec": {
+                "template": {
+                    "spec": {"containers": [{"name": container, "image": image}]}
+                }
+            }
+        }
+
+        def _call() -> Any:
+            return self._apps.patch_namespaced_deployment(
+                name=name, namespace=namespace, body=body
+            )
+
+        result = await asyncio.to_thread(_call)
+        logger.info(
+            "k8s_container_image_patched",
+            extra={
+                "namespace": namespace,
+                "deployment": name,
+                "container": container,
+                "image": image,
+            },
+        )
+        return {"image": image, "generation": result.metadata.generation}
+
+    # Bounds on the size of a proposed command/args override — the same
+    # "evidence collector, not a log viewer" posture as MAX_LOG_TAIL_LINES:
+    # a real entrypoint override is a handful of short tokens, never a
+    # sprawling script, and there is no `sh -c` anywhere in this codebase for
+    # a long string to be interpreted by in the first place.
+    MAX_ARGV_ITEMS = 20
+    MAX_ARGV_ITEM_LEN = 512
+
+    @classmethod
+    def _assert_valid_argv(cls, argv: list[str] | None, *, field_name: str) -> None:
+        if argv is None:
+            return
+        if not isinstance(argv, list) or len(argv) > cls.MAX_ARGV_ITEMS:
+            raise InvalidContainerImage(  # reused: "refuse before the write, name what's wrong"
+                f"refusing to patch: {field_name} must be a list of at most "
+                f"{cls.MAX_ARGV_ITEMS} strings"
+            )
+        for item in argv:
+            if not isinstance(item, str) or len(item) > cls.MAX_ARGV_ITEM_LEN:
+                raise InvalidContainerImage(
+                    f"refusing to patch: {field_name} contains a non-string or "
+                    f"over-length ({cls.MAX_ARGV_ITEM_LEN}) entry"
+                )
+
+    async def patch_deployment_container_command(
+        self, namespace: str, name: str, container: str, command: list[str] | None
+    ) -> dict[str, Any]:
+        """Override (or, with `command=None`, clear the override on) one
+        container's entrypoint — the write side of UPDATE_CONTAINER_COMMAND.
+
+        `command` is a plain argv list applied via `containers[].command`.
+        Kubernetes replaces this field wholesale (it carries no
+        `x-kubernetes-patch-merge-key`, unlike `env`), which is exactly the
+        semantics wanted here: a command override IS the whole entrypoint,
+        there is no per-token merge that would make sense. Never passed to a
+        shell — there is no `sh -c` in this path, so a value containing
+        shell metacharacters is just an inert argv element to the container
+        runtime, never something a shell interprets.
+        """
+        self._require()
+        self._assert_valid_argv(command, field_name="command")
+        container_patch: dict[str, Any] = {"name": container}
+        # An explicit `"command": None` in a strategic-merge patch body is
+        # how you clear a scalar/list field back to unset — omitting the key
+        # entirely would instead leave whatever was there untouched.
+        container_patch["command"] = command
+        body = {
+            "spec": {"template": {"spec": {"containers": [container_patch]}}}
+        }
+
+        def _call() -> Any:
+            return self._apps.patch_namespaced_deployment(
+                name=name, namespace=namespace, body=body
+            )
+
+        result = await asyncio.to_thread(_call)
+        logger.info(
+            "k8s_container_command_patched",
+            extra={"namespace": namespace, "deployment": name, "container": container},
+        )
+        return {"command": command, "generation": result.metadata.generation}
+
+    async def patch_deployment_container_args(
+        self, namespace: str, name: str, container: str, args: list[str] | None
+    ) -> dict[str, Any]:
+        """Override (or clear) one container's args — the write side of
+        UPDATE_CONTAINER_ARGS. Same shape and same never-a-shell guarantee as
+        `patch_deployment_container_command` above, for the `args` field."""
+        self._require()
+        self._assert_valid_argv(args, field_name="args")
+        container_patch: dict[str, Any] = {"name": container, "args": args}
+        body = {
+            "spec": {"template": {"spec": {"containers": [container_patch]}}}
+        }
+
+        def _call() -> Any:
+            return self._apps.patch_namespaced_deployment(
+                name=name, namespace=namespace, body=body
+            )
+
+        result = await asyncio.to_thread(_call)
+        logger.info(
+            "k8s_container_args_patched",
+            extra={"namespace": namespace, "deployment": name, "container": container},
+        )
+        return {"args": args, "generation": result.metadata.generation}
+
+
+class InvalidContainerImage(ValueError):
+    """Raised by `patch_deployment_container_image`/`_assert_valid_argv` —
+    caught by RemediationEngine's generic `except Exception` and turned into
+    a clean `DeepRemediationResult(succeeded=False, ...)`, the same pattern
+    `InvalidRollbackTemplate` already established for the rollback path."""
+
 
 class InvalidRollbackTemplate(ValueError):
     """Raised by `_assert_valid_container_images` — caught by
@@ -968,6 +1132,16 @@ def _looks_like_a_valid_image_reference(image: Any) -> bool:
     if image.endswith(":PLACEHOLDER") or image.endswith("/PLACEHOLDER"):
         return False
     return True
+
+
+# Public alias: `deep_investigation.py` (and its tests) validate a
+# model-proposed image against this exact same guard used for rollback /
+# initial-deployment validation, so a novel `UPDATE_CONTAINER_IMAGE`
+# proposal can never be held to a weaker standard than the rest of the
+# system. Exposed without the leading underscore because it is a
+# deliberate, supported cross-module contract, not an accidental reach
+# into a private helper.
+looks_like_a_valid_image_reference = _looks_like_a_valid_image_reference
 
 
 def _assert_valid_container_images(template_dict: dict[str, Any]) -> None:

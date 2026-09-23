@@ -377,19 +377,63 @@ recovering is strictly worse than one that stops and pages a human.
 The four actions above are Sentinel's entire *autonomous* vocabulary — bounded, rule-vetted, and
 executed with no human in the loop. Deep Investigation
 ([`lifecycle/deep_investigation.py`](sentinel-ai/app/lifecycle/deep_investigation.py)) is a
-separate, narrower capability that exists for exactly one situation: **known remediation turned
-out to be insufficient** (no candidate action existed, every candidate was denied by policy, the
-per-incident action cap was reached, or the lifecycle exhausted its retry cycles without a
-validated recovery) and the incident is about to escalate to a human anyway. Rather than escalate
-with only "nothing in the rulebook worked," Sentinel asks its configured LLM for one bounded,
-typed, **human-authorizable** proposal to attach to that escalation. It never changes whether or
-how the incident escalates — it only enriches an escalation that was already happening.
+separate, narrower capability for the situation where the known playbook isn't enough: either
+Sentinel already tried and exhausted it (no candidate action existed, every candidate was denied by
+policy, the per-incident action cap was reached, or the lifecycle exhausted its retry cycles
+without a validated recovery) and is about to escalate to a human anyway, **or** an SRE looking at
+an already-escalated incident asks Sentinel to take a closer look before doing anything themselves.
+Either way, Sentinel's configured LLM investigates and returns one bounded, typed,
+**human-authorizable** proposal — never something it just goes and does. Both entry points run the
+exact same investigation and the exact same policy gate; they only differ in how the run started
+and whether it can also happen automatically the moment known remediation runs out.
 
-**What the model can propose is closed to two operations**, `NovelActionType.SET_ENV_VAR` and
-`UNSET_ENV_VAR` on one environment variable of one container — chosen because it is the smallest
-concrete action space wider than the four fixed ones, and because "this workload came up
-misconfigured" is a real, otherwise-unremediable class of incident. Everything the model returns
-is prose or these two narrow fields; there is no way for its output to parse into anything else:
+**Two ways in, one investigation.** `DeepInvestigationTrigger.AUTO` is the automatic path described
+above, fired from the lifecycle itself. `DeepInvestigationTrigger.SUGGEST_FIX` is a manual one: any
+authenticated admin can call `POST /api/incidents/{id}/suggest-fix` on an incident that already has
+evidence and a hypothesis, whether or not it has escalated — this is the explicit,
+user-invokable "Suggest Fix" the GUI's Deep Investigation panel exposes as its own button, for an
+SRE who wants a second opinion without waiting for the known ladder to fail first. Both triggers
+call the same `investigate_deep(...)`, are gated by the same shared
+`deep_investigation_max_per_incident` budget and the same single-writer incident lease no other
+lifecycle action can run alongside, and produce proposals that go through the identical
+`evaluate_deep_proposal` policy gate below — `trigger` is recorded purely for audit and the GUI, and
+never changes what is allowed.
+
+**The investigation itself is now iterative, not a single guess.** Rather than asking the model for
+one shot in the dark, `investigate_deep` runs a bounded read-only tool-use loop: on each turn the
+model returns exactly one JSON object — `call_tool` (inspect something and get real data back),
+`propose` (submit a typed remediation), or `no_safe_fix` (say plainly that nothing safe occurred to
+it) — over the narrow `Reasoner.complete_json` interface. Available tools
+(`lifecycle/deep_investigation_tools.py`) are all read-only: `inspect_pods`, `inspect_deployment`,
+`inspect_replicasets`, `inspect_previous_revision` (backed by the *same*
+`find_previous_revision` logic the Rollback executor itself uses — not a re-derived
+approximation), `inspect_events`, `inspect_service_health`, `get_container_logs`, `query_metric`,
+`query_logs`. There is no write-capable tool in this list; the loop can look, never touch. The loop
+is bounded on every axis that matters — `deep_investigation_max_iterations` (6),
+`deep_investigation_max_tool_calls` (8), `deep_investigation_max_seconds` (90), and
+`deep_investigation_max_consecutive_malformed_turns` (2) — so a confused or malfunctioning model
+runs out of turns and produces `no_safe_fix` rather than looping indefinitely or being coaxed into
+eventually proposing something unsafe. Every turn — the model's stated hypothesis, which tool it
+called, whether that tool call succeeded, and a truncated summary of what it returned — is recorded
+into an append-only `DeepInvestigationTrace` (`iterations`, `tool_call_count`, `outcome`,
+`reason`), attached to the incident and rendered in the GUI, so "why did it propose this" or "why
+did it give up" is always answerable from the incident itself, not from application logs.
+
+**What the model can propose is a closed, typed DSL of six operations**
+(`NovelActionType`): `SET_ENV_VAR` / `UNSET_ENV_VAR` (the original two), plus
+`UPDATE_CONTAINER_IMAGE`, `UPDATE_REPLICAS`, `UPDATE_CONTAINER_COMMAND`, and
+`UPDATE_CONTAINER_ARGS`. Each maps to exactly one narrowly-scoped `KubernetesClient` write method —
+never a generic "patch this manifest" escape hatch. Deliberately excluded, on the same boundary
+rather than for lack of time: a generic `PATCH_DEPLOYMENT_FIELD` (the arbitrary-patch hatch this
+codebase refuses to build), anything touching a Service's selectors or ports (traffic routing is
+out of scope for an AI-originated change), and anything that could point an env var at a
+ConfigMap/Secret key (one hop from "read secrets," and visually indistinguishable from a secret
+mount to most reviewers). Every member goes through the same three independent gates the original
+two did — construction-time validation in `deep_investigation.py`, a Policy Engine precondition in
+`policy.py`, and an execution-time re-check in `remediation.py` — and `RemediationEngine.execute_deep`
+dispatches over the closed enum with an explicit `if/elif` chain ending in an unconditional refusal;
+there is no default branch, no `getattr`-based dispatch, and no way to reach a `KubernetesClient`
+write the enum doesn't name:
 
 - The target namespace and deployment are **never taken from the model** — they are hard-pinned to
   the incident's own target, exactly as recorded before the LLM was ever called.
@@ -400,18 +444,35 @@ is prose or these two narrow fields; there is no way for its output to parse int
   [`kubernetes_client.py`](sentinel-ai/app/clients/kubernetes_client.py) already redacts by when
   reading a Deployment's env — a proposal naming a credential-shaped key is refused at
   construction time, before it is ever stored or shown to anyone.
+- **A proposed container image must be evidence-grounded, never trusted from the model's say-so.**
+  `UPDATE_CONTAINER_IMAGE` is only accepted when the exact image string appears somewhere the model
+  actually observed for *this* Deployment — its current image, its `replicaset_history` evidence, or
+  the result of a tool call this same investigation made (e.g. `inspect_previous_revision`
+  surfacing the last known-good tag). An image that merely looks plausible, well-formed, and
+  confidently argued for — but was never seen anywhere in this incident's own evidence or tool
+  output — is refused outright, regardless of confidence. This is the direct generalisation of
+  Rollback's own logic (see below) into the novel-remediation path, and is covered by a dedicated
+  regression test (`tests/test_deep_investigation_loop.py`) built on this repo's own
+  `citizen-service`/`Init:InvalidImageName` incident shape: a placeholder image one revision ahead
+  of a real one.
+- **A proposed replica count is re-clamped, never taken as given.** `UPDATE_REPLICAS` is refused
+  outright with no replica count, refused if it asks to scale to zero (an outage, not a fix), and
+  otherwise clamped into the same `[min_replicas, max_replicas]` band (`1`–`3`) the Scale action
+  already respects — both in the Policy Engine's precondition and again, independently, as a
+  defense-in-depth re-clamp in the executor itself.
+- `command`/`args` overrides go through Kubernetes' own merge semantics for those fields (a whole-
+  array replace, not a per-item merge) via the same `_assert_valid_argv` bounds
+  (`MAX_ARGV_ITEMS`, `MAX_ARGV_ITEM_LEN`) already enforced elsewhere in `kubernetes_client.py`.
 - Confidence is clamped to `[0, 1]`, and risk is computed independently by Sentinel
   (`_assess_deep_risk`) — never "low", and never taken from the model — because a proposal that
   reached this path was, by definition, never vetted by the Policy Engine's rules the way the four
   known actions are.
-- The call itself is a single request with no tool use, no multi-turn loop, and no way for the
-  model to ask for a follow-up call; the raw response size is capped
-  (`DEEP_INVESTIGATION_OUTPUT_MAX_CHARS`, 4000 by default) before Sentinel even attempts to parse
-  it as JSON.
 - Anything that fails any check — malformed JSON, an unparseable action name, an out-of-range
-  field, a missing required prose field, a sensitive-looking key, a malformed key name — is
-  rejected outright. `apply_llm_response` never patches a bad response into something usable; it
-  returns nothing, and Sentinel escalates exactly as if the LLM had not answered at all.
+  field, a missing required prose field, a sensitive-looking key, an ungrounded image, an
+  out-of-band replica count — is rejected outright, and a run that never finds anything safe to
+  propose returns `no_safe_fix` rather than inventing something. `apply_llm_response` never patches
+  a bad response into something usable; it returns nothing, and Sentinel escalates exactly as if the
+  LLM had not answered at all.
 
 **A confidence-clearing proposal is still not an authorization to act.** The Policy Engine's
 `evaluate_deep_proposal` re-derives eligibility from scratch — the proposal's target must match the
@@ -419,39 +480,45 @@ incident's own target exactly (`DenialReason.BLAST_RADIUS_EXCEEDS_INCIDENT` othe
 deployment must not be on the frozen deny-list, the per-incident action cap is shared with the four
 known actions, and confidence must clear **0.97** — deliberately higher than every known-action
 threshold, including rollback's 0.95, because this path was never rule-vetted. The environment-key
-check is re-run here too, independently of the construction-time check, under its own
-`DenialReason.SENSITIVE_ENV_VAR_KEY`. Crucially, clearing every one of these checks still only
-produces `allowed=True`, meaning *eligible for a human to authorize* — unlike the four known
-actions, there is no confidence-override path here, at any confidence.
+check and the replicas-band check are both re-run here too, independently of their
+construction-time checks, under their own `DenialReason`s. Crucially, clearing every one of these
+checks still only produces `allowed=True`, meaning *eligible for a human to authorize* — unlike the
+four known actions, there is no confidence-override path here, at any confidence.
 
-**Execution requires an explicit, one-time SRE authorization.** An eligible proposal is surfaced on
-the escalated incident (`GET /api/incidents/{id}/deep-proposals`, and in `sentinel-gui`'s Deep
-Investigation panel) and sits in `status: suggested` until an authenticated admin calls
-`POST /api/incidents/{id}/deep-proposals/{id}/authorize`. That reuses the same short-lived
-temporary-authorization mechanism and single-writer incident lease the four known actions' manual
-authorization already uses — there is no separate, less-audited path. Only then does
-`RemediationEngine.execute_deep()` run, and it re-checks the allow-list, the deny-list, and the
-sensitive-key rule **a third time**, independently of both `apply_llm_response` and the Policy
-Engine, as the last gate before the one Kubernetes write it is permitted to make
-(`patch_deployment_env_var` / `remove_deployment_env_var` — no generic write method exists). After
-execution, the incident re-enters RECOVERY VALIDATION exactly like any other action; a failure is
-recorded on the proposal and the incident continues to escalate, it does not retry the same
-proposal automatically.
+**Execution requires an explicit, one-time SRE authorization — and a proposal can also be
+dismissed.** An eligible proposal is surfaced on the incident (`GET /api/incidents/{id}/deep-proposals`,
+and in `sentinel-gui`'s Deep Investigation panel) and sits in `status: suggested` until an
+authenticated admin either calls `POST /api/incidents/{id}/deep-proposals/{id}/authorize` — which
+reuses the same short-lived temporary-authorization mechanism and single-writer incident lease the
+four known actions' manual authorization already uses, no separate, less-audited path — or calls
+`POST /api/incidents/{id}/deep-proposals/{id}/reject`, a synchronous, cluster-inert status change
+(`status: rejected`, no lease, no background task, nothing touches the cluster) for an SRE who's
+looked at the proposal and doesn't want it. Authorizing runs `RemediationEngine.execute_deep()`,
+which re-checks the allow-list, the deny-list, the sensitive-key rule, the image-evidence grounding,
+and the replicas band **a third time**, independently of both `apply_llm_response` and the Policy
+Engine, as the last gate before the one narrowly-scoped Kubernetes write the proposed action names —
+there remains no generic write method anywhere in `KubernetesClient`. After execution, the incident
+re-enters RECOVERY VALIDATION exactly like any other action; a failure is recorded on the proposal
+and the incident continues to escalate, it does not retry the same proposal automatically. Note
+that authorizing a Suggest-Fix-originated proposal does not require the incident to be currently
+escalated — only automatic Deep Investigation implies an incident is already headed for escalation;
+a Suggest Fix proposal can legitimately sit on an incident that's still open.
 
-**The proposal's `rendered_command`** (a display-only `kubectl set env ...` string an SRE reads
-before deciding) is never executed by Sentinel — it exists only so a human can see, in familiar
-terms, what authorizing this proposal would do. Every field in it is `shlex.quote()`-d, so a
-model-proposed value containing shell metacharacters (`x; rm -rf /`, `` `curl evil` ``) renders as
-an inert quoted literal rather than something a shell would act on if copy-pasted into a real
-terminal.
+**The proposal's `rendered_command`** (a display-only `kubectl ...` string an SRE reads before
+deciding — generalised across all six action types) is never executed by Sentinel — it exists only
+so a human can see, in familiar terms, what authorizing this proposal would do. Every field in it is
+`shlex.quote()`-d, so a model-proposed value containing shell metacharacters (`x; rm -rf /`,
+`` `curl evil` ``) renders as an inert quoted literal rather than something a shell would act on if
+copy-pasted into a real terminal.
 
 **This is off by default in the sense that matters:** with no LLM configured (no API key), or with
 its provider's circuit breaker open from recent failures, `investigate_deep` returns nothing and
 Sentinel escalates exactly as it did before this feature existed —
 `deep_investigation_enabled=true` is the default, but the feature is inert without a reasoner.
-Deep Investigation is bounded to `deep_investigation_max_per_incident` (1 by default) LLM calls per
-incident, independent of the lifecycle's own retry cycles, so a pathological incident cannot keep
-spending new calls indefinitely.
+Deep Investigation is bounded to `deep_investigation_max_per_incident` (1 by default) *investigation
+runs* per incident, shared across both triggers and independent of the lifecycle's own retry
+cycles, so a pathological incident — or an SRE repeatedly mashing "Suggest fix" — cannot keep
+spending new LLM calls indefinitely.
 
 ## Rollback capability
 
@@ -481,6 +548,23 @@ If any of these fails, the Policy Engine rejects the action and the Decision Eng
 candidate is tried — or, if none remains, the incident escalates. The RBAC Role independently
 bounds the damage: even a bug in all of the above cannot let Sentinel roll back something outside
 its namespace, delete anything, or exec into a container.
+
+**Audited: rollback target selection does not blindly trust "the previous revision."**
+`find_previous_revision` (`kubernetes_client.py`) — the same function both the autonomous Rollback
+plan (via `correlation._find_valid_rollback_candidate`) and Deep Investigation's
+`inspect_previous_revision` tool call into — does not return `numbered[1]` (plain "one revision
+back," equivalent to `kubectl rollout undo` with no `--to-revision`). It returns the newest revision
+*strictly older than the current one whose images are not known-invalid*, walking back further if
+it has to. This is a deliberate guard against exactly the production bug this engagement started
+from: a placeholder-image ReplicaSet sitting one revision back from the one that broke is "the
+previous revision" in name only, and rolling back to it would re-trigger the same
+`Init:InvalidImageName` failure rather than fix it. A candidate with no `images_valid` key at all
+(older evidence, a hand-built fixture) is treated as valid, so this rule can only ever make Sentinel
+*skip* a target it previously would have used, never reject one it used to accept — and when
+nothing further back is safe either, it returns `None`, which the Policy Engine turns into a hard
+denial rather than letting the Remediation Engine improvise. This exact scenario — a placeholder
+revision one step behind a real one — is exercised end-to-end by
+`tests/test_deep_investigation_loop.py`.
 
 `DRY_RUN=true` runs the entire lifecycle — detect, investigate, correlate, decide, policy-check,
 validate — and logs the action it *would* have taken without touching the cluster. That is the
@@ -640,6 +724,17 @@ more cautious about a candidate with a poor track record, never more willing to 
 weak evidence alone would not already support. Every incident's timeline records all three values —
 the aggregated bias, the memory bias, and the combined result — so which of the two, if either,
 affected a given decision is always auditable after the fact, not just asserted.
+
+`tests/test_learning_integration.py` proves this is real, not just a unit-tested formula: it runs
+three training incidents through the *full* engine (real IncidentManager, Orchestrator, RCA,
+Decision Engine, Policy Engine, and RemediationEngine, against a real SQLite file — no mocked
+learning internals), each retrying and failing to validate every action a shared root cause's
+ladder has, then sends a fourth incident with the same root cause on a fourth, previously-unseen app
+through the same trained store. A control run with no prior history executes both ladder candidates
+in sequence on the identical scenario; the trained run denies both outright for
+`confidence_too_low` and escalates having executed nothing — same evidence, same RCA confidence,
+a different decision, and the only input that differs between the two runs is what the
+`action_outcomes` table already held.
 
 **Incident Replay** ([`lifecycle/replay.py`](sentinel-ai/app/lifecycle/replay.py)) answers "what
 would Sentinel decide about this incident right now, given everything it has learned since" by
@@ -990,12 +1085,23 @@ incident escalates exactly as it did before the feature existed — there is no 
 for this one, because there is nothing rule-based to fall back to for a failure mode the four known
 actions do not already cover.
 
-**Deep Investigation and the learning/memory feedback loop are unit-tested with the LLM, Kubernetes
-and store layers stubbed, like everything else in this project — not verified against a real
-cluster or a real model provider.** The same "claims about code, not about observed behaviour"
-caveat above applies to every number and threshold quoted in [Deep investigation & novel
-remediation](#deep-investigation--novel-remediation) and [Operational learning & incident
-replay](#operational-learning--incident-replay).
+**Deep Investigation and the learning/memory feedback loop are exercised end-to-end against the
+real engine (real Orchestrator, Decision/Policy/Remediation Engines, a real SQLite store) with the
+LLM and Kubernetes client swapped for deterministic test doubles — not against a real cluster or a
+real model provider.** `tests/test_deep_investigation_loop.py` and
+`tests/test_learning_integration.py` both prove their respective mechanisms hold up through the
+full stack, not just in isolated unit tests, but neither replaces a live run: a genuine attempt to
+verify this against a real Groq endpoint and a reachable K3s cluster was made from this project's
+own development sandbox and honestly could not be completed there — that environment has no
+outbound network path to `api.groq.com` (blocked by egress policy) and no `kubectl`/cluster
+reachable from it, so no `GROQ_API_KEY` or live cluster round-trip was ever exercised from it. The
+same "claims about code and about the real engine's stubbed-boundary behaviour, not about a live
+model or a live cluster" caveat above applies to every number and threshold quoted in [Deep
+investigation & novel remediation](#deep-investigation--novel-remediation) and [Operational
+learning & incident replay](#operational-learning--incident-replay). Verifying against this
+project's actual configured Groq key and its actual K3s environment is a step only achievable from
+somewhere with genuine network reach to both — this repository as checked out and run here is not
+that place.
 
 **Local development has no Sentinel.** `sentinel-ai` and `sentinel-gui` exist only on the optional
 standalone Sentinel EC2 instance, so the fastest environment to bring up is also the one where the

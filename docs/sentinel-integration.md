@@ -370,8 +370,9 @@ security boundary above; it is built to extend it consistently, not around it:
 - **Every GUI-facing endpoint is now authenticated.** `GET /api/incidents`, `/environments`, and
   the new `/api/dashboard`, `/api/actions`, `/api/performance`, `/api/meta`, `/api/events` (SSE),
   and `/api/incidents/{id}/{feedback,authorize,authorizations}` all require the admin JWT — see
-  `app/core/deps.py`'s `get_current_admin`. `/api/alerts/webhook` (Alertmanager) and
-  `/api/sentinel/chaos-scenarios` (its own pre-existing shared-secret gate) are unchanged.
+  `app/core/deps.py`'s `get_current_admin`. `/api/alerts/webhook` (Alertmanager, genuinely
+  unauthenticated) and `/api/sentinel/chaos-scenarios` (its own pre-existing shared-secret
+  `X-Chaos-Token` gate, checked by `sentinel-ai` itself) are unchanged.
 - **Real-time updates are a read-only signal, never a second source of truth.** An in-process
   event bus (`app/core/events.py`) publishes one event from the same `Orchestrator._persist` call
   that already writes every phase to SQLite — the GUI's SSE stream tells a connected browser
@@ -396,10 +397,16 @@ security boundary above; it is built to extend it consistently, not around it:
   external Sentinel EC2 (`infra/terraform/sentinel_remote.tf`), not in K3s, and its own nginx
   (`sentinel-gui/nginx.conf`) is that instance's only public entrypoint. It serves the built SPA
   and reverse-proxies everything under `/api/` to that instance's `sentinel-ai` over a private
-  Docker network — except `/api/alerts/webhook` and `/api/sentinel/chaos-scenarios`, which are
-  explicitly denied at the proxy (`404`) since Alertmanager and the chaos runner already reach
-  `sentinel-ai` directly over the private VPC network and never need the public path. The browser
-  calls same-origin `/api/...` (no `VITE_API_BASE_URL` override, no CORS grant needed) instead of
+  Docker network — except `POST /api/alerts/webhook`, which is explicitly denied at the proxy
+  (`404`) since Alertmanager reaches `sentinel-ai` directly over the private VPC network and the
+  browser SPA has no legitimate reason to ever call it. `/api/sentinel/chaos-scenarios*` IS
+  proxied same-origin like the JWT-gated routes above: it is gated by its own `X-Chaos-Token`
+  check inside `sentinel-ai`, not by nginx, and the browser's Chaos page
+  (`sentinel-gui/src/api/chaosScenarios.js`) is the one legitimate same-origin caller for it — an
+  earlier revision of this proxy denied it too, on the reasoning that "the chaos runner never
+  needs the public path," which is true of the AWS SSM logic inside `sentinel-ai` but not of the
+  browser UI that drives it, and which silently made the GUI's Chaos page show no scenarios at
+  all. The browser calls same-origin `/api/...` (no `VITE_API_BASE_URL` override, no CORS grant needed) instead of
   the previous model of two separate `kubectl port-forward` tunnels to a ClusterIP `sentinel-ai`
   and `sentinel-gui` in K3s. `enable_remote_sentinel=false` (the in-cluster-only topology) has no
   deployed GUI at all — see `k8s/README.md` for the `npm run dev` fallback for that case.

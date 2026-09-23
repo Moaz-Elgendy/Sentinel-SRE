@@ -59,6 +59,7 @@ from app.models.incident import (
     DeepRemediationProposal,
     DenialReason,
     Incident,
+    NovelActionType,
     PolicyVerdict,
     RemediationAction,
 )
@@ -483,6 +484,42 @@ class PolicyEngine:
                 checks,
             )
         checks["env_var_key_not_sensitive"] = True
+
+        if proposal.action_type is NovelActionType.UPDATE_REPLICAS:
+            # Same band, same "0 is an outage, not a remediation" refusal, and
+            # the same clamp-rather-than-reject-on-the-high-side posture as
+            # `_check_scale` uses for the known SCALE action — a novel
+            # proposal does not get a looser replica ceiling just because it
+            # arrived through this path. Mutating `proposal.target.replicas`
+            # in place (there is no `adjusted_params` slot on
+            # `DeepPolicyVerdict` the way there is on `PolicyVerdict`) means
+            # every downstream reader of this proposal — the GUI, the audit
+            # trail, RemediationEngine.execute_deep — sees the clamped value
+            # everywhere, not the model's raw request.
+            requested_replicas = proposal.target.replicas
+            if requested_replicas is None:
+                checks["replicas_specified"] = False
+                return self._deny_deep(
+                    proposal, DenialReason.REPLICAS_OUT_OF_BAND,
+                    "update_replicas proposal carries no replica count", checks,
+                )
+            checks["replicas_specified"] = True
+
+            if requested_replicas < 1:
+                checks["replicas_not_zero"] = False
+                return self._deny_deep(
+                    proposal, DenialReason.REPLICAS_OUT_OF_BAND,
+                    f"refusing to scale to {requested_replicas}. Scaling to zero is an "
+                    "outage, not a remediation, and Sentinel will never do it, autonomous "
+                    "or human-authorised.",
+                    checks,
+                )
+            checks["replicas_not_zero"] = True
+
+            clamped = max(self.config.min_replicas, min(self.config.max_replicas, requested_replicas))
+            checks["replicas_in_band"] = True
+            if clamped != requested_replicas:
+                proposal.target.replicas = clamped
 
         if namespace in self.config.denied_namespaces:
             checks["namespace_not_frozen_denied"] = False

@@ -528,6 +528,33 @@ class IncidentManager:
         )
         return True
 
+    async def _run_suggest_fix(self, incident: Incident, actor: str) -> None:
+        try:
+            async with self._sem():
+                await self.orchestrator.suggest_fix(incident, actor)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("suggest_fix_task_failed", extra={"incident_id": incident.id})
+        finally:
+            self.release(incident.id)
+
+    def start_suggest_fix(self, incident: Incident, actor: str) -> bool:
+        """Human-initiated explicit Deep Investigation ("Suggest Fix" GUI
+        button). Unlike `start_manual_reinvestigation`, the incident need
+        not be ESCALATED — see `SentinelOrchestrator.suggest_fix`'s own
+        docstring for the eligibility this still requires (evidence,
+        hypothesis, a target deployment, and the shared per-incident Deep
+        Investigation budget). Returns False if a lifecycle (or another
+        Deep Investigation) already holds the incident's lease."""
+        if not self.try_acquire(incident):
+            return False
+        self._spawn(
+            self._run_suggest_fix(incident, actor),
+            name=f"suggest-fix-{incident.id}",
+        )
+        return True
+
     # ------------------------------------------------------------------
     # restart recovery
     # ------------------------------------------------------------------

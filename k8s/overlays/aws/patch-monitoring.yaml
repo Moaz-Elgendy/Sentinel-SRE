@@ -56,7 +56,18 @@ data:
           # to close an incident that recovered on its own, so it does not
           # sit on an open incident forever or remediate something that has
           # already healed.
-          - url: http://10.20.1.57:8080/api/alerts/webhook
+          #
+          # SENTINEL_API_UPSTREAM_PLACEHOLDER is the SAME deploy-time token
+          # substituted into frontend's env in patch-app-deployments.yaml —
+          # deliberately reused rather than a second placeholder, so the two
+          # can never point at different Sentinel addresses after a deploy.
+          # This is the single most important address in the whole overlay
+          # (see the file header): if it is wrong, stale, or hardcoded,
+          # Alertmanager can never reach Sentinel at all, alerts never
+          # become incidents, and nothing here looks broken until you
+          # notice an incident that never appears or a resolved alert that
+          # never closes one.
+          - url: SENTINEL_API_UPSTREAM_PLACEHOLDER/api/alerts/webhook
             send_resolved: true
 ---
 apiVersion: v1

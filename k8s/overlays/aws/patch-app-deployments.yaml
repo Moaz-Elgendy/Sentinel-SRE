@@ -93,7 +93,19 @@ spec:
         - name: frontend
           env:
             - name: SENTINEL_API_UPSTREAM
-              value: http://10.20.1.57:8080
+              # Substituted at deploy time by deploy-aws.sh /
+              # sentinel-deploy.sh's `apply` mode from either the
+              # SENTINEL_API_UPSTREAM env var (external-control-plane
+              # topology) or its default, http://sentinel-ai:8080
+              # (in-cluster topology). This must stay a literal
+              # `*_PLACEHOLDER` token, matched and replaced by `sed` against
+              # the rendered manifest stream — see deploy-aws.sh's own
+              # comment for why. A hardcoded IP here is stale the moment the
+              # instance is replaced or Sentinel moves, and — critically —
+              # it silently defeats the deploy-time substitution: the sed
+              # expression has nothing to match, so it no-ops instead of
+              # erroring, and nothing about the deploy looks like it failed.
+              value: SENTINEL_API_UPSTREAM_PLACEHOLDER
 ---
 # The Postgres Deployments pull postgres:16-alpine from Docker Hub, not
 # ECR, so they need no pull secret. They do get revisionHistoryLimit for

@@ -53,6 +53,7 @@ from app.lifecycle import (
     rca,
     risk,
 )
+from app.lifecycle.deep_investigation_tools import ToolContext
 from app.lifecycle.evidence_signature import compute_signature, material_changes
 from app.lifecycle.decision import DecisionEngine
 from app.lifecycle.policy import PolicyConfig, PolicyContext, PolicyEngine
@@ -62,6 +63,7 @@ from app.models.incident import (
     ActionParams,
     ActionPlan,
     AttemptRecord,
+    DeepInvestigationTrigger,
     DeepProposalStatus,
     DeepRemediationResult,
     EscalationReason,
@@ -763,18 +765,97 @@ class Orchestrator:
         already happening with a bounded, typed, human-authorizable
         proposal. See lifecycle/deep_investigation.py's module docstring
         for the trust boundary this reaches through.
+
+        Gating specific to the automatic trigger only — eligibility that
+        also applies to the explicit Suggest Fix flow lives in
+        `_run_deep_investigation` below, which this delegates to.
         """
-        settings = self.ctx.settings
-        if not getattr(settings, "deep_investigation_enabled", True):
-            return
-        max_per_incident = getattr(settings, "deep_investigation_max_per_incident", 1)
-        if incident.deep_investigation_count >= max_per_incident:
-            return
         if incident.evidence is None or incident.hypothesis is None:
             return
         if not incident.target_deployment:
             return
+        await self._run_deep_investigation(
+            incident,
+            trigger=DeepInvestigationTrigger.AUTO,
+            phase=LifecyclePhase.ESCALATION,
+            start_message=(
+                "Deep Investigation: known remediation was insufficient; asking the "
+                "configured reasoner for a bounded, typed proposal"
+            ),
+            escalating=True,
+        )
 
+    async def suggest_fix(self, incident: Incident, actor: str) -> str:
+        """Explicit, human-invoked counterpart to `_maybe_deep_investigate`.
+
+        Callable at ANY point in an incident's life once it has evidence and
+        a hypothesis — it does NOT require the incident to be ESCALATED or
+        for known remediation to have already been exhausted, unlike the
+        automatic trigger. This is the "Suggest Fix" GUI button: an operator
+        looking at an incident who wants Sentinel's bounded, typed Deep
+        Investigation opinion right now, without waiting for (or forcing)
+        an escalation first.
+
+        Shares every other line of implementation with the automatic path
+        via `_run_deep_investigation` below — same reasoner call, same
+        typed-DSL construction, same PolicyEngine gate, same per-incident
+        `deep_investigation_max_per_incident` budget (a human clicking a
+        button does not get a separate, unbounded allowance to run the most
+        expensive and most-trusted code path in this system), same
+        append-only trace/proposal bookkeeping. The only differences are:
+        no escalation-insufficiency precondition, and a distinct
+        LifecyclePhase on the resulting timeline entries (RE_INVESTIGATION,
+        not ESCALATION — this never marks or implies the incident got
+        escalated).
+
+        Returns one of: "disabled", "budget_exhausted", "not_eligible",
+        "already_running", "no_safe_fix", "rejected", "proposal_ready".
+        """
+        settings = self.ctx.settings
+        if not getattr(settings, "deep_investigation_enabled", True):
+            return "disabled"
+        if incident.deep_investigation_running:
+            return "already_running"
+        max_per_incident = getattr(settings, "deep_investigation_max_per_incident", 1)
+        if incident.deep_investigation_count >= max_per_incident:
+            self._persist(incident)
+            return "budget_exhausted"
+        if incident.evidence is None or incident.hypothesis is None or not incident.target_deployment:
+            return "not_eligible"
+
+        outcome = await self._run_deep_investigation(
+            incident,
+            trigger=DeepInvestigationTrigger.SUGGEST_FIX,
+            phase=LifecyclePhase.RE_INVESTIGATION,
+            start_message=(
+                f"Deep Investigation: Suggest Fix requested by {actor}; asking the "
+                "configured reasoner for a bounded, typed proposal"
+            ),
+            escalating=False,
+        )
+        return outcome
+
+    async def _run_deep_investigation(
+        self,
+        incident: Incident,
+        *,
+        trigger: DeepInvestigationTrigger,
+        phase: LifecyclePhase,
+        start_message: str,
+        escalating: bool,
+    ) -> str:
+        """Shared core of the automatic Deep Investigation trigger and the
+        explicit Suggest Fix flow (see both callers' own docstrings for what
+        differs between them). Never raises — every branch below is a
+        normal, expected outcome, not an error. Persists the incident on
+        every branch (matching this method's pre-extraction behaviour for
+        the automatic path exactly), so the caller never needs to persist
+        again on its own account. `escalating` only changes the wording of
+        the "no proposal" timeline message (it says "continuing to escalate
+        as usual" for the automatic trigger, nothing extra for Suggest
+        Fix) — it does not change control flow or persistence.
+        """
+        settings = self.ctx.settings
         incident.deep_investigation_count += 1
         attempted_summary = sorted(
             {
@@ -783,29 +864,58 @@ class Orchestrator:
                 for a in incident.attempts
             }
         )
-        self._emit(
-            incident,
-            "Deep Investigation: known remediation was insufficient; asking the configured "
-            "reasoner for a bounded, typed proposal",
-            "deep_investigation_started",
+        self._emit(incident, start_message, "deep_investigation_started")
+        tool_ctx = ToolContext(
+            incident=incident,
+            k8s=self.ctx.k8s,
+            prom=self.ctx.prom,
+            loki=self.ctx.loki,
+            health_probe=self._health_probe,
+            tool_output_max_chars=getattr(
+                settings, "deep_investigation_tool_output_max_chars", 3000
+            ),
         )
-        proposal = await deep_investigation.investigate_deep(
-            incident,
-            incident.evidence,
-            incident.hypothesis,
-            attempted_summary,
-            reasoner=self.ctx.reasoner,
-            output_max_chars=getattr(settings, "deep_investigation_output_max_chars", 4000),
-        )
+        incident.deep_investigation_running = True
+        try:
+            proposal, trace = await deep_investigation.investigate_deep(
+                incident,
+                incident.evidence,
+                incident.hypothesis,
+                attempted_summary,
+                reasoner=self.ctx.reasoner,
+                tool_ctx=tool_ctx,
+                trigger=trigger,
+                output_max_chars=getattr(settings, "deep_investigation_output_max_chars", 4000),
+                max_iterations=getattr(settings, "deep_investigation_max_iterations", 6),
+                max_tool_calls=getattr(settings, "deep_investigation_max_tool_calls", 8),
+                max_seconds=getattr(settings, "deep_investigation_max_seconds", 90.0),
+                max_consecutive_malformed_turns=getattr(
+                    settings, "deep_investigation_max_consecutive_malformed_turns", 2
+                ),
+            )
+        finally:
+            incident.deep_investigation_running = False
+        incident.deep_investigation_traces.append(trace)
+
         if proposal is None:
+            fallback_reason = (
+                "no reasoner configured, the provider was unavailable, or the "
+                "response failed validation"
+            )
             incident.record(
-                LifecyclePhase.ESCALATION,
-                "Deep Investigation did not produce an authorizable proposal (no reasoner "
-                "configured, the provider was unavailable, or the response failed "
-                "validation); continuing to escalate as usual.",
+                phase,
+                "Deep Investigation did not produce an authorizable proposal "
+                f"({trace.reason or fallback_reason})"
+                + (
+                    "; continuing to escalate as usual."
+                    if escalating
+                    else "."
+                ),
+                trace_id=trace.id,
+                trace_outcome=trace.outcome,
             )
             self._persist(incident)
-            return
+            return "no_safe_fix"
 
         deep_verdict = self.ctx.policy.evaluate_deep_proposal(incident, proposal)
         if not deep_verdict.allowed:
@@ -813,20 +923,20 @@ class Orchestrator:
             proposal.rejected_reason = deep_verdict.detail
             incident.deep_proposals.append(proposal)
             incident.record(
-                LifecyclePhase.ESCALATION,
+                phase,
                 f"Deep Investigation produced a proposal but it was rejected by policy: "
                 f"{deep_verdict.detail}",
                 action_type=proposal.action_type.value,
                 denial_reason=deep_verdict.reason.value if deep_verdict.reason else None,
             )
             self._persist(incident)
-            return
+            return "rejected"
 
         incident.deep_proposals.append(proposal)
         incident.record(
-            LifecyclePhase.ESCALATION,
+            phase,
             f"Deep Investigation proposal ready for human authorization: {proposal.problem} "
-            f"-> {proposal.action_type.value} on {proposal.target.container}/{proposal.target.key} "
+            f"-> {deep_investigation.render_command(proposal.action_type, proposal.target)} "
             f"(confidence {proposal.confidence:.2f}, risk {proposal.risk_level}). This does NOT "
             "execute automatically — an SRE must authorise it.",
             proposal_id=proposal.id,
@@ -841,6 +951,7 @@ class Orchestrator:
             "deep_investigation_proposal_ready",
         )
         self._persist(incident)
+        return "proposal_ready"
 
     async def _run_inner(self, incident: Incident) -> Incident:
         sentinel_incidents_total.labels(
