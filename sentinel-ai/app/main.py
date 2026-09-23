@@ -424,9 +424,11 @@ app = FastAPI(
 
 # CORS for the Sentinel SRE Control Center GUI only — this API now issues
 # bearer tokens, so no wildcard origin (see core/config.py's
-# sentinel_gui_origins docs). The Alertmanager webhook and the
-# chaos-scenarios endpoint are never called from a browser, so they are
-# unaffected by this either way.
+# sentinel_gui_origins docs). The Alertmanager webhook is never called from
+# a browser, so it is unaffected by this either way. The chaos-scenarios
+# endpoint IS called from the browser (sentinel-gui's DemoChaosPage.jsx),
+# same-origin via sentinel-gui/nginx.conf's proxy — it doesn't need CORS
+# either, but for a different reason: it's never cross-origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.sentinel_gui_origins_list,

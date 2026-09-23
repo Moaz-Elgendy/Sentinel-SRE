@@ -109,6 +109,13 @@ export default function IncidentDetailPage() {
   const awaiting = isAwaitingHuman(incident)
   const hasReport = Boolean(incident.documentation?.markdown)
   const showFeedback = Boolean(incident.hypothesis) || (incident.attempts?.length ?? 0) > 0
+  // The URL can carry `?tab=feedback` from a previous incident (a bookmark,
+  // a shared link, or clicking through from a list without the query string
+  // being cleared) even when THIS incident has no feedback tab to show —
+  // falling through to 'investigation' avoids a Tabs value with no matching
+  // TabsTrigger/TabsContent, which otherwise renders as a blank pane with no
+  // tab visibly selected.
+  const effectiveTab = tab === 'feedback' && !showFeedback ? 'investigation' : tab
 
   return (
     <div className="space-y-4">
@@ -161,7 +168,7 @@ export default function IncidentDetailPage() {
 
       {awaiting && <AttentionPanel incident={incident} onChanged={() => setRefreshKey((k) => k + 1)} key={`${incident.id}-${refreshKey}`} />}
 
-      <Tabs value={tab} onValueChange={(next) => { const copy = new URLSearchParams(params); if (next === 'investigation') copy.delete('tab'); else copy.set('tab', next); setParams(copy, { replace: true }) }}>
+      <Tabs value={effectiveTab} onValueChange={(next) => { const copy = new URLSearchParams(params); if (next === 'investigation') copy.delete('tab'); else copy.set('tab', next); setParams(copy, { replace: true }) }}>
         <TabsList variant="line" className="h-9 w-full justify-start border-b px-0">
           <TabsTrigger value="investigation" className="flex-none px-3">Investigation</TabsTrigger>
           <TabsTrigger value="evidence" className="flex-none px-3">Evidence</TabsTrigger>
@@ -191,16 +198,16 @@ export default function IncidentDetailPage() {
           <EvidenceTab incident={incident} />
         </TabsContent>
         <TabsContent value="graph" className="pt-4">
-          {tab === 'graph' && <CausalGraphTab key={incident.id} incidentId={incident.id} />}
+          {effectiveTab === 'graph' && <CausalGraphTab key={incident.id} incidentId={incident.id} />}
         </TabsContent>
         <TabsContent value="replay" className="pt-4">
-          {tab === 'replay' && <ReplayTab key={incident.id} incidentId={incident.id} />}
+          {effectiveTab === 'replay' && <ReplayTab key={incident.id} incidentId={incident.id} />}
         </TabsContent>
         <TabsContent value="timeline" className="pt-4">
           <TimelineTab incident={incident} />
         </TabsContent>
         <TabsContent value="logs" className="pt-4">
-          {tab === 'logs' && <LogViewer incidentId={incident.id} height="h-[28rem]" />}
+          {effectiveTab === 'logs' && <LogViewer incidentId={incident.id} height="h-[28rem]" />}
         </TabsContent>
         {showFeedback && (
           <TabsContent value="feedback" className="pt-4">
