@@ -166,8 +166,10 @@ def _command_for(scenario: str, payload: ScenarioRunRequest) -> str:
     scenario_arg = shlex.quote(scenario)
     namespace_arg = shlex.quote(payload.namespace)
     rollback_arg = "true" if payload.auto_rollback else "false"
+
     return "\n".join(
         [
+            "bash <<'SENTINEL_CHAOS_SCRIPT'",
             "set -euo pipefail",
             f"cd {workdir}",
             "if [ -f .env ]; then set -a; . ./.env; set +a; fi",
@@ -177,6 +179,7 @@ def _command_for(scenario: str, payload: ScenarioRunRequest) -> str:
             "fi",
             "chmod +x scripts/incident-scenarios.sh",
             f"./scripts/incident-scenarios.sh {scenario_arg} {namespace_arg} {rollback_arg}",
+            "SENTINEL_CHAOS_SCRIPT",
         ]
     )
 

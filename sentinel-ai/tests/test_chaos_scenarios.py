@@ -169,22 +169,34 @@ def test_run_scenario_is_503_when_aws_is_not_configured(gui_client, monkeypatch)
 
 def test_run_scenario_happy_path_sends_exactly_one_ssm_command(gui_client, fake_aws):
     client, _login = gui_client
+
     resp = client.post(
         "/api/sentinel/chaos-scenarios/db-outage/runs",
         headers={"X-Chaos-Token": TOKEN},
         json={"namespace": "citizen-portal", "auto_rollback": True},
     )
+
     assert resp.status_code == 200
     body = resp.json()
+
     assert body == {
         "scenario": "db-outage",
         "instance_id": "i-0123456789abcdef0",
         "command_id": "cmd-0001",
         "status_url": "/api/sentinel/chaos-scenarios/runs/cmd-0001",
     }
+
     assert len(fake_aws.sent) == 1
     assert fake_aws.sent[0]["instance_id"] == "i-0123456789abcdef0"
     assert "db-outage" in fake_aws.sent[0]["commands"][0]
+
+    assert fake_aws.sent[0]["commands"][0].startswith(
+        "bash <<'SENTINEL_CHAOS_SCRIPT'\n"
+    )
+    assert "set -euo pipefail" in fake_aws.sent[0]["commands"][0]
+    assert fake_aws.sent[0]["commands"][0].endswith(
+        "\nSENTINEL_CHAOS_SCRIPT"
+    )
 
 
 def test_run_scenario_namespace_is_shell_quoted_against_injection(gui_client, fake_aws):
