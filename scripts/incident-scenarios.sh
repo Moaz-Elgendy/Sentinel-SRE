@@ -85,6 +85,10 @@ cleanup() {
     local count="${entry##*:}"
     kubectl scale deployment "$deploy" -n "$NAMESPACE" --replicas="$count" >/dev/null 2>&1 || true
   done
+  if [ -n "${CHAOS_TOKEN:-}" ]; then
+    reset_chaos_fault "$CITIZEN_PORT"
+    reset_chaos_fault "$NOTIF_PORT"
+  fi
   if [ "$status" -ne 0 ]; then
     echo
     echo "!! Scenario exited with an error — see above. Fault state was still reset." >&2
@@ -194,6 +198,45 @@ unregister_rollback() {
     remaining+=("$deploy")
   done
   PENDING_ROLLBACKS=("${remaining[@]:-}")
+}
+
+run_safe_suite() {
+  local scenario failures=() passed=()
+  local scenarios=(
+    db-outage
+    http-errors
+    latency
+    notification-degradation
+    high-cpu
+    memory-leak
+    crashloop
+    full-outage
+  )
+
+  for scenario in "${scenarios[@]}"; do
+    echo
+    echo "============================================================"
+    echo " Suite scenario: $scenario"
+    echo "============================================================"
+    if "$0" "$scenario" "$NAMESPACE" "$AUTO_ROLLBACK"; then
+      passed+=("$scenario")
+    else
+      local rc=$?
+      failures+=("$scenario:$rc")
+      echo "!! $scenario: FAILED (exit $rc); continuing with remaining independent scenarios." >&2
+    fi
+  done
+
+  echo
+  echo "============================================================"
+  echo " Incident scenario suite summary"
+  echo " Passed: ${passed[*]:-(none)}"
+  echo " Failed: ${failures[*]:-(none)}"
+  echo " (bad-deployment excluded from 'all' by design - it leaves the"
+  echo "  system broken on purpose. Run it explicitly.)"
+  echo "============================================================"
+
+  [ "${#failures[@]}" -eq 0 ]
 }
 
 deployment_revision() {
@@ -679,20 +722,7 @@ case "$SCENARIO" in
     # for reasons that have nothing to do with the scenario. Anything that
     # makes a test suite non-repeatable does not belong in the "run
     # everything" path — run it explicitly when you want it.
-    scenario_db_outage
-    scenario_http_errors
-    scenario_latency
-    scenario_notification_degradation
-    scenario_high_cpu
-    scenario_memory_leak
-    scenario_crashloop
-    scenario_full_outage
-    echo
-    echo "============================================================"
-    echo " All incident scenarios passed."
-    echo " (bad-deployment excluded from 'all' by design — it leaves the"
-    echo "  system broken on purpose. Run it explicitly.)"
-    echo "============================================================"
+    run_safe_suite
     ;;
   *)
     echo "Usage: $0 <scenario> [namespace] [auto-rollback]" >&2

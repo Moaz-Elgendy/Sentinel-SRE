@@ -1248,6 +1248,15 @@ class Orchestrator:
                     self._persist(incident)
 
                     if not result.succeeded:
+                        if result.transient:
+                            incident.record(
+                                LifecyclePhase.RE_INVESTIGATION,
+                                "remediation execution hit a transient transport "
+                                "failure; re-investigating with fresh evidence "
+                                "before deciding whether to retry or choose another "
+                                "safe action",
+                            )
+                            break
                         # Execution itself failed. Do not validate — there is
                         # nothing to validate. Fall through to the next candidate
                         # in this cycle.
