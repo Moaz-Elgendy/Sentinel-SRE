@@ -431,6 +431,7 @@ class RemediationEngine:
                 "cleared its state, so recovery validation re-checks the chaos_* "
                 "gauges per kubernetes_pod_name before this is treated as fixed."
             ),
+            transient=outcome.transient,
             before={"chaos_reset_response": outcome.to_dict()},
         )
 

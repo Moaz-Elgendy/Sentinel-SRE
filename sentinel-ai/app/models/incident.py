@@ -663,6 +663,11 @@ class RemediationResult:
     dry_run: bool = False
     started_at: float = field(default_factory=time.time)
     duration_seconds: float = 0.0
+    # True for execution failures that may disappear after fresh evidence or
+    # a later attempt (for example transient DNS/network failures reaching
+    # the chaos endpoint). Permanent application/control-plane failures stay
+    # false so the lifecycle does not retry blindly.
+    transient: bool = False
     # Anything we may need to undo or reference later (e.g. the revision we
     # rolled back from, the replica count we changed from).
     before: dict[str, Any] = field(default_factory=dict)
@@ -677,6 +682,7 @@ class RemediationResult:
             "started_at": self.started_at,
             "started_at_iso": iso(self.started_at),
             "duration_seconds": self.duration_seconds,
+            "transient": self.transient,
             "before": self.before,
         }
 
@@ -692,6 +698,7 @@ class RemediationResult:
             dry_run=data.get("dry_run", False),
             started_at=data.get("started_at", time.time()),
             duration_seconds=data.get("duration_seconds", 0.0),
+            transient=data.get("transient", False),
             before=data.get("before") or {},
         )
 
@@ -1639,4 +1646,3 @@ def compute_incident_key(
         ]
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-

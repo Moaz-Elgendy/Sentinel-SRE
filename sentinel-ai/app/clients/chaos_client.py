@@ -38,7 +38,10 @@ confirmed yet; see the comment there.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
+import socket
 from typing import Any
 
 import httpx
@@ -55,11 +58,15 @@ class ChaosResetOutcome:
         http_status: int | None,
         detail: str,
         state: dict[str, Any] | None = None,
+        transient: bool = False,
+        attempts: int = 1,
     ) -> None:
         self.succeeded = succeeded
         self.http_status = http_status
         self.detail = detail
         self.state = state or {}
+        self.transient = transient
+        self.attempts = attempts
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,13 +74,23 @@ class ChaosResetOutcome:
             "http_status": self.http_status,
             "detail": self.detail,
             "state": self.state,
+            "transient": self.transient,
+            "attempts": self.attempts,
         }
 
 
 class ChaosClient:
-    def __init__(self, token: str, timeout: float = 5.0) -> None:
+    def __init__(
+        self,
+        token: str,
+        timeout: float = 5.0,
+        reset_max_attempts: int = 3,
+        reset_backoff_seconds: float = 0.25,
+    ) -> None:
         self.token = token
         self.timeout = timeout
+        self.reset_max_attempts = max(1, int(reset_max_attempts))
+        self.reset_backoff_seconds = max(0.0, float(reset_backoff_seconds))
 
     @property
     def configured(self) -> bool:
@@ -124,14 +141,66 @@ class ChaosClient:
                 ),
             )
         url = f"{base_url.rstrip('/')}/api/chaos/reset"
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(url, headers=self._headers())
-        except httpx.HTTPError as exc:
+        last_error = ""
+        for attempt in range(1, self.reset_max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.post(url, headers=self._headers())
+                break
+            except (
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.ReadTimeout,
+                httpx.PoolTimeout,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+                httpx.ReadError,
+                httpx.WriteError,
+                OSError,
+                socket.gaierror,
+                TimeoutError,
+                ConnectionError,
+            ) as exc:
+                last_error = str(exc)[:200]
+                if attempt >= self.reset_max_attempts:
+                    return ChaosResetOutcome(
+                        succeeded=False,
+                        http_status=None,
+                        detail=(
+                            "chaos reset request failed after "
+                            f"{attempt} transient transport attempt(s): {last_error}"
+                        ),
+                        transient=True,
+                        attempts=attempt,
+                    )
+                delay = self.reset_backoff_seconds * (2 ** (attempt - 1))
+                if delay > 0:
+                    delay += random.uniform(0.0, self.reset_backoff_seconds)
+                logger.warning(
+                    "chaos_reset_transient_failure_retrying",
+                    extra={
+                        "target_url": url,
+                        "attempt": attempt,
+                        "max_attempts": self.reset_max_attempts,
+                        "error_detail": last_error,
+                    },
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            except httpx.HTTPError as exc:
+                return ChaosResetOutcome(
+                    succeeded=False,
+                    http_status=None,
+                    detail=f"chaos reset request failed: {str(exc)[:200]}",
+                    attempts=attempt,
+                )
+        else:  # pragma: no cover - the loop always returns or breaks
             return ChaosResetOutcome(
                 succeeded=False,
                 http_status=None,
-                detail=f"chaos reset request failed: {str(exc)[:200]}",
+                detail=f"chaos reset request failed: {last_error}",
+                transient=True,
+                attempts=self.reset_max_attempts,
             )
 
         if resp.status_code == 404:
@@ -145,12 +214,14 @@ class ChaosClient:
                     "false, so this means one of: bad token, chaos disabled, or route "
                     "absent. Cannot distinguish from the response."
                 ),
+                attempts=attempt,
             )
         if resp.status_code != 200:
             return ChaosResetOutcome(
                 succeeded=False,
                 http_status=resp.status_code,
                 detail=f"chaos reset returned HTTP {resp.status_code}",
+                attempts=attempt,
             )
 
         try:
@@ -162,6 +233,7 @@ class ChaosClient:
             http_status=200,
             detail="chaos reset accepted (per-pod; verify via chaos_* gauges)",
             state=state if isinstance(state, dict) else {},
+            attempts=attempt,
         )
 
 
