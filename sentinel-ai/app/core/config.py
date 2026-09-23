@@ -211,8 +211,41 @@ class Settings(BaseSettings):
     deep_investigation_max_per_incident: int = 1
     # Hard ceiling on the raw model response size Sentinel will even attempt
     # to json.loads — rejected before parsing, independent of whatever
-    # output-size behaviour the provider itself has.
+    # output-size behaviour the provider itself has. Applies to EVERY turn of
+    # the iterative loop below, not just a final proposal.
     deep_investigation_output_max_chars: int = 4000
+
+    # ---- Deep Investigation: bounded iterative tool-use loop -------------
+    # See lifecycle/deep_investigation.py's module docstring and
+    # lifecycle/deep_investigation_tools.py for what these bound. Every one
+    # of these is a hard ceiling checked in code, never something a model
+    # response can raise — a proposal/turn that would exceed one is simply
+    # the point the loop stops and (if no proposal was produced yet) returns
+    # `no_safe_fix`, it never silently allows "just one more".
+    #
+    # One LLM call per iteration (at most one tool call requested per
+    # iteration), so max_iterations IS the turn budget.
+    deep_investigation_max_iterations: int = 6
+    # Separate from max_iterations even though today they move in lockstep
+    # (one tool call per turn): a future turn shape that let one turn request
+    # several tool calls would still need its own ceiling on the total, and
+    # existing tests already assert against this constant by name.
+    deep_investigation_max_tool_calls: int = 8
+    # Wall-clock budget for the WHOLE investigation (all iterations, all tool
+    # calls) — independent of any single provider-call timeout, because a
+    # bounded loop of otherwise-fast calls can still add up.
+    deep_investigation_max_seconds: float = 90.0
+    # Hard ceiling on one tool call's result before it is folded into the next
+    # turn's prompt — the same "evidence collector, not a log viewer" posture
+    # as KubernetesClient.MAX_LOG_TAIL_LINES, applied uniformly to every tool
+    # in the registry regardless of what it wraps.
+    deep_investigation_tool_output_max_chars: int = 3000
+    # A turn whose JSON is malformed, or names an action/tool this build does
+    # not recognise, does not immediately abort the investigation (a model can
+    # recover on the next turn) — but two IN A ROW means something is
+    # structurally wrong (a bad prompt, a provider serving garbage) and
+    # continuing to spend calls on it is not "bounded", it is "slow to fail".
+    deep_investigation_max_consecutive_malformed_turns: int = 2
 
     # ---- Validation ------------------------------------------------------
     validation_settle_seconds: int = 20

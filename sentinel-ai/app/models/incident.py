@@ -823,17 +823,76 @@ class AttemptRecord:
 # requirement that the four known actions do not carry.
 # ---------------------------------------------------------------------------
 class NovelActionType(str, Enum):
-    """The complete, closed set of typed operations a Deep Investigation
-    proposal may request. Deliberately small: each member maps to exactly
-    one narrowly-scoped KubernetesClient write method, never a generic
-    "patch this manifest" escape hatch (see that module's own docstring on
-    why no such method exists). Extending this set means adding a new
-    KubernetesClient method, a new RemediationEngine dispatch branch and a
-    new PolicyEngine precondition together - never on its own.
+    """The closed set of typed operations a Deep Investigation proposal may
+    request — the "remediation DSL" (spec section 3). Each member maps to
+    exactly one narrowly-scoped KubernetesClient write method, never a
+    generic "patch this manifest" escape hatch (see that module's own
+    docstring on why no such method exists). Extending this set means adding
+    a new KubernetesClient method, a new RemediationEngine dispatch branch
+    and a new PolicyEngine precondition together - never on its own.
+
+    Six members, deliberately not the full candidate list a novel-remediation
+    brief might suggest (e.g. a generic PATCH_DEPLOYMENT_FIELD, a
+    PATCH_SERVICE_FIELD, or a PATCH_CONFIG_REFERENCE that points an env var at
+    a ConfigMap/Secret key). Those three are left OUT on purpose, not merely
+    "not yet done":
+
+      * PATCH_DEPLOYMENT_FIELD, taken generically ("patch any field"), is
+        exactly the arbitrary-patch escape hatch this codebase refuses to
+        build (see this module's own header docstring). Every field this
+        DSL CAN safely patch already has its own narrow, named member below.
+      * PATCH_SERVICE_FIELD touches Service selectors/ports, i.e. traffic
+        routing — "networking" in the security boundary's own words (see
+        lifecycle/deep_investigation.py's module docstring, "must not: ...
+        modify networking/security controls"). It is excluded on that
+        boundary, not on engineering difficulty.
+      * PATCH_CONFIG_REFERENCE (pointing an env var at a ConfigMap/Secret key
+        instead of a literal) is excluded because it is one hop from
+        "access secrets" — a `valueFrom.secretKeyRef` looks identical in
+        shape to a ConfigMap reference in the patch body, and the same
+        boundary that refuses SET_ENV_VAR for a sensitive-looking key name
+        would have to be re-derived for a reference type most operators
+        cannot tell apart from a secret mount at a glance. Not worth the
+        risk for a capability nothing in this codebase's remediation history
+        has ever needed.
+
+    Each remaining member below fits the SAME architecture the original two
+    did: a narrow KubernetesClient method, independent target/parameter
+    validation in deep_investigation.apply_llm_response, a PolicyEngine
+    precondition in evaluate_deep_proposal, and a RemediationEngine executor
+    in execute_deep. See each one's own comment for what makes it safe.
     """
 
     SET_ENV_VAR = "set_env_var"
     UNSET_ENV_VAR = "unset_env_var"
+    # Change one container's image. Deliberately NOT "any image the model
+    # names": apply_llm_response only accepts an image that literally
+    # appears in this incident's OWN replicaset_history evidence (i.e. a
+    # real image this exact Deployment has actually run before) — a
+    # generalisation of "roll back", not a door to running arbitrary
+    # attacker- or hallucination-supplied images. See that function's
+    # `_validate_image_target` for the check.
+    UPDATE_CONTAINER_IMAGE = "update_container_image"
+    # Change spec.replicas. Overlaps in mechanism with the existing
+    # autonomous SCALE_DEPLOYMENT (same KubernetesClient.scale_deployment
+    # write, same [min_replicas, max_replicas] band re-asserted by policy and
+    # by the engine) but reachable from Deep Investigation's evidence-driven
+    # reasoning rather than only the rule engine's fixed replica math — e.g.
+    # "these three pods are all OOMKilled and the fourth is healthy, drop to
+    # 1 replica to stop the crash loop while a human looks" is a legitimate
+    # deep-investigation conclusion the rule engine's decision.py has no
+    # branch for.
+    UPDATE_REPLICAS = "update_replicas"
+    # Override one container's entrypoint/args. Always classified "high"
+    # risk (see deep_investigation._assess_deep_risk) — unlike an env var,
+    # this changes what the container literally executes, which is a bigger
+    # behavioural change than anything else in this DSL. Still typed and
+    # bounded: a list[str] argv, applied via a Kubernetes strategic-merge
+    # patch, NEVER a shell string — there is no `sh -c` anywhere in the
+    # executor, so a value containing shell metacharacters is just an inert
+    # argv element, never something a shell interprets.
+    UPDATE_CONTAINER_COMMAND = "update_container_command"
+    UPDATE_CONTAINER_ARGS = "update_container_args"
 
     @classmethod
     def parse(cls, raw: Any) -> "NovelActionType | None":
@@ -851,6 +910,15 @@ class NovelActionType(str, Enum):
         return None
 
 
+# Action types whose target is an environment variable (container/key/value
+# on DeepActionTarget). Used by deep_investigation.py, policy.py and
+# remediation.py so "is this an env-var-shaped proposal" is asked the same
+# way in all three rather than each re-deriving it.
+ENV_VAR_ACTION_TYPES: frozenset[NovelActionType] = frozenset(
+    {NovelActionType.SET_ENV_VAR, NovelActionType.UNSET_ENV_VAR}
+)
+
+
 class DeepProposalStatus(str, Enum):
     SUGGESTED = "suggested"
     AUTHORIZED = "authorized"
@@ -866,21 +934,66 @@ class DeepProposalStatus(str, Enum):
 class DeepActionTarget:
     """The closed, typed parameter shape for a novel remediation action.
 
-    No field here can carry a shell command, a file path outside a
-    container's declared env, or an arbitrary Kubernetes object reference -
-    only exactly what `patch_deployment_env_var` / `remove_deployment_env_var`
-    take. `previous_value` is captured by Python (from live evidence, not
-    from the model) at proposal-build time so the action is always
-    revertible without asking the model to remember what it saw.
+    No field here can carry a shell command interpreted by a shell, a file
+    path outside a container's declared spec, or an arbitrary Kubernetes
+    object reference - only exactly what the six typed KubernetesClient
+    methods this DSL dispatches to take (`patch_deployment_env_var` /
+    `remove_deployment_env_var` / `patch_deployment_container_image` /
+    `scale_deployment` / `patch_deployment_container_command` /
+    `patch_deployment_container_args`). Every `previous_*` field is captured
+    by Python (from live evidence, never from the model) at proposal-build
+    time so every action is always revertible without asking the model to
+    remember what it saw.
+
+    One dataclass shared by all six action types, rather than one per type,
+    because exactly one of {key/value, image, replicas, command, args} is
+    ever populated for a given `action_type` and the alternative (six
+    near-identical dataclasses) would just move the "which fields are
+    actually meaningful here" question from a docstring to a type registry
+    without removing it. `NovelActionType` says which field(s) apply; see
+    deep_investigation.apply_llm_response for the per-type construction and
+    remediation.py's `execute_deep` for the per-type dispatch.
     """
 
     namespace: str | None = None
     deployment: str | None = None
+
+    # ---- set_env_var / unset_env_var -------------------------------------
     container: str | None = None
     key: str | None = None
     value: str | None = None
     previous_value: str | None = None
     previous_value_existed: bool = False
+
+    # ---- update_container_image -------------------------------------------
+    # `container` above is reused as the target container for this action
+    # type too — one container-naming field for every per-container op.
+    image: str | None = None
+    previous_image: str | None = None
+
+    # ---- update_replicas ---------------------------------------------------
+    replicas: int | None = None
+    previous_replicas: int | None = None
+
+    # ---- update_container_command / update_container_args -----------------
+    # Both are argv-shaped lists, NEVER a shell string — see
+    # NovelActionType.UPDATE_CONTAINER_COMMAND's own comment. `None` means
+    # "use the container's own image ENTRYPOINT/CMD" (clearing an override),
+    # which is itself a legitimate, revertible proposal.
+    command: list[str] | None = None
+    previous_command: list[str] | None = None
+    args: list[str] | None = None
+    previous_args: list[str] | None = None
+    # Whichever of command/args this proposal did NOT touch had no
+    # previous value to capture in the first place; these two flags say
+    # whether `previous_command`/`previous_args` were populated FROM the
+    # container's real spec (True) or are simply unset because this
+    # proposal is the other type of override entirely (False) — the same
+    # existed/absent distinction `previous_value_existed` already draws for
+    # env vars, generalised to a field that can legitimately be `None` on
+    # its own account.
+    previous_command_existed: bool = False
+    previous_args_existed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -891,6 +1004,16 @@ class DeepActionTarget:
             "value": self.value,
             "previous_value": self.previous_value,
             "previous_value_existed": self.previous_value_existed,
+            "image": self.image,
+            "previous_image": self.previous_image,
+            "replicas": self.replicas,
+            "previous_replicas": self.previous_replicas,
+            "command": self.command,
+            "previous_command": self.previous_command,
+            "args": self.args,
+            "previous_args": self.previous_args,
+            "previous_command_existed": self.previous_command_existed,
+            "previous_args_existed": self.previous_args_existed,
         }
 
     @classmethod
@@ -904,6 +1027,180 @@ class DeepActionTarget:
             value=data.get("value"),
             previous_value=data.get("previous_value"),
             previous_value_existed=bool(data.get("previous_value_existed", False)),
+            image=data.get("image"),
+            previous_image=data.get("previous_image"),
+            replicas=data.get("replicas"),
+            previous_replicas=data.get("previous_replicas"),
+            command=list(data["command"]) if data.get("command") is not None else None,
+            previous_command=(
+                list(data["previous_command"])
+                if data.get("previous_command") is not None
+                else None
+            ),
+            args=list(data["args"]) if data.get("args") is not None else None,
+            previous_args=(
+                list(data["previous_args"]) if data.get("previous_args") is not None else None
+            ),
+            previous_command_existed=bool(data.get("previous_command_existed", False)),
+            previous_args_existed=bool(data.get("previous_args_existed", False)),
+        )
+
+
+class DeepInvestigationTrigger(str, Enum):
+    """How a Deep Investigation run started. Purely descriptive (drives no
+    branching in policy/remediation — both proposal sources are gated
+    identically), but it is exactly what spec section 1 means by "share
+    implementation, do not duplicate logic": both members enter the SAME
+    `deep_investigation.investigate_deep` call and the SAME
+    `PolicyEngine.evaluate_deep_proposal` gate; this field only records,
+    for audit and for the GUI, which door the operator came in through.
+    """
+
+    AUTO = "auto"
+    SUGGEST_FIX = "suggest_fix"
+
+
+@dataclass
+class ToolCallRecord:
+    """One read-only tool invocation inside a bounded investigation loop.
+
+    Always the record of something that actually ran: `deep_investigation.py`
+    appends one of these for EVERY tool call it makes, before folding the
+    result into the next turn's prompt, so an audit trail entry always
+    corresponds to a real KubernetesClient/PrometheusClient/LokiClient call —
+    never to something the model merely claimed it saw (see
+    deep_investigation_tools.py's module docstring for how that guarantee is
+    enforced structurally, not just by convention).
+    """
+
+    tool: str
+    params: dict[str, Any] = field(default_factory=dict)
+    at: float = field(default_factory=time.time)
+    succeeded: bool = True
+    # A bounded, human/audit-readable summary of what the tool returned —
+    # never the full payload (see Settings.deep_investigation_tool_output_max_chars).
+    result_summary: str = ""
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool": self.tool,
+            "params": self.params,
+            "at": self.at,
+            "at_iso": iso(self.at),
+            "succeeded": self.succeeded,
+            "result_summary": self.result_summary,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ToolCallRecord":
+        return cls(
+            tool=data["tool"],
+            params=data.get("params") or {},
+            at=data.get("at", time.time()),
+            succeeded=data.get("succeeded", True),
+            result_summary=data.get("result_summary", ""),
+            error=data.get("error"),
+        )
+
+
+@dataclass
+class InvestigationIteration:
+    """One turn of the bounded loop: the model's stated hypothesis at that
+    point, and the (at most one) tool call it requested. `tool_call` is None
+    on the FINAL iteration, which instead ends in a proposal or `no_safe_fix`
+    (recorded on the enclosing `DeepInvestigationTrace`, not here)."""
+
+    iteration: int
+    hypothesis: str = ""
+    tool_call: ToolCallRecord | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "iteration": self.iteration,
+            "hypothesis": self.hypothesis,
+            "tool_call": self.tool_call.to_dict() if self.tool_call else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "InvestigationIteration":
+        return cls(
+            iteration=data["iteration"],
+            hypothesis=data.get("hypothesis", ""),
+            tool_call=(
+                ToolCallRecord.from_dict(data["tool_call"]) if data.get("tool_call") else None
+            ),
+        )
+
+
+@dataclass
+class DeepInvestigationTrace:
+    """The complete, append-only audit record of ONE bounded investigation
+    run — every iteration, every tool call and its real result, and how it
+    ended. This is what spec section 2's "every returned result must be
+    recorded in incident evidence/audit history" means concretely, and what
+    the GUI's investigation-progress view (section 10) reads: nothing about
+    "investigating" / "proposing" / "unable to produce a safe fix" is ever
+    displayed without one of these backing it.
+
+    Kept on the incident as `Incident.deep_investigation_traces`
+    (append-only, mirroring `deep_proposals`/`escalation_history`) rather
+    than folded into a `DeepRemediationProposal`, because a run that ends in
+    `no_safe_fix` produces no proposal at all — the trace is the only record
+    that an investigation happened, and it must exist independently of
+    whether one succeeded.
+    """
+
+    id: str
+    incident_id: str
+    trigger: DeepInvestigationTrigger
+    started_at: float
+    finished_at: float | None = None
+    iterations: list[InvestigationIteration] = field(default_factory=list)
+    # "running" while in flight, then exactly one of "proposal" / "no_safe_fix"
+    # / "error". Never "success"/"failure" — that would conflate "did the
+    # INVESTIGATION complete" with "was a fix found", which are different
+    # questions (a clean no_safe_fix is a fully successful investigation).
+    outcome: str = "running"
+    proposal_id: str | None = None
+    reason: str = ""
+    llm_label: str = ""
+    tool_call_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "incident_id": self.incident_id,
+            "trigger": self.trigger.value,
+            "started_at": self.started_at,
+            "started_at_iso": iso(self.started_at),
+            "finished_at": self.finished_at,
+            "finished_at_iso": iso(self.finished_at) if self.finished_at else None,
+            "iterations": [i.to_dict() for i in self.iterations],
+            "outcome": self.outcome,
+            "proposal_id": self.proposal_id,
+            "reason": self.reason,
+            "llm_label": self.llm_label,
+            "tool_call_count": self.tool_call_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DeepInvestigationTrace":
+        return cls(
+            id=data["id"],
+            incident_id=data["incident_id"],
+            trigger=DeepInvestigationTrigger(data.get("trigger", "auto")),
+            started_at=data.get("started_at", time.time()),
+            finished_at=data.get("finished_at"),
+            iterations=[
+                InvestigationIteration.from_dict(i) for i in data.get("iterations") or []
+            ],
+            outcome=data.get("outcome", "running"),
+            proposal_id=data.get("proposal_id"),
+            reason=data.get("reason", ""),
+            llm_label=data.get("llm_label", ""),
+            tool_call_count=data.get("tool_call_count", 0),
         )
 
 
@@ -1077,8 +1374,20 @@ class Incident:
     # Bounds how many times ONE incident may trigger a Deep Investigation
     # call, independent of MAX_LIFECYCLE_CYCLES: a pathological incident that
     # keeps re-escalating must not keep spending LLM calls on new proposals
-    # forever (see orchestrator.py's `_maybe_deep_investigate`).
+    # forever (see orchestrator.py's `_maybe_deep_investigate`). Shared by
+    # BOTH the automatic path and an operator's explicit "Suggest Fix" —
+    # spec section 1 requires them to share the same underlying
+    # implementation and the same bound, not a separate budget each.
     deep_investigation_count: int = 0
+    # Append-only audit trace of every bounded investigation run (see
+    # DeepInvestigationTrace) — the "investigation progress"/"evidence
+    # collected" the GUI reads, independent of whether a run produced a
+    # proposal. `deep_investigation_running` is true for exactly the
+    # duration of an in-flight run (auto or Suggest Fix); nothing else sets
+    # it, and the orchestrator always clears it in a `finally`, so it can
+    # never get stuck true after Sentinel itself has moved on.
+    deep_investigation_traces: list[DeepInvestigationTrace] = field(default_factory=list)
+    deep_investigation_running: bool = False
 
     escalated: bool = False
     escalation_reason: EscalationReason | None = None
@@ -1166,6 +1475,8 @@ class Incident:
             "timeline": [e.to_dict() for e in self.timeline],
             "deep_proposals": [p.to_dict() for p in self.deep_proposals],
             "deep_investigation_count": self.deep_investigation_count,
+            "deep_investigation_traces": [t.to_dict() for t in self.deep_investigation_traces],
+            "deep_investigation_running": self.deep_investigation_running,
             "escalated": self.escalated,
             "escalation_reason": self.escalation_reason.value if self.escalation_reason else None,
             "escalation_detail": self.escalation_detail,
@@ -1241,6 +1552,11 @@ class Incident:
                 DeepRemediationProposal.from_dict(p) for p in data.get("deep_proposals") or []
             ],
             deep_investigation_count=data.get("deep_investigation_count", 0),
+            deep_investigation_traces=[
+                DeepInvestigationTrace.from_dict(t)
+                for t in data.get("deep_investigation_traces") or []
+            ],
+            deep_investigation_running=data.get("deep_investigation_running", False),
             escalated=data.get("escalated", False),
             escalation_reason=(
                 EscalationReason(data["escalation_reason"])

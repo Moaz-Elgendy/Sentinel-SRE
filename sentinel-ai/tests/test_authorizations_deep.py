@@ -150,10 +150,20 @@ def test_list_deep_proposals_returns_an_injected_proposal(gui_client, escalated_
     assert listed[0]["action_type"] == "set_env_var"
 
 
-def test_authorize_requires_the_incident_to_be_currently_escalated(gui_client):
-    """A fabricated 'open' incident with a suggested proposal attached must
-    still be rejected — the escalated check reads live status, exactly like
-    the known-action endpoint's own equivalent test."""
+def test_authorize_does_not_require_the_incident_to_be_currently_escalated(gui_client):
+    """A suggested deep proposal on a NON-escalated ('open') incident must
+    still be authorizable.
+
+    This is deliberately the opposite of what this test asserted before the
+    Suggest Fix flow existed: `orchestrator.suggest_fix` can produce a
+    SUGGESTED proposal on an incident that is not, and may never become,
+    ESCALATED (see its own docstring), so gating authorization on live
+    'escalated' status would make a Suggest-Fix-produced proposal
+    permanently unauthorizable. Eligibility here is carried entirely by the
+    proposal's own `status == 'suggested'` check (see
+    `test_authorize_a_non_suggested_proposal_is_409` below for that half),
+    not by the incident's status — exactly like `list_deep_proposals`,
+    which has never gated on escalation either."""
     client, login = gui_client
     headers = login(client)
 
@@ -180,7 +190,16 @@ def test_authorize_requires_the_incident_to_be_currently_escalated(gui_client):
         f"/api/incidents/INC-FAKE-OPEN-DEEP/deep-proposals/{proposal['id']}/authorize",
         headers=headers,
     )
-    assert resp.status_code == 409
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body["incident_id"] == "INC-FAKE-OPEN-DEEP"
+    assert body["proposal_id"] == proposal["id"]
+
+    listed = client.get(
+        "/api/incidents/INC-FAKE-OPEN-DEEP/authorizations", headers=headers
+    ).json()
+    assert len(listed["authorizations"]) == 1
+    assert listed["authorizations"][0]["action"] == f"deep_remediation:{proposal['id']}"
 
 
 def test_authorize_nonexistent_proposal_is_404(gui_client, escalated_incident):

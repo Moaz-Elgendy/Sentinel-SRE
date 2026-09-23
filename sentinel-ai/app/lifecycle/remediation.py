@@ -46,6 +46,7 @@ from app.clients.kubernetes_client import (
     KubernetesClient,
     KubernetesUnavailable,
     find_previous_revision,
+    looks_like_a_valid_image_reference,
 )
 from app.core.metrics import observe_remediation
 from app.models.incident import (
@@ -495,6 +496,14 @@ class RemediationEngine:
                 result = await self._set_env_var(target)
             elif verdict.action_type is NovelActionType.UNSET_ENV_VAR:
                 result = await self._unset_env_var(target)
+            elif verdict.action_type is NovelActionType.UPDATE_CONTAINER_IMAGE:
+                result = await self._update_container_image(target)
+            elif verdict.action_type is NovelActionType.UPDATE_REPLICAS:
+                result = await self._update_replicas(target)
+            elif verdict.action_type is NovelActionType.UPDATE_CONTAINER_COMMAND:
+                result = await self._update_container_command(target)
+            elif verdict.action_type is NovelActionType.UPDATE_CONTAINER_ARGS:
+                result = await self._update_container_args(target)
             else:
                 raise RemediationRefused(
                     f"no executor for deep action type {verdict.action_type.value}"
@@ -589,5 +598,108 @@ class RemediationEngine:
                 f"(previous value {'existed' if target.previous_value_existed else 'did not exist'}"
                 + (f": {target.previous_value!r}" if target.previous_value else "")
                 + "). Revert by setting it back to the previous value if it existed."
+            ),
+        )
+
+    async def _update_container_image(self, target: DeepActionTarget) -> DeepRemediationResult:
+        if not target.container or not target.image:
+            raise RemediationRefused(
+                "update_container_image reached the engine with a missing container/image"
+            )
+        # Independent re-check immediately before the write — the same
+        # posture `assert_target_permitted`/`assert_env_key_permitted` give
+        # every other deep action: `deep_investigation.apply_llm_response`
+        # and `PolicyEngine.evaluate_deep_proposal` have both already
+        # validated this image, and `KubernetesClient.
+        # patch_deployment_container_image` will check it again too — this
+        # is the third, not the only, gate, so a bug anywhere upstream still
+        # cannot end in an Init:InvalidImageName pod.
+        if not looks_like_a_valid_image_reference(target.image):
+            raise RemediationRefused(
+                f"remediation refused: {target.image!r} is not a plausible container "
+                "image reference"
+            )
+        await self.k8s.patch_deployment_container_image(
+            target.namespace, target.deployment, target.container, target.image
+        )
+        return DeepRemediationResult(
+            action_type=NovelActionType.UPDATE_CONTAINER_IMAGE,
+            target=target,
+            succeeded=True,
+            detail=(
+                f"set container {target.container}'s image to {target.image} "
+                f"(previous image: {target.previous_image!r}). Revert by setting the "
+                "image back to the previous value."
+            ),
+        )
+
+    async def _update_replicas(self, target: DeepActionTarget) -> DeepRemediationResult:
+        if target.replicas is None:
+            raise RemediationRefused(
+                "update_replicas reached the engine with no replica count"
+            )
+        # Same band as the known SCALE action, re-asserted here exactly like
+        # PolicyEngine.evaluate_deep_proposal already clamped it — this is
+        # defence in depth against a proposal object that reached this
+        # method some other way, not something a real proposal is expected
+        # to fail.
+        if target.replicas < 1:
+            raise RemediationRefused(
+                f"remediation refused: refusing to scale to {target.replicas}, which is "
+                "an outage, not a remediation"
+            )
+        clamped = max(self.min_replicas, min(self.max_replicas, target.replicas))
+        await self.k8s.scale_deployment(target.namespace, target.deployment, clamped)
+        return DeepRemediationResult(
+            action_type=NovelActionType.UPDATE_REPLICAS,
+            target=target,
+            succeeded=True,
+            detail=(
+                f"scaled to {clamped} replicas"
+                + (f" (clamped from the proposed {target.replicas})" if clamped != target.replicas else "")
+                + f" (previous: {target.previous_replicas!r}). Revert by scaling back to "
+                "the previous replica count."
+            ),
+        )
+
+    async def _update_container_command(self, target: DeepActionTarget) -> DeepRemediationResult:
+        if not target.container:
+            raise RemediationRefused(
+                "update_container_command reached the engine with no container"
+            )
+        await self.k8s.patch_deployment_container_command(
+            target.namespace, target.deployment, target.container, target.command
+        )
+        return DeepRemediationResult(
+            action_type=NovelActionType.UPDATE_CONTAINER_COMMAND,
+            target=target,
+            succeeded=True,
+            detail=(
+                f"set container {target.container}'s command override to {target.command!r} "
+                f"(previous {'existed' if target.previous_command_existed else 'did not exist'}"
+                + (f": {target.previous_command!r}" if target.previous_command else "")
+                + "). Revert by setting the command back to the previous value, or "
+                "clearing the override (None) if it did not exist before this change."
+            ),
+        )
+
+    async def _update_container_args(self, target: DeepActionTarget) -> DeepRemediationResult:
+        if not target.container:
+            raise RemediationRefused(
+                "update_container_args reached the engine with no container"
+            )
+        await self.k8s.patch_deployment_container_args(
+            target.namespace, target.deployment, target.container, target.args
+        )
+        return DeepRemediationResult(
+            action_type=NovelActionType.UPDATE_CONTAINER_ARGS,
+            target=target,
+            succeeded=True,
+            detail=(
+                f"set container {target.container}'s args override to {target.args!r} "
+                f"(previous {'existed' if target.previous_args_existed else 'did not exist'}"
+                + (f": {target.previous_args!r}" if target.previous_args else "")
+                + "). Revert by setting the args back to the previous value, or "
+                "clearing the override (None) if it did not exist before this change."
             ),
         )

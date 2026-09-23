@@ -6,7 +6,7 @@ import { ConfirmDialog } from '@/components/sentinel/ConfirmDialog'
 import { Callout } from '@/components/sentinel/States'
 import { Badge } from '@/components/ui/badge'
 import { notify } from '@/lib/notify'
-import { novelActionLabel } from '@/utils/labels'
+import { describeNovelActionTarget, novelActionLabel } from '@/utils/labels'
 
 /**
  * Authorizes exactly one Deep Investigation proposal. Unlike AuthorizeDialog
@@ -47,6 +47,7 @@ export function AuthorizeDeepProposalDialog({ incident, proposal, onOpenChange, 
   if (!proposal) return null
   const target = proposal.target ?? {}
   const targetLine = [target.deployment, target.namespace && `in ${target.namespace}`].filter(Boolean).join(' ')
+  const change = describeNovelActionTarget(proposal.action_type, target)
 
   return (
     <ConfirmDialog
@@ -69,8 +70,7 @@ export function AuthorizeDeepProposalDialog({ incident, proposal, onOpenChange, 
             ['Incident', <span key="i" className="font-mono text-xs">{incident.id}</span>],
             ['Action', novelActionLabel(proposal.action_type)],
             ['Target', `${targetLine}${target.container ? `, container ${target.container}` : ''}`],
-            ['Variable', target.key],
-            ...(proposal.action_type === 'set_env_var' ? [['New value', target.value]] : []),
+            ...(change ? [['Change', `${change.before ?? '—'} → ${change.after ?? '—'}`]] : []),
             ['Scope', 'This proposal only, used once'],
             ['Permanent policy changed', <Badge key="p" variant="ok">No</Badge>],
           ].map(([label, value]) => (

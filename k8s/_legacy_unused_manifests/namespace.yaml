@@ -1,6 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: citizen-portal
-  labels:
-    app.kubernetes.io/part-of: digital-citizen-services-portal

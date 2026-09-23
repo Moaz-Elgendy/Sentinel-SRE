@@ -42,11 +42,17 @@ export const DENIAL_REASON = {
 }
 
 // Deep Investigation's closed action set (models/incident.py's
-// NovelActionType) — deliberately just two members; see that enum's
-// docstring for why it never grows without touching the typed dispatch too.
+// NovelActionType) — six members, deliberately never a generic "patch
+// anything"; see that enum's docstring for why it never grows without
+// touching the typed dispatch (deep_investigation.py / remediation.py /
+// kubernetes_client.py) too.
 export const NOVEL_ACTION = {
   set_env_var: 'Set environment variable',
   unset_env_var: 'Remove environment variable',
+  update_container_image: 'Update container image',
+  update_replicas: 'Update replica count',
+  update_container_command: 'Update container command',
+  update_container_args: 'Update container args',
 }
 
 // lifecycle/deep_investigation.py's `_assess_deep_risk` — never "low": a
@@ -106,6 +112,48 @@ export const LLM_STATUS = {
   ok: 'LLM consulted',
   reasoner_unavailable: 'LLM unavailable, rules only',
   disabled: 'LLM disabled, rules only',
+}
+
+// Generalizes DeepRemediationProposal.target's differently-shaped fields
+// per NovelActionType into one {label, before, after} triple for display —
+// see models/incident.py's DeepActionTarget docstring for why exactly one
+// of {key/value, image, replicas, command, args} is ever populated for a
+// given action_type. Returns null for an action_type this GUI does not
+// (yet) recognise, so an unrecognised backend value fails visibly (no
+// "Proposed change" block rendered) rather than showing a wrong field.
+export function describeNovelActionTarget(actionType, target = {}) {
+  switch (actionType) {
+    case 'set_env_var':
+      return {
+        label: target.key,
+        before: target.previous_value_existed ? (target.previous_value ?? 'set') : 'unset',
+        after: target.value,
+      }
+    case 'unset_env_var':
+      return {
+        label: target.key,
+        before: target.previous_value_existed ? (target.previous_value ?? 'set') : 'unset',
+        after: 'unset',
+      }
+    case 'update_container_image':
+      return { label: target.container, before: target.previous_image, after: target.image }
+    case 'update_replicas':
+      return { label: 'replicas', before: target.previous_replicas, after: target.replicas }
+    case 'update_container_command':
+      return {
+        label: target.container,
+        before: target.previous_command_existed ? JSON.stringify(target.previous_command) : 'image default',
+        after: target.command ? JSON.stringify(target.command) : 'image default (cleared)',
+      }
+    case 'update_container_args':
+      return {
+        label: target.container,
+        before: target.previous_args_existed ? JSON.stringify(target.previous_args) : 'image default',
+        after: target.args ? JSON.stringify(target.args) : 'image default (cleared)',
+      }
+    default:
+      return null
+  }
 }
 
 export const escalationReasonLabel = (key) => ESCALATION_REASON[key] ?? sentenceCase(key)

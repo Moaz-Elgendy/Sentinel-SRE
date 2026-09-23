@@ -51,7 +51,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from pydantic import BaseModel
 
 from app.core.deps import get_current_admin
-from app.models.incident import ActionParams, Incident, RemediationAction
+from app.models.incident import ActionParams, DeepProposalStatus, Incident, RemediationAction
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +277,17 @@ def authorize_deep_proposal(
     background: BackgroundTasks,
     current_admin: dict = Depends(get_current_admin),
 ) -> dict[str, Any]:
-    incident_dict = _require_escalated_incident(request, incident_id)
+    # Deliberately NOT `_require_escalated_incident`: a Deep Investigation
+    # proposal can now come from the explicit Suggest Fix flow
+    # (orchestrator.suggest_fix), which by design works on an incident that
+    # is not, and may never become, ESCALATED — see suggest_fix's own
+    # docstring. Authorization eligibility is carried entirely by the
+    # proposal's own `status == "suggested"` check below, exactly like the
+    # rest of this endpoint already worked; only the incident-status
+    # precondition is being relaxed here.
+    incident_dict = request.app.state.store.get_incident(incident_id)
+    if incident_dict is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="incident not found")
 
     proposal = next(
         (p for p in (incident_dict.get("deep_proposals") or []) if p.get("id") == proposal_id),
@@ -361,4 +371,78 @@ def authorize_deep_proposal(
         "permanent_policy_changed": False,
         "expires_at": now + AUTHORIZATION_TTL_SECONDS,
         "detail": "processing in the background; poll GET /api/incidents/{id} for progress",
+    }
+
+
+@router.post("/{incident_id}/deep-proposals/{proposal_id}/reject")
+def reject_deep_proposal(
+    incident_id: str,
+    proposal_id: str,
+    request: Request,
+    current_admin: dict = Depends(get_current_admin),
+) -> dict[str, Any]:
+    """A human explicitly declines a suggested Deep Investigation proposal.
+
+    Unlike `/authorize`, this never touches the Kubernetes client, the
+    Policy Engine, or the Remediation Engine — it only records a status
+    change and a timeline entry, synchronously, with no incident lease and
+    no background task, because there is nothing here that mutates the
+    cluster. The one thing it does guard against is racing a concurrent
+    lifecycle/Suggest Fix run that could overwrite this exact write with a
+    stale copy of the incident record; a proposal can always still be
+    rejected once that finishes.
+    """
+    from app.routers.alerts import get_incident_manager  # noqa: PLC0415
+
+    manager = get_incident_manager(request)
+    if manager is not None and manager.is_running(incident_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "a lifecycle or Deep Investigation is currently running for this "
+                "incident; try again once it finishes"
+            ),
+        )
+
+    store = request.app.state.store
+    incident_dict = store.get_incident(incident_id)
+    if incident_dict is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="incident not found")
+
+    incident = Incident.from_dict(incident_dict)
+    proposal = next((p for p in incident.deep_proposals if p.id == proposal_id), None)
+    if proposal is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no deep proposal {proposal_id!r} on this incident",
+        )
+    if proposal.status != DeepProposalStatus.SUGGESTED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"deep proposal {proposal_id} has status {proposal.status.value!r}, not "
+                "'suggested'; it has already been authorised, executed, or rejected"
+            ),
+        )
+
+    actor = str(current_admin.get("username") or current_admin.get("id"))
+    proposal.status = DeepProposalStatus.REJECTED
+    proposal.rejected_reason = f"rejected by {actor}"
+    incident.record(
+        incident.phase,
+        f"Deep Investigation proposal {proposal_id} "
+        f"({proposal.action_type.value}) rejected by {actor}.",
+        proposal_id=proposal_id,
+        action_type=proposal.action_type.value,
+    )
+    store.upsert_incident(incident.to_dict())
+    logger.info(
+        "deep_proposal_rejected",
+        extra={"incident_id": incident_id, "proposal_id": proposal_id, "rejected_by": actor},
+    )
+    return {
+        "incident_id": incident_id,
+        "proposal_id": proposal_id,
+        "status": DeepProposalStatus.REJECTED.value,
+        "rejected_by": actor,
     }

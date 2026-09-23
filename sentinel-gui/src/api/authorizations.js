@@ -33,3 +33,19 @@ export function listDeepProposals(incidentId) {
 export function authorizeDeepProposal(incidentId, proposalId) {
   return client.post(`/api/incidents/${incidentId}/deep-proposals/${proposalId}/authorize`).then((r) => r.data)
 }
+
+/** Declines exactly one SUGGESTED proposal. Never touches the cluster —
+ * see routers/authorizations.py's reject_deep_proposal docstring. */
+export function rejectDeepProposal(incidentId, proposalId) {
+  return client.post(`/api/incidents/${incidentId}/deep-proposals/${proposalId}/reject`).then((r) => r.data)
+}
+
+/** Explicit "Suggest Fix" trigger (sentinel-ai's routers/reinvestigate.py ->
+ * orchestrator.suggest_fix). Works on ANY incident that has evidence and a
+ * hypothesis — unlike reinvestigateIncident, it does not require the
+ * incident to be currently escalated. Starts a background Deep
+ * Investigation; poll the incident (or its deep_investigation_traces /
+ * deep_proposals fields) for the outcome. */
+export function suggestFix(incidentId) {
+  return client.post(`/api/incidents/${incidentId}/suggest-fix`).then((r) => r.data)
+}

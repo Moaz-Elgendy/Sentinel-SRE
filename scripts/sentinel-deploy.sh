@@ -104,7 +104,54 @@ case "${MODE}" in
     cd "${REPO_DIR}"
     git fetch --all --tags
     git checkout --detach "${SHA}"
-    kubectl apply -k k8s/overlays/aws
+
+    # Render-then-substitute, exactly like deploy-aws.sh — and for exactly
+    # the same reason: `kubectl kustomize k8s/overlays/aws` on its own still
+    # contains ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com, :PLACEHOLDER,
+    # PUBLIC_IP_PLACEHOLDER and SENTINEL_API_UPSTREAM_PLACEHOLDER — a bare
+    # `kubectl apply -k` of it (what this mode used to do) ships every one
+    # of those literally to the cluster: unpullable images
+    # (Init:InvalidImageName, since an "ACCOUNT_ID" host segment containing
+    # an underscore is not even a syntactically valid image reference,
+    # never mind one that resolves), a CORS origin of literally
+    # "PUBLIC_IP_PLACEHOLDER", and an Alertmanager webhook that can never
+    # reach Sentinel at all — alerts fire and never become incidents, and
+    # nothing about that looks like a deploy failure. This mode must not
+    # skip the substitution step deploy-aws.sh already gets right.
+    token="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' \
+      -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')"
+    AWS_REGION="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
+      http://169.254.169.254/latest/meta-data/placement/region)"
+    AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text --region "${AWS_REGION}")"
+    PUBLIC_IP="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
+      http://169.254.169.254/latest/meta-data/public-ipv4)"
+    ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    # Same default as deploy-aws.sh: the in-cluster topology's Service DNS
+    # name. Set SENTINEL_API_UPSTREAM in the environment before calling this
+    # (e.g. `SENTINEL_API_UPSTREAM=http://<sentinel-private-ip>:8080 sudo -E
+    # sentinel-deploy.sh apply <sha>`) for the external-control-plane
+    # topology — see docs/aws-deployment.md.
+    SENTINEL_API_UPSTREAM="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
+
+    RENDERED="$(mktemp)"
+    trap 'rm -f "${RENDERED}"' EXIT
+    kubectl kustomize k8s/overlays/aws \
+      | sed -e "s|ACCOUNT_ID\.dkr\.ecr\.REGION\.amazonaws\.com|${ECR_REGISTRY}|g" \
+            -e "s|:PLACEHOLDER|:${SHA}|g" \
+            -e "s|PUBLIC_IP_PLACEHOLDER|${PUBLIC_IP}|g" \
+            -e "s|SENTINEL_API_UPSTREAM_PLACEHOLDER|${SENTINEL_API_UPSTREAM}|g" \
+      > "${RENDERED}"
+
+    # Same fail-loud guard as deploy-aws.sh: a survived placeholder must
+    # stop the deploy, not silently reach the cluster.
+    if grep -qE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${RENDERED}"; then
+      echo "ERROR: unsubstituted placeholders remain in the rendered manifests:" >&2
+      grep -nE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${RENDERED}" >&2
+      exit 1
+    fi
+
+    kubectl apply -f "${RENDERED}"
+
     # A manifest-changing deploy is exactly the moment to also refresh this
     # script from the checkout, since the checkout is already at ${SHA}.
     # Best-effort: a missing scripts/sentinel-deploy.sh (very old SHA)
