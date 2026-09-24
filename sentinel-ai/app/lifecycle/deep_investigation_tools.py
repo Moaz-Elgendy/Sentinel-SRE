@@ -385,9 +385,9 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
 
 def describe_evidence_sources_for_prompt() -> str:
     lines = []
-        for name in TOOL_SPECS:
-            lines.append(f'- "{name}"')
-        return "\n".join(lines)
+    for name in TOOL_SPECS:
+        lines.append(f'- "{name}"')
+    return "\n".join(lines)
 
 
 async def call_tool(ctx: ToolContext, name: Any, params: Any) -> ToolResult:
