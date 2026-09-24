@@ -113,11 +113,11 @@ class Settings(BaseSettings):
     # forth between providers never requires re-typing another provider's
     # settings. Nothing outside app/reasoning/ knows Groq exists.
     groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-20b"
     groq_timeout_seconds: float = 20.0
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
     gemini_timeout_seconds: float = 20.0
 
     # Empty key => rule-based RCA only. Everything still works; we log it and

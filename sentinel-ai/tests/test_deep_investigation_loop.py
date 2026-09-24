@@ -68,9 +68,11 @@ class ScriptedReasoner(Reasoner):
     def __init__(self, turns: list[dict]):
         self._turns = list(turns)
         self.calls = 0
+        self.user_prompts: list[str] = []
 
     async def complete_json(self, system_prompt: str, user_prompt: str) -> str | None:
         self.calls += 1
+        self.user_prompts.append(user_prompt)
         if not self._turns:
             return json.dumps({"action": "no_safe_fix", "reason": "script exhausted"})
         return json.dumps(self._turns.pop(0))
@@ -118,10 +120,10 @@ async def test_tool_discovered_image_produces_a_grounded_proposal():
     reasoner = ScriptedReasoner(
         [
             {
-                "action": "call_tool",
+                "action": "request_evidence",
                 "hypothesis": "the current image may be a bad/placeholder deploy; check history",
-                "tool": "inspect_previous_revision",
-                "tool_params": {},
+                "evidence_source": "inspect_previous_revision",
+                "parameters": {},
             },
             {
                 "action": "propose",
@@ -165,6 +167,44 @@ async def test_tool_discovered_image_produces_a_grounded_proposal():
     assert tool_call.tool == "inspect_previous_revision"
     assert tool_call.succeeded is True
     assert "revision" in tool_call.result_summary or "2" in tool_call.result_summary
+    assert len(reasoner.user_prompts) == 2
+    assert "EVIDENCE RESULT" in reasoner.user_prompts[1]
+    assert REAL_IMAGE in reasoner.user_prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_native_style_tool_call_is_rejected_without_running_a_collector():
+    incident, evidence, hypothesis, tool_ctx = _bad_deployment_incident_and_evidence()
+
+    class NativeStyleReasoner(ScriptedReasoner):
+        pass
+
+    reasoner = NativeStyleReasoner(
+        [
+            {
+                "action": "call_tool",
+                "tool": "inspect_replicasets",
+                "tool_params": {},
+            },
+            {"action": "no_safe_fix", "reason": "native-style output was rejected"},
+        ]
+    )
+
+    proposal, trace = await investigate_deep(
+        incident,
+        evidence,
+        hypothesis,
+        attempted_summary=[],
+        reasoner=reasoner,
+        tool_ctx=tool_ctx,
+        trigger=DeepInvestigationTrigger.SUGGEST_FIX,
+    )
+
+    assert proposal is None
+    assert trace.outcome == "no_safe_fix"
+    assert trace.tool_call_count == 0
+    assert all(iteration.tool_call is None for iteration in trace.iterations)
+    assert "native-style tool/function call" in reasoner.user_prompts[1]
 
 
 @pytest.mark.asyncio
