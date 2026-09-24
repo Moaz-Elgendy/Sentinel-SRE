@@ -62,6 +62,9 @@ def test_reset_posts_to_configured_endpoint_and_returns_http_result(monkeypatch)
     requests: list[httpx.Request] = []
 
     class FakeAsyncClient:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
         async def __aenter__(self):
             return self
 
@@ -87,6 +90,9 @@ def test_reset_retries_transient_dns_failure(monkeypatch):
     attempts = 0
 
     class FakeAsyncClient:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
         async def __aenter__(self):
             return self
 
