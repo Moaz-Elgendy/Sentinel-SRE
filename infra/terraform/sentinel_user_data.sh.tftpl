@@ -110,6 +110,11 @@ LOKI_URL=http://${k3s_private_ip}:${loki_port}
 # from this instance. Reverse direction (Alertmanager -> Sentinel webhook) is
 # unrelated and unchanged: ${webhook_port} below.
 ALERTMANAGER_URL=http://${k3s_private_ip}:${alertmanager_port}
+# The chaos API is owned by each application service; these are private
+# NodePorts reachable only from the Sentinel security group. Kubernetes
+# ClusterIP names (citizen-service/notification-service) do not resolve here.
+CITIZEN_SERVICE_URL=http://${k3s_private_ip}:${citizen_chaos_port}
+NOTIFICATION_SERVICE_URL=http://${k3s_private_ip}:${notification_chaos_port}
 
 CUSTOMER_ID=demo-customer
 ENVIRONMENT_ID=demo-env-remote

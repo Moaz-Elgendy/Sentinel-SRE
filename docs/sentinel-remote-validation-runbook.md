@@ -56,9 +56,19 @@ sudo kubectl apply -k k8s/overlays/aws/
 sudo kubectl -n citizen-portal get svc prometheus-nodeport loki-nodeport
 ```
 
-Confirm both show `NodePort` type with `9090:30090/TCP` and `3100:30100/TCP`.
-This does not change the existing ClusterIP Services or anything else in the
-overlay — it only adds two new Services.
+Confirm the output includes these private NodePorts:
+
+```text
+prometheus-nodeport                    9090:30090/TCP
+loki-nodeport                          3100:30100/TCP
+citizen-service-chaos-nodeport         8000:30080/TCP
+notification-service-chaos-nodeport    8000:30081/TCP
+```
+
+The last two Services select the application pods because those applications
+own `/api/chaos/status` and `/api/chaos/reset`; there is no separate chaos
+deployment. They are not public endpoints: the K3s security group permits
+30080/30081 only when traffic comes from the Sentinel security group.
 
 ## Step 2 — Generate the Kubernetes credential for external Sentinel
 
@@ -153,6 +163,28 @@ sudo systemctl status sentinel-ai
 sudo journalctl -u sentinel-ai -n 100 --no-pager
 curl -s http://localhost:8080/readyz | jq .
 curl -s http://localhost:8080/environments | jq .
+```
+
+The bootstrap writes `CITIZEN_SERVICE_URL` and
+`NOTIFICATION_SERVICE_URL` into `/etc/sentinel-ai.env` using the K3s private
+IP and ports 30080/30081. They must not be the Kubernetes-only names
+`citizen-service` or `notification-service` on this instance. From the same
+Sentinel SSM session, verify status, reset, and status again without printing
+the token:
+
+```bash
+set -a; . /etc/sentinel-ai.env; set +a
+for url in "$CITIZEN_SERVICE_URL" "$NOTIFICATION_SERVICE_URL"; do
+  curl --fail --silent --show-error -H "X-Chaos-Token: $CHAOS_ADMIN_TOKEN" "$url/api/chaos/status"
+  curl --fail --silent --show-error -X POST -H "X-Chaos-Token: $CHAOS_ADMIN_TOKEN" "$url/api/chaos/reset"
+  curl --fail --silent --show-error -H "X-Chaos-Token: $CHAOS_ADMIN_TOKEN" "$url/api/chaos/status"
+done
+```
+
+Finally, execute `ChaosClient.reset()` inside the Sentinel container itself:
+
+```bash
+docker exec sentinel-ai python -c 'import asyncio,os; from app.clients.chaos_client import ChaosClient; print(asyncio.run(ChaosClient(os.environ["CHAOS_ADMIN_TOKEN"]).reset(os.environ["CITIZEN_SERVICE_URL"])).to_dict())'
 ```
 
 The bootstrapped environment's id is `demo-env-remote` (see

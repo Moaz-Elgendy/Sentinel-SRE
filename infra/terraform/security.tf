@@ -186,6 +186,36 @@ resource "aws_vpc_security_group_ingress_rule" "alertmanager_from_sentinel" {
   }
 }
 
+resource "aws_vpc_security_group_ingress_rule" "citizen_service_chaos_from_sentinel" {
+  count = var.enable_remote_sentinel ? 1 : 0
+
+  security_group_id            = aws_security_group.k3s_node.id
+  description                  = "Citizen-service chaos API NodePort, from the external Sentinel instance only"
+  referenced_security_group_id = aws_security_group.sentinel[0].id
+  from_port                    = var.citizen_service_chaos_nodeport
+  to_port                      = var.citizen_service_chaos_nodeport
+  ip_protocol                  = "tcp"
+
+  tags = {
+    Name = "${var.project_name}-ingress-citizen-chaos-from-sentinel"
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "notification_service_chaos_from_sentinel" {
+  count = var.enable_remote_sentinel ? 1 : 0
+
+  security_group_id            = aws_security_group.k3s_node.id
+  description                  = "Notification-service chaos API NodePort, from the external Sentinel instance only"
+  referenced_security_group_id = aws_security_group.sentinel[0].id
+  from_port                    = var.notification_service_chaos_nodeport
+  to_port                      = var.notification_service_chaos_nodeport
+  ip_protocol                  = "tcp"
+
+  tags = {
+    Name = "${var.project_name}-ingress-notification-chaos-from-sentinel"
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Sentinel Control Center GUI — public :80 entrypoint on the Sentinel
 # instance itself (sentinel-gui's own nginx, see

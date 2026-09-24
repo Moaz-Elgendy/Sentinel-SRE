@@ -401,3 +401,15 @@ variable "alertmanager_nodeport" {
   type        = number
   default     = 30093
 }
+
+variable "citizen_service_chaos_nodeport" {
+  description = "Private NodePort for citizen-service's chaos API, reachable only from the external Sentinel security group."
+  type        = number
+  default     = 30080
+}
+
+variable "notification_service_chaos_nodeport" {
+  description = "Private NodePort for notification-service's chaos API, reachable only from the external Sentinel security group."
+  type        = number
+  default     = 30081
+}
