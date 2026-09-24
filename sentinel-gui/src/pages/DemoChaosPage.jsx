@@ -1,4 +1,4 @@
-import { FlaskConical, KeyRound, LoaderCircle, OctagonAlert, Play, TriangleAlert } from 'lucide-react'
+import { FlaskConical, KeyRound, LoaderCircle, OctagonAlert, Play, RotateCcw, TriangleAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { extractErrorMessage } from '@/api/client'
 import { getChaosToken, getRunStatus, listScenarios, runScenario, setChaosToken } from '@/api/chaosScenarios'
@@ -139,7 +139,7 @@ export default function DemoChaosPage() {
   useEffect(() => {
     if (!tokenSet) return
     listScenarios()
-      .then((data) => setScenarios(data.scenarios))
+      .then((data) => setScenarios(data.scenarios.filter((scenario) => !scenario.recovery)))
       .catch((err) => {
         setScenarios([])
         setError(extractErrorMessage(err, 'Could not load chaos scenarios.'))
@@ -181,6 +181,21 @@ export default function DemoChaosPage() {
               <RunStatus run={activeRun} />
             </Panel>
           )}
+          <Panel title="Recovery" icon={RotateCcw}>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="max-w-2xl text-sm text-muted-foreground">
+                Clear active chaos faults and recover the demo cluster if a scenario left a service down.
+              </p>
+              <Button
+                variant="destructive"
+                disabled={Boolean(runningId)}
+                onClick={() => handleRun('reset-all', false)}
+              >
+                {runningId === 'reset-all' ? <LoaderCircle className="animate-spin" /> : <RotateCcw />}
+                {runningId === 'reset-all' ? 'Recovering…' : 'Reset active scenarios'}
+              </Button>
+            </div>
+          </Panel>
           <Panel title="Scenarios" flush>
             {loading ? (
               <SkeletonRows rows={2} />

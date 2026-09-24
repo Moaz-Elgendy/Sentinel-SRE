@@ -338,6 +338,48 @@ reset_chaos_fault() {
     -H "X-Chaos-Token: $CHAOS_TOKEN" >/dev/null 2>&1 || true
 }
 
+scenario_reset_all() {
+  echo "=== Recovery: reset active chaos scenarios ==="
+  echo "    Clearing reachable in-process faults and undoing only known"
+  echo "    incident-scenarios.sh platform/release mutations."
+  require_token
+
+  # These port-forwards are best-effort: a platform scenario may have taken
+  # the application down, but the kubectl recovery checks below still run.
+  port_forward citizen-service "$CITIZEN_PORT" 8000
+  port_forward notification-service "$NOTIF_PORT" 8000
+  reset_chaos_fault "$CITIZEN_PORT"
+  reset_chaos_fault "$NOTIF_PORT"
+
+  local command env_values replicas
+  command=$(kubectl get deployment citizen-service -n "$NAMESPACE" \
+    -o jsonpath='{.spec.template.spec.containers[0].command[*]}' 2>/dev/null || true)
+  if echo "$command" | grep -q 'incident-scenarios.sh.*crashloop'; then
+    echo "    Detected the scenario crashloop command; rolling back citizen-service..."
+    kubectl rollout undo deployment citizen-service -n "$NAMESPACE"
+    kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s
+  fi
+
+  env_values=$(kubectl get deployment citizen-service -n "$NAMESPACE" \
+    -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' \
+    2>/dev/null || true)
+  if echo "$env_values" | grep -q 'DATABASE_HOST=citizen-postgres-does-not-exist.invalid'; then
+    echo "    Detected the scenario bad-deployment database host; rolling back citizen-service..."
+    kubectl rollout undo deployment citizen-service -n "$NAMESPACE"
+    kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s
+  fi
+
+  replicas=$(kubectl get deployment citizen-service -n "$NAMESPACE" \
+    -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
+  if [ "$replicas" = "0" ]; then
+    echo "    Detected the scenario full-outage scale-to-zero; restoring one replica..."
+    kubectl scale deployment citizen-service -n "$NAMESPACE" --replicas=1
+    kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s
+  fi
+
+  echo "=== reset-all: recovery command completed ==="
+}
+
 scenario_db_outage() {
   echo "=== Scenario: citizen-service database outage ==="
   echo "    What an operator/Sentinel would see: /readyz returns 503, citizen-facing"
@@ -713,6 +755,7 @@ case "$SCENARIO" in
   memory-leak) scenario_memory_leak ;;
   crashloop) scenario_crashloop ;;
   bad-deployment) scenario_bad_deployment ;;
+  reset-all) scenario_reset_all ;;
   all)
     # 'all' runs the seven scenarios that leave the cluster the way they
     # found it, in roughly increasing order of disruption. bad-deployment is
@@ -740,6 +783,7 @@ case "$SCENARIO" in
     echo "                           'true' (or BAD_DEPLOYMENT_AUTO_ROLLBACK=true)" >&2
     echo "  full-outage              deployment scaled to 0 replicas (kubectl)" >&2
     echo "  all                      every scenario except bad-deployment" >&2
+    echo "  reset-all                clear active chaos and recover demo mutations" >&2
     exit 1
     ;;
 esac

@@ -122,6 +122,12 @@ SCENARIOS: dict[str, dict[str, Any]] = {
         "family": "suite",
         "description": "Runs every repeatable scenario except bad-deployment.",
     },
+    "reset-all": {
+        "title": "Reset active scenarios",
+        "family": "recovery",
+        "description": "Clears active chaos faults and recovers known demo crashloop, outage, and bad-deployment mutations.",
+        "recovery": True,
+    },
 }
 
 
