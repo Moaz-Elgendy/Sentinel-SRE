@@ -42,8 +42,10 @@ resources:
   #
   # Prometheus/Loki remain reachable by the external Sentinel through
   # the restricted NodePorts below (Alertmanager's NodePort is set by
-  # patch-alertmanager-nodeport.yaml).
+  # patch-alertmanager-nodeport.yaml). The application NodePorts expose
+  # the service-owned chaos APIs only to the Sentinel security group.
   - observability-nodeport.yaml
+  - sentinel-chaos-nodeport.yaml
 
 # ---------------------------------------------------------------------------
 # Images

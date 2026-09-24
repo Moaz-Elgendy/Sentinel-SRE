@@ -48,6 +48,8 @@ require touching this file or any lifecycle module.
   ``KUBERNETES_CA_CERT_B64``. Useful when a full kubeconfig is more than the
   remote environment wants to hand over.
 """
+from urllib.parse import urlsplit
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -414,18 +416,45 @@ class Settings(BaseSettings):
         return bool(self.aws_region.strip())
 
     def base_url_for(self, target: str) -> str | None:
-        """Map a deployment name to its in-cluster base URL.
+        """Map a deployment name to a reachable service base URL.
 
         Returns None for targets we have no HTTP surface for — the validation
         phase treats that as "HTTP health check unavailable" rather than
         "unhealthy", and the rollback policy treats it as "recovery
-        validation not available" and refuses to roll back.
+        validation not available" and refuses to roll back. In remote mode,
+        Kubernetes-only Service DNS names are rejected rather than allowed to
+        fail later as an opaque name-resolution error.
         """
-        return {
+        url = {
             "citizen-service": self.citizen_service_url,
             "notification-service": self.notification_service_url,
             "frontend": self.frontend_url,
         }.get(target)
+        if url is None or self.endpoint_configuration_error(url, remote=self.kubernetes_mode != "in_cluster"):
+            return None
+        return url
+
+    @staticmethod
+    def endpoint_configuration_error(url: str, remote: bool = False) -> str | None:
+        """Return a configuration error for a service URL, if one exists."""
+        value = url.strip()
+        if not value:
+            return "endpoint is empty"
+        try:
+            parsed = urlsplit(value)
+            hostname = parsed.hostname
+            parsed.port
+        except ValueError:
+            return "endpoint has an invalid URL or port"
+        if parsed.scheme not in {"http", "https"} or not hostname:
+            return "endpoint must be an absolute http(s) URL"
+        if remote and (
+            hostname in {"citizen-service", "notification-service"}
+            or hostname.endswith(".svc")
+            or ".svc." in hostname
+        ):
+            return "Kubernetes Service DNS is only valid from inside the cluster"
+        return None
 
 
 settings = Settings()

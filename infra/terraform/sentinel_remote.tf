@@ -292,21 +292,23 @@ resource "aws_ssm_parameter" "sentinel_extra_env" {
 
 locals {
   sentinel_user_data = var.enable_remote_sentinel ? templatefile("${path.module}/sentinel_user_data.sh.tftpl", {
-    aws_region           = var.aws_region
-    ecr_registry         = local.ecr_registry
-    ecr_repo_prefix      = var.project_name
-    image_tag            = var.sentinel_image_tag
-    gui_image_tag        = var.sentinel_gui_image_tag
-    k3s_instance_id      = aws_instance.k3s.id
-    k3s_private_ip       = aws_instance.k3s.private_ip
-    webhook_port         = var.sentinel_webhook_port
-    gui_port             = 80
-    prometheus_port      = var.prometheus_nodeport
-    loki_port            = var.loki_nodeport
-    alertmanager_port    = var.alertmanager_nodeport
-    token_param_name     = "/${var.project_name}/sentinel/k8s-token"
-    ca_param_name        = "/${var.project_name}/sentinel/k8s-ca-cert-b64"
-    extra_env_param_name = "/${var.project_name}/sentinel/extra-env"
+    aws_region              = var.aws_region
+    ecr_registry            = local.ecr_registry
+    ecr_repo_prefix         = var.project_name
+    image_tag               = var.sentinel_image_tag
+    gui_image_tag           = var.sentinel_gui_image_tag
+    k3s_instance_id         = aws_instance.k3s.id
+    k3s_private_ip          = aws_instance.k3s.private_ip
+    webhook_port            = var.sentinel_webhook_port
+    gui_port                = 80
+    prometheus_port         = var.prometheus_nodeport
+    loki_port               = var.loki_nodeport
+    alertmanager_port       = var.alertmanager_nodeport
+    citizen_chaos_port      = var.citizen_service_chaos_nodeport
+    notification_chaos_port = var.notification_service_chaos_nodeport
+    token_param_name        = "/${var.project_name}/sentinel/k8s-token"
+    ca_param_name           = "/${var.project_name}/sentinel/k8s-ca-cert-b64"
+    extra_env_param_name    = "/${var.project_name}/sentinel/extra-env"
   }) : ""
 }
 
@@ -345,6 +347,14 @@ resource "aws_instance" "sentinel" {
   user_data                   = local.sentinel_user_data
   user_data_replace_on_change = false
 
+  lifecycle {
+    prevent_destroy = true
+
+    ignore_changes = [
+      ami,
+    ]
+  }
+
   tags = {
     Name = "${var.project_name}-sentinel"
     Role = "sentinel-control-plane"
@@ -360,5 +370,7 @@ resource "aws_instance" "sentinel" {
     aws_vpc_security_group_ingress_rule.prometheus_from_sentinel,
     aws_vpc_security_group_ingress_rule.loki_from_sentinel,
     aws_vpc_security_group_ingress_rule.alertmanager_from_sentinel,
+    aws_vpc_security_group_ingress_rule.citizen_service_chaos_from_sentinel,
+    aws_vpc_security_group_ingress_rule.notification_service_chaos_from_sentinel,
   ]
 }
