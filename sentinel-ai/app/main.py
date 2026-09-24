@@ -66,6 +66,7 @@ Engine, or the Remediation Engine.
 `alerts` (the Alertmanager webhook) and `chaos_scenarios` (its own
 pre-existing shared-secret gate) are unchanged.
 """
+import asyncio
 import logging
 import secrets
 import uuid
@@ -82,7 +83,7 @@ from app.core.events import EventBus
 from app.core.logging_config import configure_logging
 from app.core.security import hash_password
 from app.domain.environment import Environment
-from app.lifecycle import ai_admin, policy_admin, rca_admin, remediation_admin
+from app.lifecycle import ai_admin, k8s_watch, policy_admin, rca_admin, remediation_admin
 from app.lifecycle.incident_manager import IncidentManager
 from app.lifecycle.orchestrator import Orchestrator, build_context
 from app.routers import (
@@ -400,9 +401,34 @@ async def lifespan(app: FastAPI):
     # INTERRUPTED) — persisted state is the truth, nothing is silently lost.
     incident_manager.recover_interrupted()
 
+    # Independent Kubernetes desired-vs-actual watch — see
+    # lifecycle/k8s_watch.py's module docstring for why this exists
+    # (Alertmanager alone cannot catch a Deployment with zero Pods, since
+    # there is no scrape target for `up` to be 0 on). Feeds the SAME
+    # IncidentManager path a real Alertmanager webhook uses.
+    k8s_watch_task = None
+    if settings.k8s_watch_enabled:
+        k8s_watch_task = asyncio.create_task(
+            k8s_watch.run_k8s_watch(
+                ctx,
+                incident_manager,
+                environment,
+                poll_interval_seconds=settings.k8s_watch_poll_interval_seconds,
+                debounce_seconds=settings.k8s_watch_debounce_seconds,
+                expected_zero_annotation=settings.k8s_watch_expected_zero_annotation,
+            ),
+            name="k8s-watch",
+        )
+
     try:
         yield
     finally:
+        if k8s_watch_task is not None:
+            k8s_watch_task.cancel()
+            try:
+                await k8s_watch_task
+            except asyncio.CancelledError:
+                pass
         await incident_manager.shutdown()
         store.close()
         logger.info("sentinel_stopped")

@@ -249,6 +249,28 @@ class Settings(BaseSettings):
     # continuing to spend calls on it is not "bounded", it is "slow to fail".
     deep_investigation_max_consecutive_malformed_turns: int = 2
 
+    # ---- Kubernetes desired-state watch -----------------------------------
+    # Independent of Alertmanager: periodically diffs each allow-listed
+    # Deployment's spec.replicas against status.availableReplicas so that a
+    # workload with zero Pods (scaled to zero, crash-looping into nothing, or
+    # rolled back into a broken template) is detected even if no Prometheus
+    # scrape target ever existed for it to alert on. See
+    # lifecycle/k8s_watch.py's module docstring for why this exists and what
+    # it does and does not decide.
+    k8s_watch_enabled: bool = True
+    k8s_watch_poll_interval_seconds: int = 30
+    # How long a mismatch must persist before it becomes an incident — the
+    # same shape as the ServiceDown rule's `for: 2m`, so a brief rollout
+    # doesn't trip this.
+    k8s_watch_debounce_seconds: int = 120
+    # Annotation an operator (or other automation) can set on a Deployment to
+    # say "spec.replicas == 0 here is intentional, do not treat it as an
+    # incident." Absent this annotation, a still-present Deployment scaled to
+    # zero is treated the same as any other unavailable workload after the
+    # debounce window — see this file's note above on why no such concept
+    # existed before.
+    k8s_watch_expected_zero_annotation: str = "sentinel.sre/expected-scale-zero"
+
     # ---- Validation ------------------------------------------------------
     validation_settle_seconds: int = 20
     validation_timeout_seconds: int = 180
