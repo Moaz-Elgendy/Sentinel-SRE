@@ -383,11 +383,11 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
-def describe_tools_for_prompt() -> str:
+def describe_evidence_sources_for_prompt() -> str:
     lines = []
-    for name, spec in TOOL_SPECS.items():
-        lines.append(f'- "{name}": {spec["description"]} Parameters: {spec["params"]}.')
-    return "\n".join(lines)
+        for name in TOOL_SPECS:
+            lines.append(f'- "{name}"')
+        return "\n".join(lines)
 
 
 async def call_tool(ctx: ToolContext, name: Any, params: Any) -> ToolResult:
