@@ -199,6 +199,21 @@ def test_run_scenario_happy_path_sends_exactly_one_ssm_command(gui_client, fake_
     )
 
 
+def test_reset_all_sends_recovery_runner_command(gui_client, fake_aws):
+    client, _login = gui_client
+
+    resp = client.post(
+        "/api/sentinel/chaos-scenarios/reset-all/runs",
+        headers={"X-Chaos-Token": TOKEN},
+        json={},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["scenario"] == "reset-all"
+    assert len(fake_aws.sent) == 1
+    assert "reset-all" in fake_aws.sent[0]["commands"][0]
+
+
 def test_run_scenario_namespace_is_shell_quoted_against_injection(gui_client, fake_aws):
     """`namespace` is caller-supplied (unlike `scenario`, which is checked
     against the closed SCENARIOS dict) and ends up inside a shell script
