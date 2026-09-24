@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import json
 import shlex
+import asyncio
 
-from app.lifecycle.deep_investigation import apply_llm_response, render_command
+from app.lifecycle.deep_investigation import apply_llm_response, investigate_deep, render_command
 from app.models.incident import (
     DeepActionTarget,
+    DeepInvestigationTrigger,
     Evidence,
     Hypothesis,
     NovelActionType,
@@ -43,6 +45,37 @@ def _good_payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_gpt_oss_no_safe_fix_json_is_validated_by_the_investigation_loop(incident):
+    """GPT-OSS's minimal JSON terminal response remains a valid protocol turn."""
+    from app.reasoning.base import Reasoner
+
+    class OneTurnReasoner(Reasoner):
+        label = "test:gpt-oss"
+
+        async def complete_json(self, system_prompt, user_prompt):
+            assert "no provider-native" in system_prompt.lower()
+            assert "never emit a native tool/function call" in system_prompt.lower()
+            return json.dumps({"action": "no_safe_fix"})
+
+    proposal, trace = asyncio.run(
+        investigate_deep(
+            incident,
+            Evidence(),
+            Hypothesis(
+                root_cause=RootCause.UNKNOWN,
+                confidence=0.0,
+                reasoning="insufficient evidence",
+            ),
+            [],
+            OneTurnReasoner(),
+            trigger=DeepInvestigationTrigger.SUGGEST_FIX,
+        )
+    )
+
+    assert proposal is None
+    assert trace.outcome == "no_safe_fix"
 
 
 def test_happy_path_produces_a_valid_proposal(incident):
