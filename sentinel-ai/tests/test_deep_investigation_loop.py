@@ -204,7 +204,33 @@ async def test_native_style_tool_call_is_rejected_without_running_a_collector():
     assert trace.outcome == "no_safe_fix"
     assert trace.tool_call_count == 0
     assert all(iteration.tool_call is None for iteration in trace.iterations)
-    assert "native-style tool/function call" in reasoner.user_prompts[1]
+    assert "unsupported recipient/envelope format" in reasoner.user_prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_gpt_oss_developer_recipient_output_is_rejected_without_dispatch():
+    incident, evidence, hypothesis, tool_ctx = _bad_deployment_incident_and_evidence()
+    reasoner = ScriptedReasoner(
+        [
+            {"name": "developer", "arguments": {"evidence_source": "inspect_replicasets"}},
+            {"action": "no_safe_fix"},
+        ]
+    )
+
+    proposal, trace = await investigate_deep(
+        incident,
+        evidence,
+        hypothesis,
+        attempted_summary=[],
+        reasoner=reasoner,
+        tool_ctx=tool_ctx,
+        trigger=DeepInvestigationTrigger.SUGGEST_FIX,
+    )
+
+    assert proposal is None
+    assert trace.outcome == "no_safe_fix"
+    assert trace.tool_call_count == 0
+    assert all(iteration.tool_call is None for iteration in trace.iterations)
 
 
 @pytest.mark.asyncio

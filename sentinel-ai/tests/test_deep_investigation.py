@@ -55,8 +55,9 @@ def test_gpt_oss_no_safe_fix_json_is_validated_by_the_investigation_loop(inciden
         label = "test:gpt-oss"
 
         async def complete_json(self, system_prompt, user_prompt):
-            assert "no provider-native" in system_prompt.lower()
-            assert "never emit a native tool/function call" in system_prompt.lower()
+            assert "plain json for an application parser" in system_prompt.lower()
+            assert "request_evidence" in system_prompt
+            assert "evidence_source" in system_prompt
             return json.dumps({"action": "no_safe_fix"})
 
     proposal, trace = asyncio.run(
@@ -77,6 +78,19 @@ def test_gpt_oss_no_safe_fix_json_is_validated_by_the_investigation_loop(inciden
 
     assert proposal is None
     assert trace.outcome == "no_safe_fix"
+
+
+def test_gpt_oss_prompt_exposes_only_plain_json_evidence_protocol():
+    from app.lifecycle.deep_investigation import _build_system_prompt
+
+    prompt = _build_system_prompt().lower()
+
+    assert "plain json" in prompt
+    assert '"request_evidence"' in prompt
+    assert '"evidence_source"' in prompt
+    assert '"parameters"' in prompt
+    for forbidden in ("tool", "function", "function_call", "tool_choice", "tool_calls"):
+        assert forbidden not in prompt
 
 
 def test_happy_path_produces_a_valid_proposal(incident):
