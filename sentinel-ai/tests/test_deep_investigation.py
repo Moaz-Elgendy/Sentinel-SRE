@@ -67,6 +67,7 @@ def test_gpt_oss_no_safe_fix_json_is_validated_by_the_investigation_loop(inciden
                 root_cause=RootCause.UNKNOWN,
                 confidence=0.0,
                 reasoning="insufficient evidence",
+                recommended_action=RemediationAction.ESCALATE,
             ),
             [],
             OneTurnReasoner(),
