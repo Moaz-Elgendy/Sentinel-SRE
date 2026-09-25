@@ -58,6 +58,23 @@ def test_forced_http_failure_leaves_observability_endpoints_usable(client, monke
     controller.reset()
 
 
+def test_http_chaos_current_state_gauge_clears_while_injection_counter_persists(client, monkeypatch):
+    monkeypatch.setattr(settings, "chaos_mode", True)
+    counter = lambda: REGISTRY.get_sample_value(
+        "chaos_injections_total", {"fault_type": "http_5xx"}
+    ) or 0.0
+    before = counter()
+
+    controller.update(error_rate=1.0)
+    assert REGISTRY.get_sample_value("chaos_error_rate") == 1.0
+    assert client.get("/api/services").status_code == 503
+    assert counter() == before + 1
+
+    controller.reset()
+    assert REGISTRY.get_sample_value("chaos_error_rate") == 0.0
+    assert counter() == before + 1
+
+
 def test_latency_injection_is_applied(client, monkeypatch):
     monkeypatch.setattr(settings, "chaos_mode", True)
     controller.update(latency_ms=60)

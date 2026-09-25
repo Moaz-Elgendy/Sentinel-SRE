@@ -477,6 +477,16 @@ make Kubernetes believe the pod is dead. Every fault field has a corresponding P
 `chaos_memory_leak_mb`, `chaos_notification_failure_rate`, plus `chaos_injections_total`), which is
 what lets Sentinel distinguish a deliberate fault from a real failure.
 
+`ChaosForcedHTTPFailures` uses the current `chaos_error_rate` gauge, not
+`increase(chaos_injections_total[5m])`. The latter is a historical counter and remains positive
+for five minutes after reset, which can make a later scenario inherit an old firing alert and
+`activeAt`. The gauge returns to zero on `/api/chaos/reset`, so the alert resolves and a repeated
+scenario can produce a fresh firing transition. After changing this rule, apply the relevant
+Kustomize overlay and reload Prometheus with its lifecycle endpoint (`POST /-/reload`, exposed by
+`--web.enable-lifecycle`) before running the scenario. The `http-errors` runner also waits for the
+alert to disappear from Prometheus and Alertmanager after Sentinel resets the fault, so a rapid
+repeat starts from an observed inactive state instead of inheriting the previous run's `activeAt`.
+
 `scripts/incident-scenarios.sh` drives nine named scenarios through this API (`db-outage`,
 `http-errors`, `latency`, `notification-degradation`, `full-outage`, `high-cpu`, `memory-leak`,
 `crashloop`, `bad-deployment`) and asserts that the right Prometheus alert reaches `firing`.
