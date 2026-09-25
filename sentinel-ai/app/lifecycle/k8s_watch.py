@@ -66,23 +66,6 @@ logger = logging.getLogger(__name__)
 
 WATCH_ALERTNAME = "DeploymentUnavailable"
 
-# Pod-level availability alerts can outlive the Pod object that triggered them.
-# A Deployment rollout commonly replaces a failed Pod with a new Pod whose name
-# and Prometheus fingerprint are different. When the replacement is healthy,
-# the incident condition is gone even if Alertmanager never delivered the
-# matching resolved notification. Reconcile only availability incidents here;
-# memory/CPU/latency incidents may legitimately outlive one Pod replacement.
-POD_AVAILABILITY_ALERTNAMES = frozenset(
-    {"ServiceDown", "PodCrashLooping", WATCH_ALERTNAME}
-)
-_RECONCILABLE_STATUSES = (
-    "open",
-    "investigating",
-    "remediating",
-    "validating",
-    "escalated",
-)
-
 
 class _DeploymentWatchState:
     """Per-Deployment debounce/notification bookkeeping. In-memory only —

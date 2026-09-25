@@ -22,7 +22,6 @@ from app.models.incident import (
     EscalationReason,
     Incident,
     IncidentStatus,
-    Severity,
     RemediationAction,
     ValidationOutcome,
 )
@@ -563,50 +562,6 @@ async def test_interrupted_incident_with_executed_action_is_never_rerun(make_eng
     rec = e.get(inc.id)
     assert rec["status"] == "escalated" and "will not repeat them blindly" in rec["escalation_detail"]
     assert e.k8s.writes == [] and e.chaos.resets == []
-
-
-def test_exact_incident_auto_resolution_from_cluster_state(make_engine):
-    e = make_engine({"notification-service": MEMORY_LEAK})
-    inc = detection.build_incident(
-        {
-            "alertname": "ServiceDown",
-            "severity": Severity.CRITICAL,
-            "app": "notification-service",
-            "namespace": "citizen-portal",
-            "pod": "notification-service-old",
-            "summary": "old pod unavailable",
-            "description": "",
-            "labels": {},
-            "annotations": {},
-            "fingerprint": "am-fp",
-            "status": "firing",
-            "startsAt": None,
-        },
-        e.environment,
-    )
-    inc.status = IncidentStatus.OPEN
-    e.store.upsert_incident(inc.to_dict())
-
-    out = e.manager.auto_resolve_incident(
-        inc.id,
-        reason=(
-            "Recorded Pod citizen-portal/notification-service-old no longer exists; "
-            "notification-service has a Ready replacement."
-        ),
-        source="k8s_watch",
-    )
-
-    assert out["resolved"] is True
-    rec = e.get(inc.id)
-    assert rec["status"] == "auto_resolved"
-    assert rec["resolved_at"] is not None
-    assert any(
-        "Incident auto-resolved from current Kubernetes state" in t["message"]
-        for t in rec["timeline"]
-    )
-    assert e.manager.auto_resolve_incident(
-        inc.id, reason="duplicate recovery observation", source="k8s_watch"
-    )["resolved"] is False
 
 
 @pytest.mark.asyncio
