@@ -1304,35 +1304,39 @@ disk) deliberately, so they cannot silently drift into disagreeing about what "u
 
 ### Recovering an already-running node
 
-You do not need to SSH or SCP anything onto the box by hand. Any sync mode now repairs a broken
-checkout as a normal side effect of running, so the same SSM commands used for an ordinary deploy
-also recover a node stuck in this state:
+There is one important bootstrap ordering rule for nodes that were provisioned before the current
+deployment-synchronization fixes landed:
+
+**Refresh `sentinel-deploy.sh` first, then sync `scripts/`.**
+
+A node may have an older `/usr/local/bin/sentinel-deploy.sh` whose `sync-scripts` implementation
+uses the old Git-index-based verification. That implementation can correctly extract the requested
+commit and still report every script as "deleted", which means calling `sync-scripts` first can
+fail before the fixed script is ever installed. The CI workflow therefore always runs these two
+commands in one SSM invocation:
+
+```bash
+/usr/local/bin/sentinel-deploy.sh sync "$GITHUB_SHA" &&
+/usr/local/bin/sentinel-deploy.sh sync-scripts "$GITHUB_SHA"
+```
+
+The first command is the narrow compatibility bootstrap: it refreshes only the installed
+`/usr/local/bin/sentinel-deploy.sh`. The second command starts a new process and therefore uses that
+freshly installed implementation to synchronize the complete `scripts/` tree.
+
+To recover a node manually, use the same ordering:
 
 ```bash
 aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
-  --parameters commands="/usr/local/bin/sentinel-deploy.sh sync-scripts $GITHUB_SHA" \
+  --parameters commands="/usr/local/bin/sentinel-deploy.sh sync $GITHUB_SHA && /usr/local/bin/sentinel-deploy.sh sync-scripts $GITHUB_SHA" \
   --region "$AWS_REGION"
 ```
 
-then re-run the CI job (or the equivalent `sync-manifests`/`apply-manifests`/`images` SSM commands)
-that originally failed. If `/usr/local/bin/sentinel-deploy.sh` itself predates this fix (so it
-doesn't know `ensure_repo_synced` at all), refresh it first the same way `sync` always has:
-
-```bash
-aws ssm send-command \
-  --instance-ids "$INSTANCE_ID" \
-  --document-name "AWS-RunShellScript" \
-  --parameters commands="/usr/local/bin/sentinel-deploy.sh sync $GITHUB_SHA" \
-  --region "$AWS_REGION"
-```
-
-`sync` refreshes `scripts/sentinel-deploy.sh` and reinstalls `/usr/local/bin/sentinel-deploy.sh`;
-now that `sync` itself also calls `ensure_repo_synced()` first, this succeeds even from a checkout
-with no resolvable `HEAD` — it repairs `.git` as a side effect of the same command. Nothing here
-ever runs `rm -rf /opt/sentinel-sre`, and nothing here can touch
-`k8s/overlays/aws/secrets/*.env`.
+`sync` and `sync-scripts` both call `ensure_repo_synced()` first, so a broken Git checkout can still
+be repaired before the requested commit is used. Nothing here ever runs `rm -rf /opt/sentinel-sre`,
+and nothing here can touch `k8s/overlays/aws/secrets/*.env`.
 
 ## Step 19. Verify pods
 

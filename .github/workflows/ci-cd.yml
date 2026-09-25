@@ -627,41 +627,30 @@ jobs:
   #   is left as a deliberate operator action over SSM — see
   #   docs/aws-deployment.md.
   #
-  # `sync-scripts`, run first, BEFORE `images`/`sync-manifests`+`apply-manifests`:
-  #   Terraform will NOT push a changed user_data to an already-running
-  #   instance (user_data_replace_on_change = false in infra/terraform/
-  #   ec2.tf — deliberately, so an edit here cannot silently replace, and
-  #   wipe, a live cluster). Without this step, a fix to
-  #   scripts/sentinel-deploy.sh (e.g. adding a newly-introduced service to
-  #   the `images` case, or a new placeholder substitution in
-  #   render_and_apply) would sit correctly in the repo forever without ever
-  #   reaching the node that is actually running. `sync-scripts` refreshes
-  #   scripts/ (and reinstalls /usr/local/bin/sentinel-deploy.sh) from this
-  #   exact commit's checkout on the node, so everything after it always
-  #   runs the current logic.
+  # Script synchronization runs in two ordered stages, BEFORE
+  # `images`/`sync-manifests`+`apply-manifests`:
   #
-  #   This step is a HARD GATE, not best-effort — see docs/aws-deployment.md,
-  #   "Deployment synchronization contract", for the incident that made this
-  #   change necessary: a push that changed both a k8s/ manifest and the
-  #   render_and_apply() logic that substitutes it hit a sync-scripts
-  #   failure that was only ever logged as a warning. The deploy step that
-  #   followed then ran the NEW manifests through the OLD (pre-fix)
-  #   installed script, which didn't know about the new placeholder and
-  #   shipped it to the cluster unsubstituted — and because that step still
-  #   reported success, nothing surfaced the problem until someone noticed
-  #   the literal placeholder string live in the Deployment. A sync failure
-  #   must stop the deploy, not run it against whatever happens to already
-  #   be on the node.
+  #   1. `sync` refreshes ONLY /usr/local/bin/sentinel-deploy.sh from this
+  #      exact commit. This is the compatibility/bootstrap stage for
+  #      already-running nodes: older installed copies have historically
+  #      understood `sync` even when their `sync-scripts` verifier was stale.
+  #   2. `sync-scripts` is then started as a new process, so it executes the
+  #      freshly installed script and refreshes the complete scripts/ tree.
   #
-  #   The one legitimate case where the node cannot yet understand this
-  #   command — bootstrapping a brand-new instance whose installed script
-  #   predates `sync-scripts` mode entirely — is a one-time, manual event
-  #   covered by docs/aws-deployment.md's bootstrap procedure
-  #   (generate-aws-secrets.sh + deploy-aws.sh, run once by an operator over
-  #   SSM before this workflow ever targets that instance). By the time CI
-  #   runs against a node at all, that node's installed script already
-  #   understands `sync-scripts`, so there is no ongoing reason for this to
-  #   be allowed to fail quietly.
+  # Terraform will NOT push changed user_data to an already-running instance
+  # (`user_data_replace_on_change = false` in infra/terraform/ec2.tf).
+  # Without these stages, a fix to scripts/sentinel-deploy.sh could sit in the
+  # repo while the node continued running older deployment logic.
+  #
+  # This is a HARD GATE, not best-effort — see docs/aws-deployment.md,
+  # "Deployment synchronization contract". The current sync-scripts verifier
+  # deliberately avoids the Git index because the archive extraction mechanism
+  # writes directly to the working tree. Running sync first also prevents an
+  # already-running node with the older verifier from getting stuck in a
+  # bootstrap deadlock where sync-scripts fails before it can install the fix.
+  #
+  # A truly brand-new node whose installed script predates `sync` itself still
+  # needs the one-time bootstrap procedure in docs/aws-deployment.md.
   # -------------------------------------------------------------------------
   deploy-to-k3s:
     needs: build-and-push-images
@@ -713,16 +702,34 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-deploy-${{ github.run_id }}
 
-      - name: Sync scripts/ on the node
+      - name: Sync deploy script and scripts/ on the node
         id: sync
         run: |
           set -euo pipefail
 
+          # Compatibility bootstrap:
+          #   1. `sync` is the older, narrow mode that has existed since the
+          #      deployment script was first installed. It refreshes ONLY
+          #      /usr/local/bin/sentinel-deploy.sh from this commit.
+          #   2. The second invocation starts a NEW process, so it executes
+          #      the freshly installed script. Its current `sync-scripts`
+          #      implementation contains the index-independent verification
+          #      fix.
+          #
+          # This ordering matters for already-running nodes: a node can be
+          # carrying an older sentinel-deploy.sh whose `sync-scripts` verifier
+          # predates the fix and therefore reports every archive-extracted
+          # script as "deleted". Calling `sync-scripts` first creates a
+          # bootstrap deadlock because that old code fails before it can
+          # install the fixed script.
+          #
+          # The two commands remain a single SSM invocation, so the hard gate
+          # below still covers the complete synchronization contract.
           command_id=$(aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Sync scripts/ to ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}" \
-            --parameters commands="/usr/local/bin/sentinel-deploy.sh sync-scripts ${GITHUB_SHA}" \
+            --comment "Refresh deploy script + sync scripts/ to ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}" \
+            --parameters commands="/usr/local/bin/sentinel-deploy.sh sync ${GITHUB_SHA} && /usr/local/bin/sentinel-deploy.sh sync-scripts ${GITHUB_SHA}" \
             --query "Command.CommandId" --output text)
 
           echo "SSM command: ${command_id}"
@@ -746,22 +753,14 @@ jobs:
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
             --query StandardErrorContent --output text || true
 
-          # HARD GATE (see the job-level comment above for why this used to
-          # be best-effort and why that was unsafe): scripts/ — including
-          # sentinel-deploy.sh's own render/substitute/verify logic — is not
-          # confirmed current on the node, so do not let the deploy step
-          # below run against whatever happens to already be installed.
-          # sentinel-deploy.sh's sync-scripts mode itself now also verifies
-          # (via verify_synced_to/verify_executable) that the sync it just
-          # ran actually landed correctly, not merely that the SSM command
-          # returned 0 — so a "Success" status here is a real guarantee, not
-          # just an absence of error.
+          # HARD GATE: the node must first accept the exact commit's deploy
+          # script, then prove that the full scripts/ tree is synchronized
+          # using that refreshed implementation. Never deploy against stale
+          # node-side scripts.
           if [ "${status}" != "Success" ]; then
-            echo "::error::scripts/ sync did not succeed (status: ${status})." \
+            echo "::error::deploy-script/scripts synchronization did not succeed (status: ${status})." \
               "Refusing to deploy against a node that is not confirmed to be" \
-              "running this commit's scripts/. If this is a brand-new" \
-              "instance whose installed script predates 'sync-scripts' mode," \
-              "bootstrap it manually first — see docs/aws-deployment.md."
+              "running this commit's scripts/."
             exit 1
           fi
 
