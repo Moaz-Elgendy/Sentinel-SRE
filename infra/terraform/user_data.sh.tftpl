@@ -225,14 +225,63 @@ systemctl start refresh-ecr-credentials.service || \
 # over SSM, which has a payload size limit.
 #
 # Only works unattended for a public repository. For a private one this
-# clone fails harmlessly and the directory must be populated another way —
-# see docs/aws-deployment.md.
+# fails harmlessly and the directory must be populated another way — see
+# docs/aws-deployment.md.
+#
+# This step and scripts/sentinel-deploy.sh's own ensure_repo_synced()
+# (installed just below, and re-run by every later "sync"/"sync-manifests"/
+# "sync-scripts"/"apply" over SSM) are the two places Git metadata for
+# $${REPO_DIR} can be created. They share the same shape deliberately: check
+# whether the checkout is actually usable (not just "does .git exist" —
+# `git clone` can be interrupted by a reboot or a transient network error
+# partway through, leaving a `.git` directory with no resolvable HEAD, which
+# `-d .git` alone cannot detect), and if not, repair only .git — never
+# $${REPO_DIR} itself, and never anything already on disk in it (there is
+# nothing there yet on a first boot, but a reboot mid-clone can leave
+# partial file content that must not be wiped either).
+#
+# The clone URL is also written to a small state file so a later repair —
+# on this box, entirely from scripts/sentinel-deploy.sh, with no Terraform
+# involved — has a real origin to recover from without guessing it.
 # ---------------------------------------------------------------------------
 if [ -n "$${REPO_URL}" ]; then
-  echo "--- cloning $${REPO_URL} ---"
-  if [ ! -d "$${REPO_DIR}/.git" ]; then
-    git clone "$${REPO_URL}" "$${REPO_DIR}" || \
-      echo "WARNING: clone failed (private repo?). Populate $${REPO_DIR} manually."
+  mkdir -p /etc/sentinel-sre
+  printf '%s' "$${REPO_URL}" > /etc/sentinel-sre/repo-url
+  chmod 0644 /etc/sentinel-sre/repo-url
+
+  git config --global --add safe.directory "$${REPO_DIR}" || true
+  mkdir -p "$${REPO_DIR}"
+
+  repo_usable=false
+  if [ -d "$${REPO_DIR}/.git" ] \
+    && git -C "$${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    && git -C "$${REPO_DIR}" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    repo_usable=true
+  fi
+
+  if [ "$${repo_usable}" = "false" ]; then
+    echo "--- (re)initializing $${REPO_DIR} from $${REPO_URL} ---"
+    # Only .git is removed/recreated — any other file already on disk in
+    # $${REPO_DIR} (e.g. partial content left by an interrupted previous
+    # boot) is left exactly as it is.
+    rm -rf "$${REPO_DIR}/.git"
+    if git clone "$${REPO_URL}" "$${REPO_DIR}" 2>/tmp/sentinel-clone.err; then
+      echo "clone succeeded"
+    else
+      echo "WARNING: plain clone failed, retrying via git init + fetch:"
+      cat /tmp/sentinel-clone.err || true
+      rm -rf "$${REPO_DIR}/.git"
+      ( cd "$${REPO_DIR}" \
+        && git init --quiet \
+        && git remote add origin "$${REPO_URL}" \
+        && git fetch --quiet origin \
+        && default_branch="$$(git remote show origin | sed -n 's/.*HEAD branch: //p')" \
+        && git symbolic-ref HEAD "refs/heads/$${default_branch:-main}" \
+        && git reset --quiet --hard "origin/$${default_branch:-main}" ) || \
+        echo "WARNING: repository initialization failed (private repo?). Populate $${REPO_DIR} manually — see docs/aws-deployment.md."
+    fi
+  else
+    echo "--- $${REPO_DIR} already has a usable checkout, leaving it as-is ---"
   fi
   git config --global --add safe.directory "$${REPO_DIR}" || true
 fi

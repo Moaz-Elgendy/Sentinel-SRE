@@ -147,6 +147,139 @@ verify_synced_to() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Repo repair / bootstrap
+# ---------------------------------------------------------------------------
+# File Terraform's bootstrap (user_data.sh.tftpl) writes the configured
+# clone URL into, so that any later repair — on a node bootstrapped before
+# this file existed, or one whose repo_url differs from a hardcoded guess —
+# still has a real origin to recover from without anyone having to know or
+# retype it. Not sensitive: it is the same public HTTPS clone URL already
+# visible in `git remote -v` and in Terraform's own state.
+REPO_URL_STATE_FILE="${REPO_URL_STATE_FILE:-/etc/sentinel-sre/repo-url}"
+
+# True if REPO_DIR is a git working tree with a resolvable HEAD. This, not
+# "does .git exist", is the actual precondition every sync mode needs: a
+# `.git` directory can exist and still be unusable (empty, from an
+# interrupted clone; corrupted; or a bare `git init` with no history), which
+# is exactly the failure this function exists to catch instead of trusting.
+repo_is_usable() {
+  git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    && git -C "${REPO_DIR}" rev-parse --verify -q HEAD >/dev/null 2>&1
+}
+
+# True if `sha`'s commit object is present in REPO_DIR's local object
+# database right now (no network access).
+commit_available() {
+  local sha="$1"
+  git -C "${REPO_DIR}" cat-file -e "${sha}^{commit}" 2>/dev/null
+}
+
+# Best-effort discovery of the origin clone URL, preferring the durable
+# state file (survives a repair that has to remove .git entirely) and
+# falling back to whatever REPO_DIR's own remote says, for a repo that is
+# still git-valid but merely missing the requested commit.
+resolve_repo_url() {
+  local url=""
+  if [ -s "${REPO_URL_STATE_FILE}" ]; then
+    url="$(cat "${REPO_URL_STATE_FILE}")"
+  fi
+  if [ -z "${url}" ] && git -C "${REPO_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    url="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null || true)"
+  fi
+  printf '%s' "${url}"
+}
+
+# Ensures REPO_DIR is a usable git checkout with `sha` resolvable locally,
+# repairing the checkout in place if it is not — reinitializing Git
+# metadata and re-pointing it at origin, then fetching, rather than trusting
+# a directory that merely exists. This is what every sync mode below calls
+# instead of the old `[ ! -d "${REPO_DIR}/.git" ]` check, which only proved
+# a directory named .git was present, not that it contained a usable
+# repository — the exact gap that let a broken checkout reach
+# verify_synced_to instead of being caught and repaired up front.
+#
+# Safety invariants, load-bearing for the rest of the deployment contract:
+#   * REPO_DIR itself is never removed or recreated — only .git may be.
+#   * Every other file already on disk in REPO_DIR, tracked or not
+#     (including the live, gitignored k8s/overlays/aws/secrets/*.env
+#     files), is left exactly as it was. A repair here never runs anything
+#     resembling `rm -rf "${REPO_DIR}"` or a wipe-and-reclone of the whole
+#     tree.
+#   * Fails closed: if the requested commit still cannot be proven present
+#     locally after every repair/fetch attempt, this returns non-zero and
+#     the caller must not proceed to deploy.
+ensure_repo_synced() {
+  local sha="$1"
+  mkdir -p "${REPO_DIR}"
+  git config --global --add safe.directory "${REPO_DIR}" 2>/dev/null || true
+
+  if ! repo_is_usable; then
+    echo "WARN: ${REPO_DIR} has no usable git checkout (.git missing, empty, or corrupted)." >&2
+    echo "      repairing Git metadata in place (untracked working-tree files, including" >&2
+    echo "      k8s/overlays/aws/secrets/*.env, are left untouched) ..." >&2
+    local url
+    url="$(resolve_repo_url)"
+    if [ -z "${url}" ]; then
+      echo "ERROR: cannot repair ${REPO_DIR}: no repository URL is known." >&2
+      echo "       Neither ${REPO_URL_STATE_FILE} nor an existing origin remote is available." >&2
+      echo "       See docs/aws-deployment.md, 'Deployment synchronization contract'." >&2
+      return 1
+    fi
+    # Only .git is ever removed here — see the safety invariants above.
+    rm -rf "${REPO_DIR}/.git"
+    git -C "${REPO_DIR}" init --quiet
+    git -C "${REPO_DIR}" remote add origin "${url}"
+    git config --global --add safe.directory "${REPO_DIR}" 2>/dev/null || true
+  fi
+
+  if ! commit_available "${sha}"; then
+    echo "${REPO_DIR}: ${sha} not present locally yet, fetching from origin ..." >&2
+    git -C "${REPO_DIR}" fetch --quiet --all --tags 2>/dev/null || true
+    if ! commit_available "${sha}"; then
+      # Covers a sha that isn't the tip of any ref `--all` picked up (e.g.
+      # an unmerged PR head). GitHub enables fetch-by-SHA
+      # (uploadpack.allowReachableSHA1InWant) for reachable commits on
+      # public repos, which is the only origin access this script has ever
+      # relied on.
+      git -C "${REPO_DIR}" fetch --quiet origin "${sha}" 2>/dev/null || true
+    fi
+  fi
+
+  if ! commit_available "${sha}"; then
+    echo "ERROR: ${sha} is not available from ${REPO_DIR}'s origin after fetching." >&2
+    echo "       (fail-closed: refusing to treat this checkout as synced)" >&2
+    return 1
+  fi
+
+  # A freshly (re)initialized repo has both no HEAD and an empty index —
+  # and an empty index is not cosmetic. `verify_synced_to`'s `git diff
+  # "${sha}" -- <paths>` (and therefore sync-scripts' `git archive | tar
+  # -x`, which writes files directly and never touches the index itself)
+  # only compares real file content for paths the index already knows
+  # about; a path with no index entry at all reads as "absent" to `git
+  # diff`, regardless of what is actually sitting on disk. The original
+  # design never hit this because the node's checkout always started from a
+  # real `git clone`, whose full-tree checkout populates the index for
+  # every tracked path once, up front.
+  #
+  # `git checkout "${sha}" -- .` reproduces exactly that: it populates the
+  # index AND working tree for every path tracked at `sha`, repo-wide, in
+  # one step — while remaining exactly as safe as the existing narrow
+  # `git checkout "${sha}" -- k8s` / `-- scripts/sentinel-deploy.sh` calls
+  # elsewhere in this file, for the same reason: a checkout of an explicit
+  # pathspec only ever writes paths git tracks at that commit, so it can
+  # never touch the untracked k8s/overlays/aws/secrets/*.env files or
+  # anything else not tracked at `sha`. This runs only on the repair path
+  # (a repo that had no usable HEAD a moment ago), never on an
+  # already-valid checkout.
+  if ! git -C "${REPO_DIR}" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    git -C "${REPO_DIR}" checkout --quiet "${sha}" -- . 2>/dev/null || true
+    git -C "${REPO_DIR}" update-ref refs/heads/master "${sha}" 2>/dev/null || true
+    git -C "${REPO_DIR}" symbolic-ref HEAD refs/heads/master 2>/dev/null || true
+  fi
+}
+
 # A rendered manifest containing this string went through no substitution
 # at all — reject it outright rather than trying to guess what URL was
 # meant. Deliberately permissive about the host part (private IPs, Service
@@ -295,8 +428,8 @@ case "${MODE}" in
     # job for how its image gets updated instead.
     ;;
   apply)
+    ensure_repo_synced "${SHA}" || exit 1
     cd "${REPO_DIR}"
-    git fetch --all --tags
     git checkout --detach "${SHA}"
 
     # Render-then-substitute, exactly like deploy-aws.sh — and for exactly
@@ -335,13 +468,8 @@ case "${MODE}" in
     # *.env.example templates are tracked), this can never overwrite the
     # real, live secret values already on the node. Run apply-manifests
     # immediately after this to actually apply what was just synced.
-    if [ ! -d "${REPO_DIR}/.git" ]; then
-      echo "ERROR: ${REPO_DIR} is not a git checkout; cannot sync." >&2
-      echo "See docs/aws-deployment.md for populating it (private repo)." >&2
-      exit 1
-    fi
+    ensure_repo_synced "${SHA}" || exit 1
     cd "${REPO_DIR}"
-    git fetch --all --tags --quiet
     git checkout --quiet "${SHA}" -- k8s
     verify_synced_to "${SHA}" k8s
     echo "k8s manifests synced to ${SHA} (secrets/*.env untouched — untracked):"
@@ -362,13 +490,8 @@ case "${MODE}" in
     # edits, AND deletions (see the header comment for why this is safe
     # here but not for k8s/). Then reinstall the deploy script itself, same
     # as the original narrow "sync" mode did.
-    if [ ! -d "${REPO_DIR}/.git" ]; then
-      echo "ERROR: ${REPO_DIR} is not a git checkout; cannot sync." >&2
-      echo "See docs/aws-deployment.md for populating it (private repo)." >&2
-      exit 1
-    fi
+    ensure_repo_synced "${SHA}" || exit 1
     cd "${REPO_DIR}"
-    git fetch --all --tags --quiet
     rm -rf scripts
     git archive "${SHA}" -- scripts | tar -x
     verify_synced_to "${SHA}" scripts
@@ -398,13 +521,8 @@ case "${MODE}" in
     # checkout at ${SHA}, without touching any Kubernetes resources. See the
     # header comment above for why this exists. Deliberately narrow: this
     # touches exactly one file and runs no application code.
-    if [ ! -d "${REPO_DIR}/.git" ]; then
-      echo "ERROR: ${REPO_DIR} is not a git checkout; cannot sync." >&2
-      echo "See docs/aws-deployment.md for populating it (private repo)." >&2
-      exit 1
-    fi
+    ensure_repo_synced "${SHA}" || exit 1
     cd "${REPO_DIR}"
-    git fetch --all --tags --quiet
     git checkout --quiet "${SHA}" -- scripts/sentinel-deploy.sh
     verify_synced_to "${SHA}" scripts/sentinel-deploy.sh
     chmod +x scripts/sentinel-deploy.sh
