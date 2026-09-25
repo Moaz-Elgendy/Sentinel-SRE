@@ -338,6 +338,32 @@ reset_chaos_fault() {
     -H "X-Chaos-Token: $CHAOS_TOKEN" >/dev/null 2>&1 || true
 }
 
+rollback_citizen_service() {
+  # Shared by both the crashloop and bad-deployment detections below.
+  # Deliberately NOT allowed to take the whole recovery down with it (see
+  # the call sites): `set -e` would otherwise abort scenario_reset_all the
+  # instant one `kubectl rollout status` timed out, silently skipping every
+  # check after it — e.g. leaving a full-outage scale-to-zero in place
+  # forever because the crashloop check above it happened to time out
+  # first. A single rollback attempt can also land on another bad revision
+  # if bad-deployment was run more than once without a reset in between
+  # (`rollout undo` with no target only ever steps back one revision), so
+  # this retries once before giving up.
+  local reason="$1" attempt
+  for attempt in 1 2; do
+    if kubectl rollout undo deployment citizen-service -n "$NAMESPACE" >/dev/null 2>&1 \
+      && kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=240s >/dev/null 2>&1; then
+      echo "    OK — citizen-service rolled back and ready ($reason, attempt $attempt)"
+      return 0
+    fi
+    echo "    Rollback attempt $attempt for '$reason' did not reach Ready within 240s..." >&2
+  done
+  echo "FAILED: could not roll citizen-service back to a healthy revision ($reason)." >&2
+  echo "        Check: kubectl rollout history deployment citizen-service -n $NAMESPACE" >&2
+  echo "               kubectl get pods -n $NAMESPACE -l app=citizen-service" >&2
+  return 1
+}
+
 scenario_reset_all() {
   echo "=== Recovery: reset active chaos scenarios ==="
   echo "    Clearing reachable in-process faults and undoing only known"
@@ -351,33 +377,52 @@ scenario_reset_all() {
   reset_chaos_fault "$CITIZEN_PORT"
   reset_chaos_fault "$NOTIF_PORT"
 
-  local command env_values replicas
+  # Each check below is independent and best-effort: one taking longer than
+  # its own timeout must not stop the others from running (that used to be
+  # exactly what happened, since an unguarded `kubectl rollout status`
+  # failing under `set -e` aborted the whole function on the spot). Track
+  # failures and keep going, then report honestly at the end instead of
+  # always printing "recovery command completed" even when it wasn't.
+  local failures=()
+
+  local command
   command=$(kubectl get deployment citizen-service -n "$NAMESPACE" \
     -o jsonpath='{.spec.template.spec.containers[0].command[*]}' 2>/dev/null || true)
   if echo "$command" | grep -q 'incident-scenarios.sh.*crashloop'; then
     echo "    Detected the scenario crashloop command; rolling back citizen-service..."
-    kubectl rollout undo deployment citizen-service -n "$NAMESPACE"
-    kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s
+    rollback_citizen_service "crashloop" || failures+=("crashloop")
   fi
 
+  local env_values
   env_values=$(kubectl get deployment citizen-service -n "$NAMESPACE" \
     -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' \
     2>/dev/null || true)
   if echo "$env_values" | grep -q 'DATABASE_HOST=citizen-postgres-does-not-exist.invalid'; then
     echo "    Detected the scenario bad-deployment database host; rolling back citizen-service..."
-    kubectl rollout undo deployment citizen-service -n "$NAMESPACE"
-    kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s
+    rollback_citizen_service "bad-deployment" || failures+=("bad-deployment")
   fi
 
+  local replicas
   replicas=$(kubectl get deployment citizen-service -n "$NAMESPACE" \
     -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
   if [ "$replicas" = "0" ]; then
     echo "    Detected the scenario full-outage scale-to-zero; restoring one replica..."
-    kubectl scale deployment citizen-service -n "$NAMESPACE" --replicas=1
-    kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s
+    if kubectl scale deployment citizen-service -n "$NAMESPACE" --replicas=1 >/dev/null 2>&1 \
+      && kubectl rollout status deployment citizen-service -n "$NAMESPACE" --timeout=180s >/dev/null 2>&1; then
+      echo "    OK — citizen-service restored to 1 replica and ready"
+    else
+      echo "FAILED: could not restore citizen-service after full-outage scale-to-zero." >&2
+      failures+=("full-outage")
+    fi
   fi
 
-  echo "=== reset-all: recovery command completed ==="
+  if [ "${#failures[@]}" -eq 0 ]; then
+    echo "=== reset-all: recovery completed, no leftover mutations required manual attention ==="
+  else
+    echo "!! reset-all: recovery ran but could not fix: ${failures[*]} — see FAILED lines above." >&2
+    echo "=== reset-all: recovery completed with unresolved issues ===" >&2
+    return 1
+  fi
 }
 
 scenario_db_outage() {
