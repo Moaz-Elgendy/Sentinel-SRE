@@ -146,6 +146,84 @@ class IncidentManager:
         with self._lock:
             return list(self._live)
 
+    def auto_resolve_incident(
+        self, incident_id: str, *, reason: str, source: str = "sentinel"
+    ) -> dict[str, Any]:
+        """Close one exact incident as ``auto_resolved`` from observed recovery.
+
+        This is intentionally ID-based rather than fingerprint-based. A
+        Kubernetes Pod replacement changes the Pod name and Alertmanager
+        fingerprint, and an exact incident id prevents a stale recovery signal
+        from closing a newer occurrence of the same workload/failure class.
+
+        When the incident currently owns a lifecycle lease, do not race that
+        lifecycle by overwriting its state from a second writer. Record the
+        observation and let its normal validation/finish path decide. The
+        common stale-Pod case has no active lifecycle and is closed immediately.
+        """
+        now = self._clock()
+        with self._lock:
+            latest = self.store.get_incident(incident_id)
+            if latest is None:
+                return {"resolved": False, "reason": "incident not found"}
+
+            status = latest.get("status")
+            if status in _CLOSED_STATUSES:
+                return {"resolved": False, "reason": "incident already terminal"}
+
+            live = self._live.get(incident_id)
+            if live is not None:
+                live.record(
+                    LifecyclePhase.DETECTION,
+                    "Kubernetes reconciliation observed that the recorded target "
+                    "Pod is gone and a healthy replacement is serving; the running "
+                    "lifecycle will validate recovery before changing terminal state.",
+                    source=source,
+                    reason=reason,
+                )
+                self.store.upsert_incident(live.to_dict())
+                self.emit(
+                    live,
+                    "Kubernetes observed recovery for the recorded Pod; lifecycle validation continues",
+                    "recovery_observed",
+                    source=source,
+                )
+                return {
+                    "resolved": False,
+                    "reason": "incident lifecycle is still running; recovery recorded",
+                }
+
+            incident = Incident.from_dict(latest)
+            incident.status = IncidentStatus.AUTO_RESOLVED
+            incident.resolved_at = now
+            incident.record(
+                LifecyclePhase.DETECTION,
+                "Incident auto-resolved from current Kubernetes state: " + reason,
+                source=source,
+            )
+            self.store.upsert_incident(incident.to_dict())
+            self.emit(
+                incident,
+                "Incident auto-resolved: the recorded Pod was replaced and the Deployment recovered",
+                "auto_resolved",
+                source=source,
+            )
+            logger.info(
+                "incident_auto_resolved_from_cluster_state",
+                extra={
+                    "incident_id": incident.id,
+                    "alertname": incident.alertname,
+                    "app": incident.app,
+                    "pod": incident.pod,
+                    "source": source,
+                },
+            )
+            return {
+                "resolved": True,
+                "incident_id": incident.id,
+                "reason": "current Kubernetes state confirmed recovery",
+            }
+
     # ------------------------------------------------------------------
     # events (real, from the backend — nothing here is decorative)
     # ------------------------------------------------------------------

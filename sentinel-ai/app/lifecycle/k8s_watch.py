@@ -66,6 +66,23 @@ logger = logging.getLogger(__name__)
 
 WATCH_ALERTNAME = "DeploymentUnavailable"
 
+# Pod-level availability alerts can outlive the Pod object that triggered them.
+# A Deployment rollout commonly replaces a failed Pod with a new Pod whose name
+# and Prometheus fingerprint are different. When the replacement is healthy,
+# the incident condition is gone even if Alertmanager never delivered the
+# matching resolved notification. Reconcile only availability incidents here;
+# memory/CPU/latency incidents may legitimately outlive one Pod replacement.
+POD_AVAILABILITY_ALERTNAMES = frozenset(
+    {"ServiceDown", "PodCrashLooping", WATCH_ALERTNAME}
+)
+_RECONCILABLE_STATUSES = (
+    "open",
+    "investigating",
+    "remediating",
+    "validating",
+    "escalated",
+)
+
 
 class _DeploymentWatchState:
     """Per-Deployment debounce/notification bookkeeping. In-memory only —
@@ -138,6 +155,107 @@ def _normalised_alert(
     }
 
 
+async def _reconcile_stale_pod_incidents(
+    ctx: Any,
+    incident_manager: Any,
+    environment: Any,
+    deployments: list[dict[str, Any]],
+) -> None:
+    """Auto-resolve availability incidents whose recorded Pod disappeared.
+
+    Alertmanager identifies a Pod-level alert by the Pod name/fingerprint. A
+    normal Deployment replacement creates a new Pod, so the old alert may lose
+    its scrape target without Sentinel receiving a useful resolved webhook.
+    This reconciliation closes that stale incident only when ALL of these are
+    true:
+
+    * the incident is still non-terminal and records a Pod name;
+    * it is an availability incident (not a memory/CPU/latency diagnosis);
+    * the target Deployment still wants replicas and currently has all desired
+      replicas available; and
+    * the recorded Pod name is gone while at least one current Pod is Ready.
+
+    The exact incident id is passed to IncidentManager so a resolution cannot
+    accidentally close a newer occurrence that shares the same workload and
+    failure class.
+    """
+    store = getattr(incident_manager, "store", None)
+    if store is None:
+        return
+
+    try:
+        records = store.list_by_statuses(_RECONCILABLE_STATUSES)
+    except Exception:  # noqa: BLE001 - reconciliation must not kill the watch
+        logger.exception("k8s_watch_incident_list_failed")
+        return
+
+    namespace = environment.kubernetes.namespace
+    by_name = {d.get("name"): d for d in deployments if d.get("name")}
+    candidates: dict[str, list[dict[str, Any]]] = {}
+    for incident in records:
+        if incident.get("namespace") != namespace:
+            continue
+        if not incident.get("pod"):
+            continue
+        if incident.get("alertname") not in POD_AVAILABILITY_ALERTNAMES:
+            continue
+        app = incident.get("app")
+        if not app or app not in by_name:
+            continue
+        candidates.setdefault(app, []).append(incident)
+
+    for app, incidents in candidates.items():
+        dep = by_name[app]
+        desired = dep.get("desired_replicas")
+        available = dep.get("available_replicas") or 0
+        if desired is None or desired <= 0 or available < desired:
+            continue
+
+        try:
+            pods = await ctx.k8s.list_pods(namespace, label_selector=f"app={app}")
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "k8s_watch_list_pods_for_reconciliation_failed",
+                extra={"namespace": namespace, "deployment": app},
+            )
+            continue
+
+        current_names = {p.get("name") for p in pods if p.get("name")}
+        ready = any(p.get("ready") for p in pods)
+        if not ready:
+            continue
+
+        for incident in incidents:
+            pod = incident.get("pod")
+            if not pod or pod in current_names:
+                continue
+            reason = (
+                f"Recorded Pod {namespace}/{pod} no longer exists; Deployment "
+                f"{namespace}/{app} now has {available}/{desired} available replicas "
+                "and a Ready replacement Pod. Treating the stale Pod-level "
+                "availability condition as cleared."
+            )
+            try:
+                result = incident_manager.auto_resolve_incident(
+                    incident["id"], reason=reason, source="k8s_watch"
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "k8s_watch_auto_resolution_failed",
+                    extra={"incident_id": incident.get("id"), "deployment": app, "pod": pod},
+                )
+                continue
+            if result.get("resolved"):
+                logger.info(
+                    "k8s_watch_stale_pod_incident_auto_resolved",
+                    extra={
+                        "incident_id": incident.get("id"),
+                        "deployment": app,
+                        "pod": pod,
+                    },
+                )
+
+
 async def _evaluate(
     ctx: Any,
     incident_manager: Any,
@@ -155,6 +273,12 @@ async def _evaluate(
 
     seen_names: set[str] = set()
     now = time.time()
+
+    # Reconcile Pod-level availability incidents independently of Alertmanager.
+    # This is deliberately done before the Deployment-unavailable loop: the
+    # current Deployment can be healthy even though the incident's recorded
+    # Pod object has already been replaced.
+    await _reconcile_stale_pod_incidents(ctx, incident_manager, environment, deployments)
 
     for dep in deployments:
         name = dep.get("name")
