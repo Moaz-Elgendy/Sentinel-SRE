@@ -99,10 +99,10 @@ spec:
           env:
             - name: SENTINEL_API_UPSTREAM
               # Substituted at deploy time by deploy-aws.sh /
-              # sentinel-deploy.sh's `apply` mode from either the
-              # SENTINEL_API_UPSTREAM env var (external-control-plane
-              # topology) or its default, http://sentinel-ai:8080
-              # (in-cluster topology). This must stay a literal
+              # sentinel-deploy.sh's `apply` mode from the
+              # SENTINEL_API_UPSTREAM env var, which is REQUIRED in the
+              # external-control-plane topology — there is deliberately no
+              # default. This must stay a literal
               # `*_PLACEHOLDER` token, matched and replaced by `sed` against
               # the rendered manifest stream — see deploy-aws.sh's own
               # comment for why. A hardcoded IP here is stale the moment the

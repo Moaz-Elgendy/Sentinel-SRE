@@ -18,19 +18,19 @@
 # tracked kustomization.yaml in place, which leaves the checkout dirty and
 # makes the next `git checkout` conflict. `kubectl kustomize` (built into
 # k3s's bundled kubectl) can render but not edit, so this renders and then
-# substitutes three placeholders in the output stream. Nothing on disk is
+# substitutes deploy-time placeholders in the output stream. Nothing on disk is
 # modified.
 #
-# The three placeholders and why each cannot be resolved at build time:
+# The placeholders and why each cannot be resolved at build time:
 #   ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com  - depends on the AWS account
 #   :PLACEHOLDER                             - depends on the commit deployed
 #   PUBLIC_IP_PLACEHOLDER                    - depends on the instance's IP
-#   SENTINEL_API_UPSTREAM_PLACEHOLDER        - optional remote Sentinel URL
+#   SENTINEL_API_UPSTREAM_PLACEHOLDER        - required private external Sentinel URL
 #
-# All three are deliberately invalid rather than plausible defaults, so a
-# substitution that silently fails to happen produces an immediate,
-# obvious error (ImagePullBackOff, or a CORS rejection in the browser)
-# instead of quietly running the wrong thing.
+# Manifest placeholders are deliberately invalid rather than plausible
+# defaults, so a missed substitution fails visibly. The external Sentinel
+# upstream is required explicitly; AWS no longer hosts the authoritative
+# Sentinel inside the K3s cluster.
 
 set -euo pipefail
 
@@ -60,6 +60,29 @@ command -v kubectl >/dev/null 2>&1 || {
   exit 1
 }
 
+SENTINEL_API_UPSTREAM="${SENTINEL_API_UPSTREAM:-}"
+if [ -z "${SENTINEL_API_UPSTREAM}" ]; then
+  echo "ERROR: SENTINEL_API_UPSTREAM is required for the external Sentinel EC2 topology." >&2
+  echo "       Set it to http://<sentinel-private-ip>:8080 before deploying." >&2
+  exit 1
+fi
+case "${SENTINEL_API_UPSTREAM}" in
+  http://*|https://*) ;;
+  *)
+    echo "ERROR: SENTINEL_API_UPSTREAM must be an http(s) URL." >&2
+    exit 1
+    ;;
+esac
+sentinel_authority="${SENTINEL_API_UPSTREAM#*://}"
+sentinel_authority="${sentinel_authority%%/*}"
+sentinel_host="${sentinel_authority%%:*}"
+case "${sentinel_host,,}" in
+  sentinel-ai|localhost|127.0.0.1|*.svc|*.svc.*)
+    echo "ERROR: SENTINEL_API_UPSTREAM must point to the external Sentinel EC2, not a local/Kubernetes-only name." >&2
+    exit 1
+    ;;
+esac
+
 # ---------------------------------------------------------------------------
 # Discover account, region and public IP from the instance itself
 #
@@ -87,7 +110,6 @@ echo "  account    : ${AWS_ACCOUNT_ID}"
 echo "  public IP  : ${PUBLIC_IP}"
 echo "  registry   : ${ECR_REGISTRY}"
 echo "  image tag  : ${IMAGE_TAG}"
-SENTINEL_API_UPSTREAM="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
 echo "  sentinel   : ${SENTINEL_API_UPSTREAM}"
 
 # ---------------------------------------------------------------------------

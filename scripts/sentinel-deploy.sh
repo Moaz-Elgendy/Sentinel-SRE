@@ -358,10 +358,10 @@ ensure_repo_synced() {
 
 # A rendered manifest containing this string went through no substitution
 # at all — reject it outright rather than trying to guess what URL was
-# meant. Deliberately permissive about the host part (private IPs, Service
-# DNS names, and public hostnames must all be valid here).
+# meant. Private IPs and private DNS hostnames are valid, but in-cluster
+# Service DNS and loopback addresses are not reachable from external Sentinel.
 validate_upstream_url() {
-  local url="$1"
+  local url="$1" authority host
   case "${url}" in
     *PLACEHOLDER*|"")
       echo "ERROR: SENTINEL_API_UPSTREAM is unset or still a placeholder: '${url}'" >&2
@@ -370,6 +370,16 @@ validate_upstream_url() {
     http://*|https://*) ;;
     *)
       echo "ERROR: SENTINEL_API_UPSTREAM must be an http(s) URL, got: '${url}'" >&2
+      return 1
+      ;;
+  esac
+
+  authority="${url#*://}"
+  authority="${authority%%/*}"
+  host="${authority%%:*}"
+  case "${host,,}" in
+    sentinel-ai|localhost|127.0.0.1|*.svc|*.svc.*)
+      echo "ERROR: SENTINEL_API_UPSTREAM must be reachable from the external Sentinel EC2; '${host}' is a local/cluster-only name." >&2
       return 1
       ;;
   esac
@@ -415,9 +425,10 @@ render_and_apply() {
 
   ecr_registry="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com"
 
-  # Same default as deploy-aws.sh: the in-cluster topology's Service DNS
-  # name. Set SENTINEL_API_UPSTREAM for the external-control-plane topology.
-  sentinel_api_upstream="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
+  # AWS runs Sentinel on its own EC2 instance. Never fall back to the
+  # Kubernetes-only `sentinel-ai` Service name: Alertmanager could accept the
+  # config while every real alert webhook fails to reach external Sentinel.
+  sentinel_api_upstream="${SENTINEL_API_UPSTREAM:-}"
 
   validate_upstream_url "${sentinel_api_upstream}" || return 1
 

@@ -943,9 +943,14 @@ stack with the frontend
 proxy pointed at the standalone Sentinel EC2 private IP:
 
 ```bash
+terraform -chdir=infra/terraform output -raw sentinel_private_ip
 sudo SENTINEL_API_UPSTREAM=http://<sentinel-private-ip>:8080 \
   /opt/sentinel-sre/scripts/deploy-aws.sh <image-tag>
 ```
+
+The upstream is required for every AWS overlay apply. Deployment fails closed if it is absent or
+points to Kubernetes-only Sentinel Service DNS; never use `http://sentinel-ai:8080` in the
+standalone two-EC2 topology. CI discovers this private IP and reapplies the overlay on every deploy.
 
 Then enter the chaos admin token, connect to Sentinel, and click a scenario. Sentinel uses SSM Run
 Command to execute `/opt/sentinel-sre/scripts/incident-scenarios.sh` on the K3s node and shows the

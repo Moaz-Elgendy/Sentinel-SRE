@@ -769,48 +769,40 @@ jobs:
         run: |
           set -euo pipefail
 
-          # k8s/ changed this push -> sync only the tracked *.yaml under
-          # k8s/ from this commit (never the live k8s/overlays/aws/secrets/
-          # *.env — those are gitignored/untracked, so `git checkout` can't
-          # touch them) and apply the rendered overlay. Otherwise this is a
-          # normal code-only push: `set image` only, same as before, so the
-          # ReplicaSet history Sentinel relies on is unaffected either way.
-          #
-          if [ "${{ steps.k8s-diff.outputs.changed }}" = "true" ]; then
-            # Sentinel runs on its own EC2 instance in the AWS topology.
-            # Discover its private IP from the Terraform-managed Name tag.
-            # Do not accept a repository variable here: a value copied as a
-            # Markdown link (for example [http://...](http://...)) is not a
-            # valid URL and can also break AWS CLI parameter parsing.
-            sentinel_private_ips_raw="$(aws ec2 describe-instances \
-              --filters \
-                "Name=tag:Name,Values=sentinel-sre-demo-sentinel" \
-                "Name=instance-state-name,Values=running" \
-              --query 'Reservations[].Instances[].PrivateIpAddress' \
-              --output text)"
-            read -r -a sentinel_private_ips <<< "${sentinel_private_ips_raw}"
+          # Sentinel runs on a separate EC2 instance from K3s. Always discover
+          # that instance's private IP and apply the rendered overlay with its
+          # webhook URL: a code-only deploy must also repair any old
+          # Alertmanager config that still points at Kubernetes-only DNS.
+          sentinel_private_ips_raw="$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=sentinel-sre-demo-sentinel" \
+              "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].PrivateIpAddress' \
+            --output text)"
+          read -r -a sentinel_private_ips <<< "${sentinel_private_ips_raw}"
 
-            if [ "${#sentinel_private_ips[@]}" -ne 1 ]; then
-              echo "::error::Expected exactly one running external Sentinel EC2 instance, found ${#sentinel_private_ips[@]}."
-              echo "Raw private-IP lookup result: ${sentinel_private_ips_raw}"
-              exit 1
-            fi
-
-            sentinel_private_ip="${sentinel_private_ips[0]}"
-            if [[ ! "${sentinel_private_ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-              echo "::error::Sentinel private IP lookup returned an invalid value: ${sentinel_private_ip}"
-              exit 1
-            fi
-
-            sentinel_api_upstream="http://${sentinel_private_ip}:8080"
-            echo "Sentinel API upstream: ${sentinel_api_upstream}"
-
-            deploy_cmd="export SENTINEL_API_UPSTREAM=${sentinel_api_upstream}; /usr/local/bin/sentinel-deploy.sh sync-manifests ${GITHUB_SHA} && /usr/local/bin/sentinel-deploy.sh apply-manifests ${GITHUB_SHA}"
-            comment="Deploy ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID} (k8s manifests changed; Sentinel=${sentinel_api_upstream})"
-          else
-            deploy_cmd="/usr/local/bin/sentinel-deploy.sh images ${GITHUB_SHA}"
-            comment="Deploy ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID}"
+          if [ "${#sentinel_private_ips[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one running external Sentinel EC2 instance, found ${#sentinel_private_ips[@]}."
+            echo "Raw private-IP lookup result: ${sentinel_private_ips_raw}"
+            exit 1
           fi
+
+          sentinel_private_ip="${sentinel_private_ips[0]}"
+          if [[ ! "${sentinel_private_ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "::error::Sentinel private IP lookup returned an invalid value: ${sentinel_private_ip}"
+            exit 1
+          fi
+
+          sentinel_api_upstream="http://${sentinel_private_ip}:8080"
+          echo "Sentinel API upstream: ${sentinel_api_upstream}"
+
+          sync_manifests=""
+          if [ "${{ steps.k8s-diff.outputs.changed }}" = "true" ]; then
+            # Sync only tracked k8s files; live overlay secrets are untracked.
+            sync_manifests="/usr/local/bin/sentinel-deploy.sh sync-manifests ${GITHUB_SHA} && "
+          fi
+          deploy_cmd="export SENTINEL_API_UPSTREAM=${sentinel_api_upstream}; ${sync_manifests}/usr/local/bin/sentinel-deploy.sh apply-manifests ${GITHUB_SHA}"
+          comment="Deploy ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID} (Sentinel=${sentinel_api_upstream})"
 
           # AWS-RunShellScript defines `commands` as a StringList. Use real
           # JSON rather than AWS CLI shorthand: the shell command contains

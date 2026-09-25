@@ -56,8 +56,11 @@ expect_failure() {
 
 echo "=== validate_upstream_url ==="
 expect_success "accepts a private-IP http URL"      validate_upstream_url "http://10.20.1.57:8080"
-expect_success "accepts the in-cluster DNS default" validate_upstream_url "http://sentinel-ai:8080"
 expect_success "accepts https"                      validate_upstream_url "https://sentinel.example.com"
+expect_failure "rejects in-cluster sentinel Service DNS" validate_upstream_url "http://sentinel-ai:8080"
+expect_failure "rejects Kubernetes service DNS"      validate_upstream_url "http://sentinel-ai.citizen-portal.svc:8080"
+expect_failure "rejects short Kubernetes .svc DNS"  validate_upstream_url "http://sentinel-ai.svc:8080"
+expect_failure "rejects localhost"                  validate_upstream_url "http://localhost:8080"
 expect_failure "rejects the raw placeholder"        validate_upstream_url "SENTINEL_API_UPSTREAM_PLACEHOLDER"
 expect_failure "rejects empty"                      validate_upstream_url ""
 expect_failure "rejects a non-http(s) scheme"       validate_upstream_url "ftp://10.20.1.57"
@@ -74,6 +77,16 @@ if grep -q 'SENTINEL_API_UPSTREAM_PLACEHOLDER' "${aws_patch}"; then
   ok "AWS overlay can receive the external Sentinel endpoint at deploy time"
 else
   bad "AWS overlay has no external Sentinel endpoint substitution"
+fi
+if grep -q 'SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080' "${SCRIPT_DIR}/../sentinel-deploy.sh" "${SCRIPT_DIR}/../deploy-aws.sh"; then
+  bad "AWS deploy scripts must not default to cluster-only Sentinel DNS"
+else
+  ok "AWS deploy scripts have no cluster-only Sentinel DNS fallback"
+fi
+if grep -q 'SENTINEL_API_UPSTREAM is required for the external Sentinel EC2 topology' "${SCRIPT_DIR}/../deploy-aws.sh"; then
+  ok "manual AWS overlay deploy fails closed without the external Sentinel URL"
+else
+  bad "manual AWS overlay deploy does not require the external Sentinel URL"
 fi
 
 echo "=== assert_no_placeholders ==="

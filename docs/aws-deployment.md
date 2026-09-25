@@ -86,15 +86,28 @@ the Terraform comments and repeated where relevant below.
         |   Prometheus  Loki  Grafana  Alertmanager   |
         |   Alloy (DaemonSet)                         |
         |                                             |
-        |   sentinel-ai:8080                          |
-        |     <- Alertmanager webhook                 |
-        |     -> Kubernetes API (namespaced Role)     |
-        +---------------------------------------------+
-                       ^
-                       | outbound only
-                       v
-        SSM Session Manager  |  ECR  |  apt / get.k3s.io / Docker Hub
+        |     -> Alertmanager webhook ------------.    |
+        |     <- K8s API / Prometheus / Loki / chaos  |  |
+        +---------------------------------------------+  |  private VPC
+                       ^                             |  |
+                       | outbound only               |  |
+                       v                             |  |
+        SSM Session Manager  |  ECR  |  apt / get.k3s.io
+                                                      |
+        +----------------------------------------------+
+        |  EC2, same VPC: external Sentinel control     |
+        |  plane (sentinel-ai + sentinel-gui). The      |
+        |  webhook port is open only from the K3s      |
+        |  node's security group.                      |
+        +----------------------------------------------+
 ```
+
+Sentinel itself is **not** a Deployment in this overlay. It runs on a second EC2 instance
+(`infra/terraform/sentinel_remote.tf`, gated on `var.enable_remote_sentinel`) alongside
+`sentinel-gui`, so Alertmanager delivers webhooks over the private VPC to
+`http://<sentinel-private-ip>:8080/api/alerts/webhook` — not to the Kubernetes-only
+`sentinel-ai` Service name. The deploy scripts refuse to render that name for exactly this
+reason; see the verification step below for the command that proves which address is live.
 
 `notification-service` has no Ingress rule. It is reached only by `citizen-service` over the
 cluster network — the same server-to-server boundary the project has had since the services were
@@ -1183,8 +1196,14 @@ Do **not** put these in GitHub Secrets. They are consumed by a pod at runtime, n
 ### 18b. Apply the overlay
 
 ```bash
-sudo /opt/sentinel-sre/scripts/deploy-aws.sh "$TAG"
+sudo SENTINEL_API_UPSTREAM=http://<sentinel-private-ip>:8080 \
+  /opt/sentinel-sre/scripts/deploy-aws.sh "$TAG"
 ```
+
+Get the address with `terraform -chdir=infra/terraform output -raw sentinel_private_ip`. It is
+required because Alertmanager on the K3s EC2 must reach the separate Sentinel EC2 over the private
+VPC. AWS deploy scripts reject Kubernetes-only `sentinel-ai` Service DNS instead of silently
+installing a receiver that cannot reach the external Sentinel.
 
 where `$TAG` is the git SHA you pushed in step 17. The script:
 
@@ -1967,13 +1986,16 @@ Expected:
 ```yaml
       - name: sentinel
         webhook_configs:
-          - url: http://sentinel-ai:8080/api/alerts/webhook
+          - url: http://<sentinel-private-ip>:8080/api/alerts/webhook
             send_resolved: true
 ```
 
-That URL must be exactly `http://sentinel-ai:8080/api/alerts/webhook`. It is an in-cluster
-ClusterIP address, so Alertmanager reaches Sentinel over the pod network â€” nothing leaves the
-node.
+That URL must target the standalone Sentinel EC2's private IP, obtainable with
+`terraform -chdir=infra/terraform output -raw sentinel_private_ip`. Do not use
+`http://sentinel-ai:8080`: that Kubernetes-only Service name is not the external Sentinel and can
+leave alerts active in Alertmanager without creating or remediating incidents. The K3s security
+group allows the Sentinel webhook port only from the K3s node security group, keeping this path on
+the private VPC.
 
 You can exercise the path end to end without waiting for a real incident, by posting a synthetic
 alert into Alertmanager and watching it arrive at Sentinel:

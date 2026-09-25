@@ -236,15 +236,21 @@ aws ssm start-session --target <instance-id> --region <region>
 sudo /opt/sentinel-sre/scripts/generate-aws-secrets.sh
 
 # 4. Deploy a specific commit that CI has already pushed to ECR.
-sudo /opt/sentinel-sre/scripts/deploy-aws.sh <git-sha>
+sudo SENTINEL_API_UPSTREAM=http://<sentinel-private-ip>:8080 \
+  /opt/sentinel-sre/scripts/deploy-aws.sh <git-sha>
 ```
+
+Get `<sentinel-private-ip>` from `terraform -chdir=infra/terraform output -raw sentinel_private_ip`.
+This is mandatory: Alertmanager on the K3s EC2 sends webhooks directly to the standalone Sentinel
+EC2 over the private VPC. The deploy script rejects the Kubernetes-only `http://sentinel-ai:8080`
+fallback.
 
 Thereafter a push to `main` deploys itself: GitHub Actions runs the tests, builds and pushes to
 ECR, then uses `aws ssm send-command` to invoke a fixed script on the node. CI never holds a
 kubeconfig and never contacts the Kubernetes API.
 
-`scripts/deploy-aws.sh` renders `overlays/aws` with `kubectl kustomize` and substitutes three
-placeholders in the output stream rather than editing tracked files:
+`scripts/deploy-aws.sh` renders `overlays/aws` with `kubectl kustomize` and substitutes deploy-time
+values in the output stream rather than editing tracked files:
 
 | Placeholder | Why it can't be resolved at build time |
 |---|---|
@@ -276,22 +282,26 @@ the browser) instead of quietly running the wrong thing.
 - **`revisionHistoryLimit` set explicitly**, so Sentinel has rollback targets. Rollback is only
   possible if the previous ReplicaSet still exists.
 - **Chaos enabled**, so the failure scenarios exist to demonstrate.
-- **Sentinel added.** It has no local-development equivalent yet, so it is a resource in this
-  overlay rather than a patch on the base. When a local Sentinel setup exists, it should be
-  promoted into `base/`. The Sentinel SRE Control Center GUI (`sentinel-gui/`) is **not** added
+- **External Sentinel integration.** Sentinel runs on its own EC2 instance, not in this K3s
+  overlay. Alertmanager's webhook receiver is rendered to the external instance's private VPC
+  address through `SENTINEL_API_UPSTREAM`; AWS deploys reject the in-cluster-only `sentinel-ai`
+  hostname. The Sentinel SRE Control Center GUI (`sentinel-gui/`) is **not** added
   alongside it any more — it has moved to the external Sentinel EC2 as part of the Sentinel
   control plane (see `infra/terraform/sentinel_remote.tf`) and is never deployed in K3s.
 - **Replica counts right-sized for 2 vCPU.** Fixed by hand, no HPA.
-- **Alertmanager gets a webhook receiver** pointing at `http://sentinel-ai:8080/api/alerts/webhook`,
+- **Alertmanager gets a webhook receiver** pointing at
+  `http://<sentinel-private-ip>:8080/api/alerts/webhook` (private VPC),
   plus the additional alert rules the new chaos scenarios need (`HighCPUUsage`,
   `MemoryLeakSuspected`, `ChaosCPUBurn`, `ChaosMemoryLeak`, `NotificationDispatchFailures`) and two
   that watch Sentinel itself (`SentinelDown`, `SentinelEscalating`).
 
 ### Reaching the internal tools on AWS
 
-Nothing except the portal on port 80 is publicly reachable. Grafana, Prometheus, Alertmanager and
-Sentinel are all `ClusterIP`-only, reached with `kubectl port-forward` from a Session Manager shell
-on the node — for example:
+Nothing except the portal on port 80 is publicly reachable from the K3s node. Grafana, Prometheus
+and Alertmanager remain cluster services, with restricted NodePorts for external Sentinel. Sentinel
+itself is on its separate EC2 instance; its webhook port is allowed only from the K3s node security
+group. An older in-cluster Sentinel API can still be reached with `kubectl port-forward` for
+diagnostics — for example:
 
 ```bash
 sudo kubectl -n citizen-portal port-forward svc/sentinel-ai 8080:8080
