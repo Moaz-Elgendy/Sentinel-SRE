@@ -152,6 +152,21 @@ data "aws_iam_policy_document" "github_actions" {
     resources = [for repo in aws_ecr_repository.services : repo.arn]
   }
 
+  # The K3s deployment also resolves the private IP of the Terraform-managed
+  # external Sentinel instance by its Name tag. This is read-only discovery;
+  # CI still cannot create, modify, or terminate EC2 instances.
+  statement {
+    sid       = "DiscoverExternalSentinelIp"
+    effect    = "Allow"
+    actions   = ["ec2:DescribeInstances"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:Region"
+      values   = [var.aws_region]
+    }
+  }
+
   # Deploy trigger: run ONE specific SSM document against ONE specific
   # instance. AWS-RunShellScript is the document that executes the
   # /usr/local/bin/sentinel-deploy.sh helper baked into the node.

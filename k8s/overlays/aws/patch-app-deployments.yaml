@@ -83,9 +83,14 @@ kind: Deployment
 metadata:
   name: frontend
   namespace: citizen-portal
+  annotations:
+    sentinel.sre/external-control-plane: "true"
 spec:
   revisionHistoryLimit: 5
   template:
+    metadata:
+      annotations:
+        sentinel.sre/external-control-plane: "true"
     spec:
       imagePullSecrets:
         - name: ecr-credentials

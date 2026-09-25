@@ -63,6 +63,19 @@ expect_failure "rejects empty"                      validate_upstream_url ""
 expect_failure "rejects a non-http(s) scheme"       validate_upstream_url "ftp://10.20.1.57"
 expect_failure "rejects a bare host with no scheme" validate_upstream_url "10.20.1.57:8080"
 
+echo "=== AWS external Sentinel wiring ==="
+aws_patch="${SCRIPT_DIR}/../../k8s/overlays/aws/patch-app-deployments.yaml"
+if grep -q 'value: SENTINEL_API_UPSTREAM_PLACEHOLDER' "${aws_patch}"; then
+  ok "AWS frontend keeps an explicit deploy-time Sentinel placeholder"
+else
+  bad "AWS frontend Sentinel placeholder is missing"
+fi
+if grep -q 'SENTINEL_API_UPSTREAM_PLACEHOLDER' "${aws_patch}"; then
+  ok "AWS overlay can receive the external Sentinel endpoint at deploy time"
+else
+  bad "AWS overlay has no external Sentinel endpoint substitution"
+fi
+
 echo "=== assert_no_placeholders ==="
 clean_file="$(mktemp)"
 dirty_file="$(mktemp)"
