@@ -627,22 +627,41 @@ jobs:
   #   is left as a deliberate operator action over SSM — see
   #   docs/aws-deployment.md.
   #
-  # `sync` mode, run first and best-effort, before `images`:
+  # `sync-scripts`, run first, BEFORE `images`/`sync-manifests`+`apply-manifests`:
   #   Terraform will NOT push a changed user_data to an already-running
   #   instance (user_data_replace_on_change = false in infra/terraform/
   #   ec2.tf — deliberately, so an edit here cannot silently replace, and
   #   wipe, a live cluster). Without this step, a fix to
   #   scripts/sentinel-deploy.sh (e.g. adding a newly-introduced service to
-  #   the `images` case) would sit correctly in the repo forever without
-  #   ever reaching the node that is actually running. `sync` re-installs
-  #   /usr/local/bin/sentinel-deploy.sh from this exact commit's checkout on
-  #   the node, so `images` right after it always runs the current logic.
-  #   It is deliberately best-effort: a node whose installed script predates
-  #   `sync` mode itself has no way to understand this command the very
-  #   first time it is rolled out (see docs/aws-deployment.md's "one-time
-  #   bootstrap" note) — that must not block the `images` deploy that
-  #   follows, which is why this step's failure is reported but never fails
-  #   the job.
+  #   the `images` case, or a new placeholder substitution in
+  #   render_and_apply) would sit correctly in the repo forever without ever
+  #   reaching the node that is actually running. `sync-scripts` refreshes
+  #   scripts/ (and reinstalls /usr/local/bin/sentinel-deploy.sh) from this
+  #   exact commit's checkout on the node, so everything after it always
+  #   runs the current logic.
+  #
+  #   This step is a HARD GATE, not best-effort — see docs/aws-deployment.md,
+  #   "Deployment synchronization contract", for the incident that made this
+  #   change necessary: a push that changed both a k8s/ manifest and the
+  #   render_and_apply() logic that substitutes it hit a sync-scripts
+  #   failure that was only ever logged as a warning. The deploy step that
+  #   followed then ran the NEW manifests through the OLD (pre-fix)
+  #   installed script, which didn't know about the new placeholder and
+  #   shipped it to the cluster unsubstituted — and because that step still
+  #   reported success, nothing surfaced the problem until someone noticed
+  #   the literal placeholder string live in the Deployment. A sync failure
+  #   must stop the deploy, not run it against whatever happens to already
+  #   be on the node.
+  #
+  #   The one legitimate case where the node cannot yet understand this
+  #   command — bootstrapping a brand-new instance whose installed script
+  #   predates `sync-scripts` mode entirely — is a one-time, manual event
+  #   covered by docs/aws-deployment.md's bootstrap procedure
+  #   (generate-aws-secrets.sh + deploy-aws.sh, run once by an operator over
+  #   SSM before this workflow ever targets that instance). By the time CI
+  #   runs against a node at all, that node's installed script already
+  #   understands `sync-scripts`, so there is no ongoing reason for this to
+  #   be allowed to fail quietly.
   # -------------------------------------------------------------------------
   deploy-to-k3s:
     needs: build-and-push-images
@@ -694,7 +713,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: gha-deploy-${{ github.run_id }}
 
-      - name: Sync scripts/ on the node (best-effort)
+      - name: Sync scripts/ on the node
         id: sync
         run: |
           set -euo pipefail
@@ -727,15 +746,24 @@ jobs:
             --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
             --query StandardErrorContent --output text || true
 
+          # HARD GATE (see the job-level comment above for why this used to
+          # be best-effort and why that was unsafe): scripts/ — including
+          # sentinel-deploy.sh's own render/substitute/verify logic — is not
+          # confirmed current on the node, so do not let the deploy step
+          # below run against whatever happens to already be installed.
+          # sentinel-deploy.sh's sync-scripts mode itself now also verifies
+          # (via verify_synced_to/verify_executable) that the sync it just
+          # ran actually landed correctly, not merely that the SSM command
+          # returned 0 — so a "Success" status here is a real guarantee, not
+          # just an absence of error.
           if [ "${status}" != "Success" ]; then
-            echo "::warning::scripts/ sync did not succeed (status: ${status})." \
-              "The deploy step below will still run against whatever version of" \
-              "scripts/ is currently on the node. If this is the very first run" \
-              "after adding 'sync-scripts' mode, this is expected once — see" \
-              "docs/aws-deployment.md."
+            echo "::error::scripts/ sync did not succeed (status: ${status})." \
+              "Refusing to deploy against a node that is not confirmed to be" \
+              "running this commit's scripts/. If this is a brand-new" \
+              "instance whose installed script predates 'sync-scripts' mode," \
+              "bootstrap it manually first — see docs/aws-deployment.md."
+            exit 1
           fi
-          # Deliberately always exit 0: sync is a best-effort freshness step,
-          # never a gate on the deploy that follows.
 
       - name: Trigger deploy on the node via SSM
         id: send
@@ -748,8 +776,19 @@ jobs:
           # touch them) and apply the rendered overlay. Otherwise this is a
           # normal code-only push: `set image` only, same as before, so the
           # ReplicaSet history Sentinel relies on is unaffected either way.
+          #
+          # SENTINEL_API_UPSTREAM is optional repository configuration (a
+          # GitHub Actions variable, Settings -> Secrets and variables ->
+          # Actions -> Variables), never hardcoded here: set it to
+          # http://<sentinel-private-ip>:8080 for the external-control-plane
+          # topology (Sentinel running on its own EC2 instance, per
+          # infra/terraform/sentinel_remote.tf). Left unset, apply-manifests
+          # falls back to its own in-cluster default (http://sentinel-ai:8080)
+          # exactly as before — the ordinary in-cluster topology needs no
+          # configuration change at all. Quoted so an empty value still
+          # exports cleanly and sentinel-deploy.sh's own default applies.
           if [ "${{ steps.k8s-diff.outputs.changed }}" = "true" ]; then
-            deploy_cmd="/usr/local/bin/sentinel-deploy.sh sync-manifests ${GITHUB_SHA} && /usr/local/bin/sentinel-deploy.sh apply-manifests ${GITHUB_SHA}"
+            deploy_cmd="export SENTINEL_API_UPSTREAM='${{ vars.SENTINEL_API_UPSTREAM }}'; /usr/local/bin/sentinel-deploy.sh sync-manifests ${GITHUB_SHA} && /usr/local/bin/sentinel-deploy.sh apply-manifests ${GITHUB_SHA}"
             comment="Deploy ${GITHUB_SHA:0:7} from ${GITHUB_RUN_ID} (k8s manifests changed)"
           else
             deploy_cmd="/usr/local/bin/sentinel-deploy.sh images ${GITHUB_SHA}"

@@ -92,9 +92,6 @@
 set -euo pipefail
 export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-MODE="${1:?usage: sentinel-deploy.sh <images|apply|sync-manifests|apply-manifests|sync-scripts|sync> <git-sha>}"
-SHA="${2:?usage: sentinel-deploy.sh <images|apply|sync-manifests|apply-manifests|sync-scripts|sync> <git-sha>}"
-
 # Fixed for this environment — mirrors infra/terraform/variables.tf's
 # app_namespace/project_name defaults and ec2.tf's repo_dir. These three
 # things do not vary independently of a full infrastructure redeploy, so
@@ -104,12 +101,91 @@ NS="citizen-portal"
 PREFIX="sentinel-sre-demo"
 REPO_DIR="/opt/sentinel-sre"
 
+# ---------------------------------------------------------------------------
+# Verification helpers
+# ---------------------------------------------------------------------------
+# These exist so "the SSM command returned 0" is never mistaken for "the
+# node is now at the commit CI asked for" — see docs/aws-deployment.md,
+# "Deployment synchronization contract", for the incident that made that
+# distinction necessary: sync-scripts used to be allowed to fail silently,
+# which let a manifest change ship with an old copy of render_and_apply()
+# that didn't know about it, and nothing here caught that until the bad
+# value was already live.
+
+# Fails loudly if `path` is not executable. Kept separate from `chmod`
+# itself so every caller proves the bit actually landed, rather than
+# trusting that `install`/`chmod`'s own exit code was enough — on a
+# filesystem mounted noexec, or if `install`/`chmod` silently no-ops on a
+# path it doesn't have permission to touch, the command can still return 0.
+verify_executable() {
+  local path="$1"
+  if [ ! -x "${path}" ]; then
+    echo "ERROR: ${path} is not executable after sync." >&2
+    stat "${path}" >&2 2>/dev/null || echo "(and it does not exist at all)" >&2
+    return 1
+  fi
+}
+
+# Fails loudly if the working tree under any of `paths` does not exactly
+# match the tree at `sha`. `sync-scripts`/`sync-manifests` deliberately
+# never do a full `git checkout --detach` (see their own comments — moving
+# HEAD is unsafe with a partially-untracked repo like this one), so
+# `git rev-parse HEAD` cannot be used to prove "we are at the commit CI
+# asked for". `git diff --quiet <sha> -- <paths>` is the equivalent check
+# for a narrow, path-scoped sync: it compares the *working tree* against
+# the *target commit* directly and is silent on paths git doesn't track,
+# so the untracked k8s/overlays/aws/secrets/*.env files can never trip it.
+verify_synced_to() {
+  local sha="$1"
+  shift
+  if ! git -C "${REPO_DIR}" diff --quiet "${sha}" -- "$@"; then
+    echo "ERROR: ${REPO_DIR} is not actually at ${sha} for: $*" >&2
+    echo "       (sync reported success but the working tree still differs" >&2
+    echo "       from the requested commit — do not deploy from this state)" >&2
+    git -C "${REPO_DIR}" diff --stat "${sha}" -- "$@" >&2 || true
+    return 1
+  fi
+}
+
+# A rendered manifest containing this string went through no substitution
+# at all — reject it outright rather than trying to guess what URL was
+# meant. Deliberately permissive about the host part (private IPs, Service
+# DNS names, and public hostnames must all be valid here).
+validate_upstream_url() {
+  local url="$1"
+  case "${url}" in
+    *PLACEHOLDER*|"")
+      echo "ERROR: SENTINEL_API_UPSTREAM is unset or still a placeholder: '${url}'" >&2
+      return 1
+      ;;
+    http://*|https://*) ;;
+    *)
+      echo "ERROR: SENTINEL_API_UPSTREAM must be an http(s) URL, got: '${url}'" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Fails loudly if `file` still contains an unsubstituted template token.
+# Split out of render_and_apply so the exact same check can run in
+# scripts/tests/test_sentinel_deploy_contract.sh without any AWS/k8s
+# access.
+assert_no_placeholders() {
+  local file="$1"
+  if grep -qE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${file}"; then
+    echo "ERROR: unsubstituted placeholders remain in the rendered manifests:" >&2
+    grep -nE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${file}" >&2
+    return 1
+  fi
+}
+
 # Shared by "apply" and "apply-manifests": render k8s/overlays/aws with
 # Kustomize, substitute the four placeholders with values discovered from
-# this instance (never hardcoded), fail loudly if any placeholder survives,
-# then apply the rendered output. Assumes ${REPO_DIR}/k8s is already at the
-# manifests the caller wants applied — it does not check anything out
-# itself. Must be run from ${REPO_DIR}.
+# this instance (never hardcoded), fail loudly if any placeholder survives
+# OR if the value substituted in is not one a real deploy should ever ship
+# with, then apply the rendered output. Assumes ${REPO_DIR}/k8s is already
+# at the manifests the caller wants applied — it does not check anything
+# out itself. Must be run from ${REPO_DIR}.
 render_and_apply() {
   local sha="$1"
   local token aws_region aws_account_id public_ip ecr_registry sentinel_api_upstream rendered
@@ -125,7 +201,12 @@ render_and_apply() {
   # Same default as deploy-aws.sh: the in-cluster topology's Service DNS
   # name. Set SENTINEL_API_UPSTREAM in the environment before calling this
   # for the external-control-plane topology — see docs/aws-deployment.md.
+  # CI's automated path (ci-cd.yml's deploy-to-k3s job) now exports this
+  # from the optional SENTINEL_API_UPSTREAM repository variable so the
+  # external topology is covered by ordinary pushes too, not just a manual
+  # operator invocation.
   sentinel_api_upstream="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
+  validate_upstream_url "${sentinel_api_upstream}" || return 1
 
   rendered="$(mktemp)"
   trap 'rm -f "${rendered}"' RETURN
@@ -138,14 +219,35 @@ render_and_apply() {
 
   # Fail-loud guard: a survived placeholder must stop the deploy, not
   # silently reach the cluster.
-  if grep -qE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${rendered}"; then
-    echo "ERROR: unsubstituted placeholders remain in the rendered manifests:" >&2
-    grep -nE 'PLACEHOLDER|ACCOUNT_ID\.dkr\.ecr' "${rendered}" >&2
+  assert_no_placeholders "${rendered}" || return 1
+
+  # Positive assertion, not just an absence-of-placeholder one: prove the
+  # value we actually meant to ship is present verbatim. This is what would
+  # have caught the historical incident even if some future edit renamed
+  # the placeholder token without updating this sed list to match — a
+  # mismatch there leaves no "PLACEHOLDER" string behind for the check
+  # above to catch, since the raw base manifest's own literal is gone too,
+  # replaced by nothing.
+  if ! grep -qF "value: ${sentinel_api_upstream}" "${rendered}"; then
+    echo "ERROR: rendered manifests do not contain the expected Sentinel endpoint" >&2
+    echo "       (value: ${sentinel_api_upstream}) — refusing to apply." >&2
     return 1
   fi
 
   kubectl apply -f "${rendered}"
 }
+
+# Dispatch is wrapped in main() — invoked only when this file is executed
+# directly (the only way it is ever actually used: by SSM, by CI, or by an
+# operator running it by hand) — and NOT when it is sourced. That lets
+# scripts/tests/test_sentinel_deploy_contract.sh source this file to
+# exercise verify_executable/verify_synced_to/validate_upstream_url/
+# assert_no_placeholders in isolation, with no AWS credentials, no
+# kubeconfig, and no risk of accidentally deploying anything: sourcing this
+# file does nothing beyond defining the functions above.
+main() {
+  MODE="${1:?usage: sentinel-deploy.sh <images|apply|sync-manifests|apply-manifests|sync-scripts|sync> <git-sha>}"
+  SHA="${2:?usage: sentinel-deploy.sh <images|apply|sync-manifests|apply-manifests|sync-scripts|sync> <git-sha>}"
 
 case "${MODE}" in
   images)
@@ -220,6 +322,7 @@ case "${MODE}" in
     # should not fail an otherwise-successful manifest apply.
     if [ -f scripts/sentinel-deploy.sh ]; then
       install -m 0755 scripts/sentinel-deploy.sh /usr/local/bin/sentinel-deploy.sh
+      verify_executable /usr/local/bin/sentinel-deploy.sh
     fi
     ;;
   sync-manifests)
@@ -240,6 +343,7 @@ case "${MODE}" in
     cd "${REPO_DIR}"
     git fetch --all --tags --quiet
     git checkout --quiet "${SHA}" -- k8s
+    verify_synced_to "${SHA}" k8s
     echo "k8s manifests synced to ${SHA} (secrets/*.env untouched — untracked):"
     git show --stat --oneline "${SHA}" -- k8s | head -n -1 || true
     ;;
@@ -267,10 +371,27 @@ case "${MODE}" in
     git fetch --all --tags --quiet
     rm -rf scripts
     git archive "${SHA}" -- scripts | tar -x
+    verify_synced_to "${SHA}" scripts
+
+    # `git archive | tar -x` preserves the executable bit git recorded for
+    # each blob (100755 vs 100644) when this runs as root, which SSM's
+    # AWS-RunShellScript document does — so in the ordinary case this
+    # chmod is a no-op. It is made explicit anyway rather than relied on
+    # implicitly: a file that was ever committed with the wrong mode (e.g.
+    # added via a client that doesn't preserve +x, or edited through
+    # something that reset it) would otherwise silently ship non-executable
+    # and only be discovered the next time something tries to run it — see
+    # docs/aws-deployment.md, "Deployment synchronization contract". Every
+    # script here is invoked directly (by CI, by the chaos-scenario runner,
+    # or by an operator over SSM), never sourced, so +x on all of them is
+    # correct; nothing under scripts/ is a non-executable helper.
+    chmod +x scripts/*.sh
     if [ -f scripts/sentinel-deploy.sh ]; then
+      verify_executable scripts/sentinel-deploy.sh
       install -m 0755 scripts/sentinel-deploy.sh /usr/local/bin/sentinel-deploy.sh
+      verify_executable /usr/local/bin/sentinel-deploy.sh
     fi
-    echo "scripts/ synced to ${SHA} (including deletions)"
+    echo "scripts/ synced to ${SHA} (including deletions), executable bits verified"
     ;;
   sync)
     # Refresh /usr/local/bin/sentinel-deploy.sh itself from the repository
@@ -285,7 +406,10 @@ case "${MODE}" in
     cd "${REPO_DIR}"
     git fetch --all --tags --quiet
     git checkout --quiet "${SHA}" -- scripts/sentinel-deploy.sh
+    verify_synced_to "${SHA}" scripts/sentinel-deploy.sh
+    chmod +x scripts/sentinel-deploy.sh
     install -m 0755 scripts/sentinel-deploy.sh /usr/local/bin/sentinel-deploy.sh
+    verify_executable /usr/local/bin/sentinel-deploy.sh
     echo "sentinel-deploy.sh synced to ${SHA}"
     ;;
   *)
@@ -299,6 +423,11 @@ esac
 # exists to demonstrate: CI's job is to deploy, and Sentinel's job is to
 # notice and remediate. Blocking CI on rollout status would mask exactly
 # the failure mode we want observed.
-if [ "${MODE}" != "sync" ] && [ "${MODE}" != "sync-manifests" ] && [ "${MODE}" != "sync-scripts" ]; then
-  kubectl -n "${NS}" get deployments -o wide
+  if [ "${MODE}" != "sync" ] && [ "${MODE}" != "sync-manifests" ] && [ "${MODE}" != "sync-scripts" ]; then
+    kubectl -n "${NS}" get deployments -o wide
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  main "$@"
 fi

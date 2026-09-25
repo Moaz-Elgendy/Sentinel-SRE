@@ -1,4 +1,4 @@
-import { FlaskConical, KeyRound, LoaderCircle, OctagonAlert, Play, RotateCcw, TriangleAlert } from 'lucide-react'
+import { ChevronDown, ChevronRight, FlaskConical, KeyRound, LoaderCircle, OctagonAlert, Play, RotateCcw, TriangleAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { extractErrorMessage } from '@/api/client'
 import { getChaosToken, getRunStatus, listScenarios, runScenario, setChaosToken } from '@/api/chaosScenarios'
@@ -44,17 +44,65 @@ function useCommandStatus(commandId) {
   return { data, error }
 }
 
+// Non-2xx from the chaos API, a stuck deployment, a missing token, etc. all
+// surface here as the script's own `FAILED: ...` line — the SSM top-level
+// `status`/`status_details` only say "the shell exited non-zero", never why.
+// Without this, a failed run is undebuggable from the GUI: the operator sees
+// "Failed" and nothing else, even though the script prints exactly what went
+// wrong on stderr (or stdout, since most of incident-scenarios.sh's own
+// diagnostics go there).
+const FAILED_STATUSES = new Set(['Failed', 'TimedOut', 'Cancelled'])
+
+function CommandOutput({ data }) {
+  const [open, setOpen] = useState(FAILED_STATUSES.has(data.status))
+  const stderr = (data.stderr ?? '').trim()
+  const stdout = (data.stdout ?? '').trim()
+  if (!stderr && !stdout) return null
+  return (
+    <div className="border-t pt-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground"
+      >
+        {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+        Command output
+        {typeof data.response_code === 'number' && data.response_code !== 0 && (
+          <span className="font-mono text-[10px] text-destructive">exit {data.response_code}</span>
+        )}
+      </button>
+      {open && (
+        <div className="mt-2 space-y-2">
+          {stderr && (
+            <div>
+              <p className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">stderr</p>
+              <pre className="max-h-72 overflow-auto rounded-md bg-muted p-2 font-mono text-xs whitespace-pre-wrap text-destructive">{stderr}</pre>
+            </div>
+          )}
+          {stdout && (
+            <div>
+              <p className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">stdout</p>
+              <pre className="max-h-72 overflow-auto rounded-md bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{stdout}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function RunStatus({ run }) {
   const { data, error } = useCommandStatus(run.commandId)
   if (error) return <Callout tone="bad">{extractErrorMessage(error, 'Could not read run status.')}</Callout>
   if (!data) return <SkeletonRows rows={1} className="p-0" />
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-2">
       <div className="flex items-center gap-2 text-sm">
         <span className="text-muted-foreground">Status</span>
         <StatusBadge status={data.status} />
       </div>
       {data.status_details && <p className="text-xs text-muted-foreground">{data.status_details}</p>}
+      <CommandOutput data={data} />
     </div>
   )
 }
