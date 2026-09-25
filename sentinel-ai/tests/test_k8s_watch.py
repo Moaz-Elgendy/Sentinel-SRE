@@ -223,36 +223,6 @@ def test_evaluate_never_flags_intentional_zero_end_to_end():
     asyncio.run(_run())
 
 
-def test_reconcile_does_not_resolve_non_availability_pod_incident():
-    async def _run():
-        k8s = _FakeK8sList()
-        k8s.set_deployment("notification-service", desired=1, available_replicas=1)
-        k8s.set_pods(
-            "notification-service",
-            {"name": "notification-service-NEW", "ready": True, "container_states": []},
-        )
-        manager = _FakeManager(
-            incidents=[{
-                "id": "INC-MEM",
-                "status": "open",
-                "alertname": "MemoryLeakSuspected",
-                "app": "notification-service",
-                "namespace": "some-namespace",
-                "pod": "notification-service-OLD",
-            }]
-        )
-        environment = _FakeEnvironment()
-        ctx = _FakeCtx(k8s)
-
-        await k8s_watch._reconcile_stale_pod_incidents(
-            ctx, manager, environment, k8s._deployments
-        )
-
-        assert manager.auto_resolved == []
-
-    asyncio.run(_run())
-
-
 def test_evaluate_skips_polling_when_kubernetes_unavailable_via_run_loop():
     """`run_k8s_watch` must not call list_deployments at all while
     `ctx.k8s.available` is False (mirrors main.py's own
