@@ -312,6 +312,36 @@ def test_reconcile_does_not_resolve_stale_pod_when_deployment_is_still_short():
     asyncio.run(_run())
 
 
+def test_reconcile_does_not_resolve_chaos_database_incident():
+    async def _run():
+        k8s = _FakeK8sList()
+        k8s.set_deployment("citizen-service", desired=1, available_replicas=1)
+        k8s.set_pods(
+            "citizen-service",
+            {"name": "citizen-service-NEW", "ready": True, "container_states": []},
+        )
+        manager = _FakeManager(
+            incidents=[{
+                "id": "INC-DB",
+                "status": "open",
+                "alertname": "ChaosDatabaseFailure",
+                "app": "citizen-service",
+                "namespace": "some-namespace",
+                "pod": "citizen-service-OLD",
+            }]
+        )
+        environment = _FakeEnvironment()
+        ctx = _FakeCtx(k8s)
+
+        await k8s_watch._reconcile_stale_pod_incidents(
+            ctx, manager, environment, k8s._deployments
+        )
+
+        assert manager.auto_resolved == []
+
+    asyncio.run(_run())
+
+
 def test_reconcile_does_not_resolve_non_availability_pod_incident():
     async def _run():
         k8s = _FakeK8sList()

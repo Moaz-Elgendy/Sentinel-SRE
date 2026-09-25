@@ -4,7 +4,8 @@
 # Drives a small set of named, repeatable incidents through the Phase 10
 # chaos control API, then confirms Phase 9's stack actually catches each
 # one: the right Prometheus alert enters "firing" within its `for:`
-# window, and (best-effort) that it reaches Alertmanager.
+# window, reaches Alertmanager, and stays active long enough for Sentinel to
+# investigate, remediate and validate the recovery.
 #
 # This closes the loop the whole project has been building toward: every
 # earlier phase produced a signal (a metric, a log line, an alert rule) in
@@ -38,7 +39,9 @@
 # stack deployed.
 #
 # Each scenario port-forwards what it needs, runs, verifies, cleans up
-# its port-forwards, and resets the fault it injected — even on failure
+# its port-forwards, and holds injected faults until Sentinel has had time to
+# detect and remediate them. A timeout is a scenario failure; cleanup then
+# resets the fault as a safety net.
 # (see the trap below). Chaos state is per-pod and in-memory (Phase 10),
 # so scenarios that need a deterministic single target first scale the
 # relevant Deployment to 1 replica, and restore the original replica
@@ -46,6 +49,9 @@
 set -euo pipefail
 
 NAMESPACE="${2:-citizen-portal}"
+ALERTMANAGER_PROPAGATION_TIMEOUT="${ALERTMANAGER_PROPAGATION_TIMEOUT:-90}"
+SENTINEL_REMEDIATION_TIMEOUT="${SENTINEL_REMEDIATION_TIMEOUT:-300}"
+SCENARIO_STARTED_EPOCH=0
 # Read at top level, not inside the function: inside a shell function $3 is
 # the *function's* third argument, not the script's.
 AUTO_ROLLBACK="${3:-${BAD_DEPLOYMENT_AUTO_ROLLBACK:-false}}"
@@ -145,12 +151,25 @@ wait_for_alert() {
   while [ "$waited" -lt "$timeout" ]; do
     local firing
     firing=$(curl -sf "http://localhost:$PROM_PORT/api/v1/alerts" 2>/dev/null \
-      | python3 -c "
-import sys, json
+      | SCENARIO_STARTED_EPOCH="$SCENARIO_STARTED_EPOCH" ALERT_NAME="$alert_name" python3 -c "
+import json, os, sys
+from datetime import datetime
 try:
     data = json.load(sys.stdin)
-    alerts = data.get('data', {}).get('alerts', [])
-    print('yes' if any(a['labels'].get('alertname') == '$alert_name' and a['state'] == 'firing' for a in alerts) else 'no')
+    start = int(os.environ['SCENARIO_STARTED_EPOCH'])
+    name = os.environ['ALERT_NAME']
+    for a in data.get('data', {}).get('alerts', []):
+        if a.get('labels', {}).get('alertname') != name or a.get('state') != 'firing':
+            continue
+        active_at = a.get('activeAt')
+        if not active_at:
+            continue
+        active_epoch = datetime.fromisoformat(active_at.replace('Z', '+00:00')).timestamp()
+        if active_epoch >= start - 5:
+            print('yes')
+            break
+    else:
+        print('no')
 except Exception:
     print('no')
 " 2>/dev/null || echo "no")
@@ -166,25 +185,93 @@ except Exception:
   return 1
 }
 
-check_alertmanager_seen() {
-  # Best-effort — confirms the alert also reached Alertmanager, not just
-  # Prometheus's own evaluation. Non-fatal if it hasn't propagated yet.
-  local alert_name="$1"
-  local seen
-  seen=$(curl -sf "http://localhost:$AM_PORT/api/v2/alerts" 2>/dev/null \
-    | python3 -c "
-import sys, json
+wait_for_alertmanager() {
+  # Prometheus firing is NOT enough for an end-to-end Sentinel scenario.
+  # Alertmanager has its own group_wait, and Sentinel receives the alert only
+  # from Alertmanager's webhook. Keep the fault active until the firing alert
+  # is actually visible here.
+  local alert_name="$1" timeout="${2:-$ALERTMANAGER_PROPAGATION_TIMEOUT}" waited=0
+  echo "    Waiting up to ${timeout}s for '$alert_name' to reach Alertmanager/Sentinel..."
+  while [ "$waited" -lt "$timeout" ]; do
+    local seen
+    seen=$(curl -sf "http://localhost:$AM_PORT/api/v2/alerts" 2>/dev/null \
+      | SCENARIO_STARTED_EPOCH="$SCENARIO_STARTED_EPOCH" ALERT_NAME="$alert_name" python3 -c "
+import json, os, sys
+from datetime import datetime
 try:
     alerts = json.load(sys.stdin)
-    print('yes' if any(a['labels'].get('alertname') == '$alert_name' for a in alerts) else 'no')
+    start = int(os.environ['SCENARIO_STARTED_EPOCH'])
+    name = os.environ['ALERT_NAME']
+    for a in alerts:
+        if a.get('labels', {}).get('alertname') != name:
+            continue
+        if (a.get('status') or {}).get('state') != 'active':
+            continue
+        starts_at = a.get('startsAt')
+        if not starts_at:
+            continue
+        starts_epoch = datetime.fromisoformat(starts_at.replace('Z', '+00:00')).timestamp()
+        if starts_epoch >= start - 5:
+            print('yes')
+            break
+    else:
+        print('no')
 except Exception:
     print('no')
 " 2>/dev/null || echo "no")
-  if [ "$seen" = "yes" ]; then
-    echo "    OK — also visible in Alertmanager (http://localhost:$AM_PORT)"
-  else
-    echo "    (not yet visible in Alertmanager — it polls Prometheus periodically; check manually if needed)"
-  fi
+    if [ "$seen" = "yes" ]; then
+      echo "    OK — $alert_name is active in Alertmanager (Sentinel webhook can now receive it)"
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "FAILED: $alert_name reached Prometheus but did not become active in Alertmanager within ${timeout}s" >&2
+  echo "        Check: curl http://localhost:$AM_PORT/api/v2/alerts" >&2
+  return 1
+}
+
+# Backward-compatible informational helper used by platform-only scenarios.
+# Application-fault scenarios MUST use wait_for_alertmanager instead.
+check_alertmanager_seen() {
+  wait_for_alertmanager "$1" "${2:-$ALERTMANAGER_PROPAGATION_TIMEOUT}" || true
+}
+
+wait_for_chaos_clear() {
+  # Do not reset the fault immediately after Prometheus fires. The scenario is
+  # supposed to exercise Sentinel's complete loop, including investigation,
+  # policy, remediation and validation. The fault remains active until the
+  # corresponding chaos control state is cleared by Sentinel, or until this
+  # timeout expires and the safety cleanup path resets it.
+  local service="$1" port="$2" field="$3" timeout="${4:-$SENTINEL_REMEDIATION_TIMEOUT}" waited=0
+  echo "    Holding fault for up to ${timeout}s while Sentinel investigates/remediates '$service'..."
+  while [ "$waited" -lt "$timeout" ]; do
+    local state cleared
+    state=$(curl -sf "http://localhost:$port/api/chaos/status" \
+      -H "X-Chaos-Token: $CHAOS_TOKEN" 2>/dev/null || true)
+    cleared=$(printf '%s' "$state" | FIELD_NAME="$field" python3 -c "
+import json, os, sys
+try:
+    d=json.load(sys.stdin)
+    key=os.environ['FIELD_NAME']
+    if key not in d:
+        print('no')
+    else:
+        v=d[key]
+        print('yes' if v in (False, 0, 0.0) else 'no')
+except Exception:
+    print('no')
+" 2>/dev/null || echo "no")
+    if [ "$cleared" = "yes" ]; then
+      echo "    OK — Sentinel cleared '$field' after ~${waited}s"
+      return 0
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "FAILED: Sentinel did not clear '$field' on $service within ${timeout}s" >&2
+  echo "        Safety cleanup will reset the chaos fault before exit." >&2
+  return 1
 }
 
 unregister_rollback() {
@@ -327,6 +414,7 @@ generate_traffic() {
 
 set_chaos_fault() {
   local port="$1" body="$2"
+  SCENARIO_STARTED_EPOCH=$(date +%s)
   curl -sf -X POST "http://localhost:$port/api/chaos/fault" \
     -H "X-Chaos-Token: $CHAOS_TOKEN" -H "Content-Type: application/json" \
     -d "$body" >/dev/null
@@ -429,15 +517,10 @@ scenario_db_outage() {
   echo "=== Scenario: citizen-service database outage ==="
   echo "    What an operator/Sentinel would see: /readyz returns 503, citizen-facing"
   echo "    requests that touch the DB start failing, ChaosDatabaseFailure fires"
-  echo "    almost immediately (for: 30s — this is deliberately the fastest rule,"
-  echo "    since a DB outage is the most severe scenario this project can simulate)."
+  echo "    after its 30s Prometheus 'for:' window, then Alertmanager delivers the"
+  echo "    firing webhook and Sentinel investigates/resets the injected fault."
   require_token
   pin_single_replica citizen-service
-  # Only the target service's port-forward gates the fault itself.
-  # Prometheus/Alertmanager are opened after injection (below) since they are
-  # only needed for the verification that follows, not for the fault to go
-  # live — this is what lets a GUI-triggered run show something happening
-  # within seconds instead of waiting on tunnels the injection doesn't need.
   port_forward citizen-service "$CITIZEN_PORT" 8000
 
   echo "    Injecting simulated DB failure..."
@@ -451,24 +534,19 @@ scenario_db_outage() {
   port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "ChaosDatabaseFailure" 90
-  check_alertmanager_seen "ChaosDatabaseFailure"
+  wait_for_alertmanager "ChaosDatabaseFailure"
+  wait_for_chaos_clear citizen-service "$CITIZEN_PORT" db_failure
 
-  echo "    Resetting fault..."
-  reset_chaos_fault "$CITIZEN_PORT"
-  echo "=== db-outage: PASSED ==="
+  echo "=== db-outage: PASSED — Sentinel detected and cleared the injected DB fault ==="
 }
 
 scenario_http_errors() {
   echo "=== Scenario: citizen-service forced HTTP 5xx failures ==="
-  echo "    What an operator/Sentinel would see: every request to citizen-service"
-  echo "    fails with 500, ChaosForcedHTTPFailures fires almost immediately"
-  echo "    (for: 30s, confirms Prometheus is observing the deliberate fault itself),"
-  echo "    then HighHTTPErrorRate fires ~5 minutes later once the 5xx ratio has"
-  echo "    been sustained long enough to rule out a brief blip."
+  echo "    The deliberate 5xx fault stays enabled while Sentinel detects and"
+  echo "    remediates it. We verify Alertmanager delivery before waiting for"
+  echo "    Sentinel's chaos reset rather than resetting the fault ourselves."
   require_token
   pin_single_replica citizen-service
-  # Only the target service's port-forward gates the fault itself; see the
-  # note in scenario_db_outage for why Prometheus/Alertmanager come after.
   port_forward citizen-service "$CITIZEN_PORT" 8000
 
   echo "    Injecting 100% forced HTTP error rate..."
@@ -478,32 +556,28 @@ scenario_http_errors() {
   port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "ChaosForcedHTTPFailures" 90
-  check_alertmanager_seen "ChaosForcedHTTPFailures"
+  wait_for_alertmanager "ChaosForcedHTTPFailures"
 
-  generate_traffic "http://localhost:$CITIZEN_PORT" 30 &
+  # HighHTTPErrorRate is a slower, aggregate signal. It is useful observability
+  # but must not block the scenario from exercising the faster, deterministic
+  # chaos alert -> Sentinel remediation path. Keep traffic active while the
+  # fault is enabled, but wait on the chaos gauge being cleared by Sentinel.
+  generate_traffic "http://localhost:$CITIZEN_PORT" 180 &
   local traffic_pid=$!
-  wait_for_alert "HighHTTPErrorRate" 360
+  wait_for_chaos_clear citizen-service "$CITIZEN_PORT" error_rate
   wait "$traffic_pid" 2>/dev/null || true
-  check_alertmanager_seen "HighHTTPErrorRate"
 
-  echo "    Resetting fault..."
-  reset_chaos_fault "$CITIZEN_PORT"
-  echo "=== http-errors: PASSED ==="
+  echo "=== http-errors: PASSED — Sentinel detected and cleared the injected HTTP fault ==="
 }
 
 scenario_latency() {
   echo "=== Scenario: citizen-service elevated latency under load ==="
-  echo "    What an operator/Sentinel would see: p95 latency creeps above 1s."
-  echo "    ChaosLatencyInjection fires almost immediately from the configured"
-  echo "    value alone (for: 30s); HighRequestLatency needs actual request"
-  echo "    volume to populate the latency histogram, so this scenario generates"
-  echo "    traffic concurrently — a fault with zero traffic produces zero"
-  echo "    observations, which is a real gap worth knowing about, not just a"
-  echo "    script detail (see Phases.md Phase 12 'what's missing')."
+  echo "    ChaosLatencyInjection fires after 30s from the configured value."
+  echo "    Traffic runs concurrently so the normal latency signal can also be"
+  echo "    observed, but the scenario waits for Sentinel to clear the injected"
+  echo "    latency rather than resetting it as soon as Prometheus fires."
   require_token
   pin_single_replica citizen-service
-  # Only the target service's port-forward gates the fault itself; see the
-  # note in scenario_db_outage for why Prometheus/Alertmanager come after.
   port_forward citizen-service "$CITIZEN_PORT" 8000
 
   echo "    Injecting 1500ms artificial latency..."
@@ -513,34 +587,24 @@ scenario_latency() {
   port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "ChaosLatencyInjection" 90
-  check_alertmanager_seen "ChaosLatencyInjection"
+  wait_for_alertmanager "ChaosLatencyInjection"
 
-  generate_traffic "http://localhost:$CITIZEN_PORT" 60 &
+  generate_traffic "http://localhost:$CITIZEN_PORT" 180 &
   local traffic_pid=$!
-  wait_for_alert "HighRequestLatency" 360
+  wait_for_chaos_clear citizen-service "$CITIZEN_PORT" latency_ms
   wait "$traffic_pid" 2>/dev/null || true
-  check_alertmanager_seen "HighRequestLatency"
 
-  echo "    Resetting fault..."
-  reset_chaos_fault "$CITIZEN_PORT"
-  echo "=== latency: PASSED ==="
+  echo "=== latency: PASSED — Sentinel detected and cleared the injected latency ==="
 }
 
 scenario_notification_degradation() {
   echo "=== Scenario: notification delivery degradation ==="
-  echo "    What an operator/Sentinel would see: citizen-service keeps working"
-  echo "    fine (fire-and-forget — Phase 2's whole point), but notifications"
-  echo "    silently stop being delivered. This is the scenario that most"
-  echo "    directly tests whether an on-call engineer — or Sentinel — is"
-  echo "    watching a downstream dependency's own signals, not just the"
-  echo "    service the citizen directly talks to."
+  echo "    Notification failures are injected while citizen-service traffic"
+  echo "    continues. Alertmanager delivery is verified, then the fault remains"
+  echo "    active until Sentinel clears the notification chaos state."
   require_token
   pin_single_replica citizen-service
   pin_single_replica notification-service
-  # Only notification-service's port-forward gates the fault itself.
-  # citizen-service is only needed for the traffic generator below, and
-  # Prometheus/Alertmanager only for verification — both come after
-  # injection so the fault goes live as soon as possible.
   port_forward notification-service "$NOTIF_PORT" 8000
 
   echo "    Injecting 100% notification delivery failure..."
@@ -550,15 +614,16 @@ scenario_notification_degradation() {
   port_forward prometheus "$PROM_PORT" 9090
   port_forward alertmanager "$AM_PORT" 9093
 
-  generate_traffic "http://localhost:$CITIZEN_PORT" 60 &
+  # This alert has a 5m Prometheus 'for:' window, so keep traffic alive and
+  # do not reset the fault when the first alert merely reaches Prometheus.
+  generate_traffic "http://localhost:$CITIZEN_PORT" 420 &
   local traffic_pid=$!
-  wait_for_alert "NotificationDeliveryFailureRateHigh" 360
+  wait_for_alert "NotificationDeliveryFailureRateHigh" 420
+  wait_for_alertmanager "NotificationDeliveryFailureRateHigh"
+  wait_for_chaos_clear notification-service "$NOTIF_PORT" notification_failure_rate
   wait "$traffic_pid" 2>/dev/null || true
-  check_alertmanager_seen "NotificationDeliveryFailureRateHigh"
 
-  echo "    Resetting fault..."
-  reset_chaos_fault "$NOTIF_PORT"
-  echo "=== notification-degradation: PASSED ==="
+  echo "=== notification-degradation: PASSED — Sentinel detected and cleared the injected notification fault ==="
 }
 
 scenario_full_outage() {
@@ -593,63 +658,36 @@ scenario_full_outage() {
 
 scenario_high_cpu() {
   echo "=== Scenario: citizen-service CPU exhaustion ==="
-  echo "    What an operator/Sentinel would see: rate(process_cpu_seconds_total[2m])"
-  echo "    for this pod climbs and stays climbed, requests get slower as the"
-  echo "    event loop competes with the burn, but /healthz and /metrics keep"
-  echo "    answering — the burner runs on an 80/20 duty cycle precisely so the"
-  echo "    incident stays observable and remediable instead of silently killing"
-  echo "    the pod via its liveness probe (see app/chaos/state.py)."
-  echo "    Note the pod's 500m CPU limit caps the observed rate near 0.5 cores;"
-  echo "    HighCPUUsage's threshold has to sit below that to ever fire here."
+  echo "    The CPU burn remains enabled after Prometheus fires so Sentinel can"
+  echo "    investigate, choose its remediation, and validate recovery."
   require_token
   pin_single_replica citizen-service
-  # Only the target service's port-forward gates the fault itself; see the
-  # note in scenario_db_outage for why Prometheus/Alertmanager come after.
   port_forward citizen-service "$CITIZEN_PORT" 8000
 
   echo "    Enabling the CPU burn worker..."
   set_chaos_fault "$CITIZEN_PORT" '{"cpu_burn": true}'
 
-  # Sanity check that the fault did not cost us the observability we need to
-  # detect it — the single most important property of this scenario.
   local healthz_status
   healthz_status=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:$CITIZEN_PORT/healthz")
-  echo "    /healthz still returns HTTP $healthz_status while burning (expected 200)"
+  echo "    /healthz now returns HTTP $healthz_status while burning (expected 200)"
 
   port_forward prometheus "$PROM_PORT" 9090
   port_forward alertmanager "$AM_PORT" 9093
 
-  # Generous timeout: the alert is built on a 2m rate window, so Prometheus
-  # needs at least that much history before the expression is even true,
-  # plus the rule's own `for:` duration on top.
   wait_for_alert "HighCPUUsage" 420
-  check_alertmanager_seen "HighCPUUsage"
+  wait_for_alertmanager "HighCPUUsage"
+  wait_for_chaos_clear citizen-service "$CITIZEN_PORT" cpu_burn
 
-  echo "    Resetting fault..."
-  reset_chaos_fault "$CITIZEN_PORT"
-  echo "=== high-cpu: PASSED ==="
+  echo "=== high-cpu: PASSED — Sentinel detected and cleared the CPU fault ==="
 }
 
 scenario_memory_leak() {
-  # 64 MiB, deliberately: the pod's limit is 256Mi and the app's steady-state
-  # RSS is already well over 100Mi, so a bigger leak risks the kubelet
-  # OOMKilling the container partway through the wait — which would replace
-  # the memory incident with a restart incident and lose the very signal this
-  # scenario exists to produce. 64Mi is a large, unmistakable step on
-  # process_resident_memory_bytes while staying under the limit. Demoing the
-  # OOMKill path is legitimate and supported (the API accepts up to 2048), it
-  # just is not what *this* scenario asserts.
   local leak_mb=64
   echo "=== Scenario: citizen-service memory leak (${leak_mb} MiB retained) ==="
-  echo "    What an operator/Sentinel would see: process_resident_memory_bytes"
-  echo "    steps up and never comes back down on its own — the signature that"
-  echo "    separates a leak from a traffic spike. Nothing else degrades, which"
-  echo "    is what makes leaks dangerous: the service looks fine right up to"
-  echo "    the moment the container hits its memory limit and is OOMKilled."
+  echo "    The leak remains active after MemoryLeakSuspected fires so Sentinel"
+  echo "    has time to investigate and perform its configured remediation."
   require_token
   pin_single_replica citizen-service
-  # Only the target service's port-forward gates the fault itself; see the
-  # note in scenario_db_outage for why Prometheus/Alertmanager come after.
   port_forward citizen-service "$CITIZEN_PORT" 8000
 
   echo "    Retaining ${leak_mb} MiB in the leak buffer..."
@@ -659,12 +697,10 @@ scenario_memory_leak() {
   port_forward alertmanager "$AM_PORT" 9093
 
   wait_for_alert "MemoryLeakSuspected" 420
-  check_alertmanager_seen "MemoryLeakSuspected"
+  wait_for_alertmanager "MemoryLeakSuspected"
+  wait_for_chaos_clear citizen-service "$CITIZEN_PORT" memory_leak_mb
 
-  echo "    Resetting fault (frees every retained chunk — the leak is reversible"
-  echo "    here, which a real leak would not be)..."
-  reset_chaos_fault "$CITIZEN_PORT"
-  echo "=== memory-leak: PASSED ==="
+  echo "=== memory-leak: PASSED — Sentinel detected and cleared/remediated the memory fault ==="
 }
 
 scenario_crashloop() {
