@@ -50,15 +50,17 @@ data:
 
           - alert: ChaosForcedHTTPFailures
             expr: >-
-              increase(chaos_injections_total{fault_type="http_5xx", kubernetes_namespace="citizen-portal"}[5m]) > 0
+              chaos_error_rate{kubernetes_namespace="citizen-portal"} > 0
             for: 30s
             labels:
               severity: warning
             annotations:
               summary: "{{ $labels.app }} is experiencing forced chaos HTTP failures"
               description: >-
-                Phase 10 has injected HTTP 5xx responses into {{ $labels.app }}.
-                This rule confirms Prometheus is observing the deliberate fault.
+                HTTP 5xx chaos is currently active for {{ $labels.app }}.
+                This current-state gauge clears immediately when the chaos
+                control plane resets the fault; chaos_injections_total is a
+                historical counter and is not suitable for this alert.
 
           - alert: ChaosDatabaseFailure
             expr: chaos_db_failure{kubernetes_namespace="citizen-portal"} == 1

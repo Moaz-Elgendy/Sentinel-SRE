@@ -231,102 +231,48 @@ except Exception:
   return 1
 }
 
+wait_for_alert_inactive() {
+  local alert_name="$1" timeout="${2:-180}" waited=0
+  echo "    Waiting up to ${timeout}s for '$alert_name' to clear in Prometheus and Alertmanager..."
+  while [ "$waited" -lt "$timeout" ]; do
+    local prom_response am_response prom_active am_active
+    prom_response=$(curl -sf "http://localhost:$PROM_PORT/api/v1/alerts" 2>/dev/null || true)
+    am_response=$(curl -sf "http://localhost:$AM_PORT/api/v2/alerts" 2>/dev/null || true)
+    if [ -n "$prom_response" ] && [ -n "$am_response" ]; then
+      prom_active=$(printf '%s' "$prom_response" | ALERT_NAME="$alert_name" python3 -c '
+import json, os, sys
+name = os.environ["ALERT_NAME"]
+try:
+    alerts = json.load(sys.stdin).get("data", {}).get("alerts", [])
+    print("yes" if any(a.get("labels", {}).get("alertname") == name for a in alerts) else "no")
+except Exception:
+    print("unknown")
+' 2>/dev/null || echo "unknown")
+      am_active=$(printf '%s' "$am_response" | ALERT_NAME="$alert_name" python3 -c '
+import json, os, sys
+name = os.environ["ALERT_NAME"]
+try:
+    alerts = json.load(sys.stdin)
+    print("yes" if any(a.get("labels", {}).get("alertname") == name for a in alerts) else "no")
+except Exception:
+    print("unknown")
+' 2>/dev/null || echo "unknown")
+      if [ "$prom_active" = "no" ] && [ "$am_active" = "no" ]; then
+        echo "    OK — $alert_name is inactive in Prometheus and Alertmanager"
+        return 0
+      fi
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "FAILED: $alert_name did not clear from Prometheus and Alertmanager within ${timeout}s" >&2
+  return 1
+}
+
 # Backward-compatible informational helper used by platform-only scenarios.
 # Application-fault scenarios MUST use wait_for_alertmanager instead.
 check_alertmanager_seen() {
   wait_for_alertmanager "$1" "${2:-$ALERTMANAGER_PROPAGATION_TIMEOUT}" || true
-}
-
-wait_for_alert() {
-  local alert_name="$1" timeout="$2" waited=0
-
-  echo "    Waiting up to ${timeout}s for '$alert_name' to fire..."
-
-  while [ "$waited" -lt "$timeout" ]; do
-    local response
-    response=$(curl -sf "http://localhost:$PROM_PORT/api/v1/alerts" 2>/dev/null || true)
-
-    local firing
-    firing=$(printf '%s' "$response" \
-      SCENARIO_STARTED_EPOCH="$SCENARIO_STARTED_EPOCH" \
-      ALERT_NAME="$alert_name" \
-      python3 -c '
-import json
-import os
-import sys
-from datetime import datetime
-
-try:
-    data = json.load(sys.stdin)
-    start = int(os.environ["SCENARIO_STARTED_EPOCH"])
-    name = os.environ["ALERT_NAME"]
-
-    for a in data.get("data", {}).get("alerts", []):
-        labels = a.get("labels", {})
-
-        if labels.get("alertname") != name:
-            continue
-
-        state = a.get("state")
-        active_at = a.get("activeAt")
-
-        print(
-            f"    DEBUG: {name}: state={state}, activeAt={active_at}",
-            file=sys.stderr
-        )
-
-        if state != "firing":
-            continue
-
-        if not active_at:
-            print("    DEBUG: firing alert has no activeAt", file=sys.stderr)
-            continue
-
-        active_epoch = datetime.fromisoformat(
-            active_at.replace("Z", "+00:00")
-        ).timestamp()
-
-        print(
-            f"    DEBUG: active_epoch={active_epoch:.3f}, "
-            f"scenario_start={start}, "
-            f"delta={active_epoch - start:.3f}s",
-            file=sys.stderr
-        )
-
-        if active_epoch >= start - 5:
-            print("yes")
-            sys.exit(0)
-
-        print(
-            "    DEBUG: alert rejected because it predates "
-            "the current scenario",
-            file=sys.stderr
-        )
-
-    print("no")
-
-except Exception as exc:
-    print(
-        f"    DEBUG: parser error: {type(exc).__name__}: {exc}",
-        file=sys.stderr
-    )
-    print("no")
-' 2>/tmp/wait_for_alert_debug.log)
-
-    cat /tmp/wait_for_alert_debug.log >&2
-
-    if [ "$firing" = "yes" ]; then
-      echo "    OK — $alert_name is firing (took ~${waited}s)"
-      return 0
-    fi
-
-    sleep 5
-    waited=$((waited + 5))
-  done
-
-  echo "FAILED: $alert_name did not enter firing state within ${timeout}s" >&2
-  echo "        Check: curl http://localhost:$PROM_PORT/api/v1/alerts" >&2
-  return 1
 }
 
 unregister_rollback() {
@@ -621,6 +567,7 @@ scenario_http_errors() {
   local traffic_pid=$!
   wait_for_chaos_clear citizen-service "$CITIZEN_PORT" error_rate
   wait "$traffic_pid" 2>/dev/null || true
+  wait_for_alert_inactive "ChaosForcedHTTPFailures"
 
   echo "=== http-errors: PASSED — Sentinel detected and cleared the injected HTTP fault ==="
 }
