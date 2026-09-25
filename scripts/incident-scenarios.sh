@@ -427,6 +427,56 @@ reset_chaos_fault() {
     -H "X-Chaos-Token: $CHAOS_TOKEN" >/dev/null 2>&1 || true
 }
 
+wait_for_chaos_clear() {
+  local service="$1" port="$2" state_field="$3"
+  local timeout="${4:-$SENTINEL_REMEDIATION_TIMEOUT}" waited=0
+
+  case "$state_field" in
+    error_rate|latency_ms|db_failure|cpu_burn|memory_leak_mb|notification_failure_rate) ;;
+    *)
+      echo "FAILED: unsupported chaos status field '$state_field'" >&2
+      return 2
+      ;;
+  esac
+
+  echo "    Waiting up to ${timeout}s for Sentinel to clear $service $state_field..."
+  while [ "$waited" -lt "$timeout" ]; do
+    local status state
+    status=$(curl -fsS --max-time 5 "http://localhost:$port/api/chaos/status" \
+      -H "X-Chaos-Token: $CHAOS_TOKEN" 2>/dev/null || true)
+    state=$(printf '%s' "$status" \
+      | CHAOS_STATE_FIELD="$state_field" python3 -c '
+import json
+import os
+import sys
+
+try:
+    body = json.load(sys.stdin)
+    value = body.get(os.environ["CHAOS_STATE_FIELD"])
+    if isinstance(value, bool):
+        print("clear" if value is False else "active")
+    elif isinstance(value, (int, float)):
+        print("clear" if value == 0 else "active")
+    else:
+        print("unknown")
+except Exception:
+    print("unknown")
+' 2>/dev/null || echo "unknown")
+
+    if [ "$state" = "clear" ]; then
+      echo "    OK — $service $state_field is clear (took ~${waited}s)"
+      return 0
+    fi
+
+    sleep 5
+    waited=$((waited + 5))
+  done
+
+  echo "FAILED: Sentinel did not clear $service $state_field within ${timeout}s" >&2
+  echo "        Last chaos status response: ${status:-<unreachable>}" >&2
+  return 1
+}
+
 rollback_citizen_service() {
   # Shared by both the crashloop and bad-deployment detections below.
   # Deliberately NOT allowed to take the whole recovery down with it (see
