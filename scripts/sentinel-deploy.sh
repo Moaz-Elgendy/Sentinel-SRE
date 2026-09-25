@@ -8,9 +8,9 @@
 #   sentinel-deploy.sh sync-manifests <git-sha>  # refresh ONLY k8s/**/*.yaml from <git-sha>
 #   sentinel-deploy.sh apply-manifests <git-sha> # render+substitute+apply whatever is on disk now
 #   sentinel-deploy.sh sync-scripts   <git-sha>  # replace scripts/ (incl. deletions) from <git-sha>
-#   sentinel-deploy.sh sync  <git-sha>    # refresh THIS script on the node from <git-sha>
-#                                          # (compatibility/bootstrap-safe; CI runs this
-#                                          # immediately before sync-scripts)
+#   sentinel-deploy.sh sync  <git-sha>    # refresh THIS script on the node from <git-sha> (narrow;
+#                                          # superseded for CI's purposes by sync-scripts above,
+#                                          # kept for any existing manual/documented use)
 #
 # "images" is the normal CI path when a push touches no k8s/ files: it
 # changes only the container images, which produces a clean new ReplicaSet
@@ -82,11 +82,9 @@
 #   file() and splices it verbatim into user_data.sh.tftpl, which writes it
 #   to /usr/local/bin/sentinel-deploy.sh. There is exactly one copy of the
 #   deploy logic — this file — so it cannot drift from what actually runs.
-# * Every CI deploy: `sync` first re-copies this exact file from the node's
-#   own checkout at ${REPO_DIR} (kept current by `git fetch` inside `sync`
-#   itself) over /usr/local/bin/sentinel-deploy.sh. CI then invokes
-#   `sync-scripts` in a new process, so an already-running node is never
-#   trapped behind an older sync-scripts implementation.
+# * Every CI deploy: `sync` (see the case below) re-copies this exact file
+#   from the node's own checkout at ${REPO_DIR} (kept current by `git fetch`
+#   inside `sync` itself) over /usr/local/bin/sentinel-deploy.sh.
 #
 # Because of this, avoid anything here that only makes sense inside a
 # Terraform-rendered heredoc (no ${{...}} double-dollar escaping needed —
@@ -409,13 +407,12 @@ render_and_apply() {
   public_ip="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
     http://169.254.169.254/latest/meta-data/public-ipv4)"
   ecr_registry="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com"
-  # Same default as deploy-aws.sh: the in-cluster topology's Service DNS
-  # name. Set SENTINEL_API_UPSTREAM in the environment before calling this
-  # for the external-control-plane topology — see docs/aws-deployment.md.
-  # CI's automated path (ci-cd.yml's deploy-to-k3s job) now exports this
-  # from the optional SENTINEL_API_UPSTREAM repository variable so the
-  # external topology is covered by ordinary pushes too, not just a manual
-  # operator invocation.
+  # The AWS/K3s overlay runs Sentinel on a separate EC2 instance, so the
+  # in-cluster `sentinel-ai` Service is intentionally not available there.
+  # CI resolves the external Sentinel private IP and exports
+  # SENTINEL_API_UPSTREAM before calling this mode. Keep the in-cluster DNS
+  # default for local/manual deployments where an in-cluster Sentinel really
+  # exists, but never allow the AWS CI path to silently fall back to it.
   sentinel_api_upstream="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
   validate_upstream_url "${sentinel_api_upstream}" || return 1
 
