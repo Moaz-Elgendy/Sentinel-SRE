@@ -126,25 +126,104 @@ verify_executable() {
   fi
 }
 
-# Fails loudly if the working tree under any of `paths` does not exactly
-# match the tree at `sha`. `sync-scripts`/`sync-manifests` deliberately
-# never do a full `git checkout --detach` (see their own comments — moving
-# HEAD is unsafe with a partially-untracked repo like this one), so
-# `git rev-parse HEAD` cannot be used to prove "we are at the commit CI
-# asked for". `git diff --quiet <sha> -- <paths>` is the equivalent check
-# for a narrow, path-scoped sync: it compares the *working tree* against
-# the *target commit* directly and is silent on paths git doesn't track,
-# so the untracked k8s/overlays/aws/secrets/*.env files can never trip it.
+# Fails loudly if the filesystem under any of `paths` does not exactly
+# match the tree at `sha` — same files, same content, same executable bit.
+#
+# THIS USED TO BE `git diff --quiet <sha> -- <paths>`. That was the root
+# cause of a real production outage: `sync-scripts` populates the working
+# tree with `git archive <sha> -- scripts | tar -x`, which writes files
+# straight to disk and never touches the Git index. `git diff <commit>`
+# compares the working tree against `<commit>` *through* the index as an
+# intermediate cache — a path with no index entry at all (or a stale one
+# left over from before the archive extraction) reads as "absent" to that
+# diff, no matter what is actually sitting on disk. The result was
+# `verify_synced_to` reporting every file under scripts/ as deleted right
+# after `sync-scripts` had just correctly written every one of them,
+# blocking every subsequent deploy. This has been reproduced against this
+# exact repository: a clone whose index predates a commit that adds a new
+# script, followed by the real `rm -rf scripts; git archive "$SHA" --
+# scripts | tar -x` sync-scripts does, makes the old `git diff --quiet`
+# check fail even though `diff -r` against the target tree finds nothing
+# wrong. `git diff`/`git status`-based checks are index-backed by
+# construction, so no flag or extra call fixes this — the check has to stop
+# consulting the index at all.
+#
+# This instead reads the *target tree* directly with `git ls-tree -r`
+# (mode + blob sha + path for every blob under `path` at `sha`) and
+# re-derives the identical triple from the *real filesystem* with `stat`
+# (executable bit) and `git hash-object` (content-addressed, without
+# staging or writing anything) for every regular file actually present.
+# Two plain strings are then compared. This never reads or writes the
+# index, so it is correct regardless of which sync mechanism populated the
+# working tree (`git archive | tar`, `git checkout -- <path>`, or a manual
+# copy) and regardless of what state the index happens to be in. It proves
+# the one thing CI actually cares about: what will really execute from
+# ${REPO_DIR}, not what some cache believes is there.
+#
+# Default (no --exact): silent about any file present on disk under `path`
+# that the tree at `sha` does not track — the same contract the old
+# `git diff`-based check had. This is what makes it safe for k8s/, which
+# has live untracked secrets (k8s/overlays/aws/secrets/*.env) that must
+# never trip this check, and preserves sync-manifests' documented, accepted
+# limitation that `git checkout -- <path>` cannot remove an orphaned
+# manifest.
+#
+# --exact: additionally fails if a file exists on disk under `path` that
+# the tree at `sha` does not track. Only safe — and only used — for
+# scripts/, which sync-scripts always `rm -rf`s immediately before
+# re-extracting from `sha` (see sync-scripts below), so scripts/ has no
+# untracked subtree of its own by construction; this is belt-and-suspenders
+# verification that the rm -rf + archive step actually did that, not a
+# requirement that changes what any caller has to do.
 verify_synced_to() {
+  local exact=0
+  if [ "${1:-}" = "--exact" ]; then
+    exact=1
+    shift
+  fi
   local sha="$1"
   shift
-  if ! git -C "${REPO_DIR}" diff --quiet "${sha}" -- "$@"; then
-    echo "ERROR: ${REPO_DIR} is not actually at ${sha} for: $*" >&2
-    echo "       (sync reported success but the working tree still differs" >&2
-    echo "       from the requested commit — do not deploy from this state)" >&2
-    git -C "${REPO_DIR}" diff --stat "${sha}" -- "$@" >&2 || true
-    return 1
-  fi
+  local path expected actual tracked_paths failed=0
+
+  for path in "$@"; do
+    # "<mode> <blob-sha> <path>" for every blob the tree at ${sha} has
+    # under ${path}, one per line, sorted by path.
+    expected="$(git -C "${REPO_DIR}" ls-tree -r "${sha}" -- "${path}" \
+      | awk '{printf "%s %s %s\n", $1, $3, $4}' | LC_ALL=C sort -k3,3)"
+
+    # The identical triple, re-derived from what is really on disk right
+    # now — never from the index, never from `git status`/`git diff`.
+    actual="$(cd "${REPO_DIR}" && find "${path}" -type f 2>/dev/null | while IFS= read -r f; do
+        if [ -x "${f}" ]; then mode=100755; else mode=100644; fi
+        blob="$(git hash-object "${f}")"
+        printf '%s %s %s\n' "${mode}" "${blob}" "${f}"
+      done | LC_ALL=C sort -k3,3)"
+
+    if [ "${exact}" -eq 0 ]; then
+      # Drop any on-disk file whose path isn't tracked at ${sha} under
+      # this pathspec before comparing (live secrets, or anything else
+      # legitimately untracked) — same as the old check's silence on
+      # paths Git doesn't track.
+      tracked_paths="$(printf '%s\n' "${expected}" | awk 'NF{print $3}')"
+      actual="$(printf '%s\n' "${actual}" | awk -v trackedlist="${tracked_paths}" '
+        BEGIN {
+          n = split(trackedlist, arr, "\n")
+          for (i = 1; i <= n; i++) if (arr[i] != "") tracked[arr[i]] = 1
+        }
+        NF { if ($3 in tracked) print }
+      ')"
+    fi
+
+    if [ "${expected}" != "${actual}" ]; then
+      echo "ERROR: ${REPO_DIR}/${path} is not actually at ${sha}" >&2
+      echo "       (sync reported success but the filesystem still differs" >&2
+      echo "       from the requested commit's tree — do not deploy from this state)" >&2
+      diff <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}") >&2 || true
+      failed=1
+    fi
+  done
+
+  [ "${failed}" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -252,21 +331,18 @@ ensure_repo_synced() {
     return 1
   fi
 
-  # A freshly (re)initialized repo has both no HEAD and an empty index —
-  # and an empty index is not cosmetic. `verify_synced_to`'s `git diff
-  # "${sha}" -- <paths>` (and therefore sync-scripts' `git archive | tar
-  # -x`, which writes files directly and never touches the index itself)
-  # only compares real file content for paths the index already knows
-  # about; a path with no index entry at all reads as "absent" to `git
-  # diff`, regardless of what is actually sitting on disk. The original
-  # design never hit this because the node's checkout always started from a
-  # real `git clone`, whose full-tree checkout populates the index for
-  # every tracked path once, up front.
-  #
-  # `git checkout "${sha}" -- .` reproduces exactly that: it populates the
-  # index AND working tree for every path tracked at `sha`, repo-wide, in
-  # one step — while remaining exactly as safe as the existing narrow
-  # `git checkout "${sha}" -- k8s` / `-- scripts/sentinel-deploy.sh` calls
+  # A freshly (re)initialized repo has both no HEAD and an empty index.
+  # `verify_synced_to` no longer cares about that (it reads the target tree
+  # and the real filesystem directly, never the index — see its own header
+  # comment for the production incident that made that necessary), but
+  # HEAD/the index are still worth populating here for their own sake: a
+  # repo with no HEAD at all can't answer basic `git log`/`git show`
+  # questions an operator debugging the node over SSM would reasonably
+  # expect to work, and leaves the checkout looking permanently "broken" to
+  # anything that does still ask Git directly. `git checkout "${sha}" -- .`
+  # populates the index AND working tree for every path tracked at `sha`,
+  # repo-wide, in one step — while remaining exactly as safe as the
+  # existing narrow `git checkout "${sha}" -- k8s` / `-- scripts` calls
   # elsewhere in this file, for the same reason: a checkout of an explicit
   # pathspec only ever writes paths git tracks at that commit, so it can
   # never touch the untracked k8s/overlays/aws/secrets/*.env files or
@@ -494,7 +570,11 @@ case "${MODE}" in
     cd "${REPO_DIR}"
     rm -rf scripts
     git archive "${SHA}" -- scripts | tar -x
-    verify_synced_to "${SHA}" scripts
+    # --exact: scripts/ has no untracked subtree (unlike k8s/), and was
+    # just rm -rf'd above, so nothing should be here that isn't in the
+    # target tree — verify that too, not just that the target tree's files
+    # are present and correct.
+    verify_synced_to --exact "${SHA}" scripts
 
     # `git archive | tar -x` preserves the executable bit git recorded for
     # each blob (100755 vs 100644) when this runs as root, which SSM's
@@ -524,7 +604,7 @@ case "${MODE}" in
     ensure_repo_synced "${SHA}" || exit 1
     cd "${REPO_DIR}"
     git checkout --quiet "${SHA}" -- scripts/sentinel-deploy.sh
-    verify_synced_to "${SHA}" scripts/sentinel-deploy.sh
+    verify_synced_to --exact "${SHA}" scripts/sentinel-deploy.sh
     chmod +x scripts/sentinel-deploy.sh
     install -m 0755 scripts/sentinel-deploy.sh /usr/local/bin/sentinel-deploy.sh
     verify_executable /usr/local/bin/sentinel-deploy.sh

@@ -149,6 +149,103 @@ expect_success "passes once the working tree is brought forward" verify_synced_t
 echo "totally-untracked-secret" > "${tmp_repo}/k8s/secret.env"
 expect_success "ignores an untracked file (models secrets/*.env)" verify_synced_to "${NEW_SHA}" scripts k8s
 
+echo "=== verify_synced_to: the actual production regression (git archive/tar bypasses the index) ==="
+# This is the exact failure that shipped: `git diff --quiet <sha> -- <path>`
+# is index-backed, and `git archive <sha> -- <path> | tar -x` (what
+# sync-scripts actually runs) writes files straight to disk without ever
+# touching the index. A clone whose index predates a commit that adds a new
+# file under scripts/ reproduces it: after the archive extraction the file
+# is correct byte-for-byte on disk, but had `verify_synced_to` still been
+# `git diff --quiet`, it would have reported it deleted. verify_synced_to
+# must pass here — it reads the target tree and the real filesystem
+# directly and is not allowed to consult the index at all.
+idx_upstream="$(mktemp -d)"
+(
+  cd "${idx_upstream}"
+  git init --quiet -b main
+  git config user.email test@example.com
+  git config user.name "Contract Test"
+  mkdir -p scripts
+  echo "existing" > scripts/existing.sh
+  git add -A
+  git commit --quiet -m "commit A"
+)
+IDX_SHA_A="$(git -C "${idx_upstream}" rev-parse HEAD)"
+(
+  cd "${idx_upstream}"
+  echo "brand new" > scripts/brand-new.sh
+  git add -A
+  git commit --quiet -m "commit B: add a new script"
+)
+IDX_SHA_B="$(git -C "${idx_upstream}" rev-parse HEAD)"
+
+# A real `git clone`, then checked out at A: HEAD, index and working tree
+# are all genuinely, fully consistent at A — exactly like a node's very
+# first `git clone`, well before commit B (and brand-new.sh) ever existed.
+idx_repo="$(mktemp -d)"
+git clone --quiet "${idx_upstream}" "${idx_repo}" >/dev/null
+(cd "${idx_repo}" && git checkout --quiet "${IDX_SHA_A}")
+
+REPO_DIR="${idx_repo}"
+# The real sync-scripts sequence: wipe scripts/, then extract the target
+# commit's tree directly onto disk. This never stages anything, so the
+# index is still exactly as it was at commit A — no entry at all for
+# brand-new.sh.
+(cd "${idx_repo}" && rm -rf scripts && git archive "${IDX_SHA_B}" -- scripts | tar -x)
+expect_success "sync-scripts' actual mechanism (archive|tar, no index update) verifies clean" \
+  verify_synced_to --exact "${IDX_SHA_B}" scripts
+if [ -f "${idx_repo}/scripts/brand-new.sh" ] && [ "$(cat "${idx_repo}/scripts/brand-new.sh")" = "brand new" ]; then
+  ok "the new file really is present and correct on disk (not a false pass)"
+else
+  bad "the new file is missing or wrong on disk — verify_synced_to passed incorrectly"
+fi
+
+echo "=== verify_synced_to --exact (scripts/-only: no untracked subtree allowed) ==="
+exact_repo="$(mktemp -d)"
+(
+  cd "${exact_repo}"
+  git init --quiet -b main
+  git config user.email test@example.com
+  git config user.name "Contract Test"
+  mkdir -p scripts scripts/tests
+  echo "a" > scripts/a.sh
+  chmod +x scripts/a.sh
+  echo "t" > scripts/tests/t.sh
+  git add -A
+  git commit --quiet -m "exact-mode fixture"
+)
+EXACT_SHA="$(git -C "${exact_repo}" rev-parse HEAD)"
+REPO_DIR="${exact_repo}"
+
+expect_success "--exact passes on a clean, exactly-synced scripts/" \
+  verify_synced_to --exact "${EXACT_SHA}" scripts
+
+echo "leftover" > "${exact_repo}/scripts/stale.sh"
+expect_failure "--exact catches an extra/stale file that plain mode ignores" \
+  verify_synced_to --exact "${EXACT_SHA}" scripts
+expect_success "plain mode still ignores that same extra file" \
+  verify_synced_to "${EXACT_SHA}" scripts
+rm "${exact_repo}/scripts/stale.sh"
+
+chmod -x "${exact_repo}/scripts/a.sh"
+expect_failure "--exact catches a wrong executable bit" \
+  verify_synced_to --exact "${EXACT_SHA}" scripts
+chmod +x "${exact_repo}/scripts/a.sh"
+
+echo "changed" > "${exact_repo}/scripts/tests/t.sh"
+expect_failure "--exact catches a modified file in a nested path" \
+  verify_synced_to --exact "${EXACT_SHA}" scripts
+echo "t" > "${exact_repo}/scripts/tests/t.sh"
+
+rm "${exact_repo}/scripts/a.sh"
+expect_failure "--exact catches a missing file" \
+  verify_synced_to --exact "${EXACT_SHA}" scripts
+echo "a" > "${exact_repo}/scripts/a.sh"
+chmod +x "${exact_repo}/scripts/a.sh"
+
+expect_success "--exact passes again once restored exactly" \
+  verify_synced_to --exact "${EXACT_SHA}" scripts
+
 echo "=== ensure_repo_synced (git checkout repair) ==="
 # "Upstream" origin: a real repo any of these fixtures can clone/fetch from,
 # standing in for GitHub in the tests below. Two commits so there is
@@ -355,6 +452,52 @@ if [ "$(cat "${REPO_DIR}/k8s/thing.yaml" 2>/dev/null)" = "new" ]; then
   ok "sync-manifests: k8s/ content matches the requested commit after recovery"
 else
   bad "sync-manifests: k8s/ content does not match the requested commit after recovery"
+fi
+
+# --- true end-to-end reproduction of the production failure, through the
+#     actual `main sync-scripts` entry point, on a HEALTHY (never broken)
+#     clone — not the missing-HEAD repair fixture above, which populates
+#     the index as a side effect of repair and would not have caught this.
+#     A real `git clone` checked out at an older commit, exactly like a
+#     node that was provisioned before a later push added a new script and
+#     has not been told to sync-scripts since.
+e2e_upstream="$(mktemp -d)"
+(
+  cd "${e2e_upstream}"
+  git init --quiet -b master
+  git config user.email test@example.com
+  git config user.name "Contract Test"
+  mkdir -p scripts
+  echo "old" > scripts/existing.sh
+  git add -A
+  git commit --quiet -m "old commit"
+)
+E2E_OLD_SHA="$(git -C "${e2e_upstream}" rev-parse HEAD)"
+(
+  cd "${e2e_upstream}"
+  echo "new script" > scripts/newly-added.sh
+  git add -A
+  git commit --quiet -m "add a new script"
+)
+E2E_NEW_SHA="$(git -C "${e2e_upstream}" rev-parse HEAD)"
+
+e2e_repo="$(mktemp -d)"
+git clone --quiet "${e2e_upstream}" "${e2e_repo}" >/dev/null
+(cd "${e2e_repo}" && git checkout --quiet "${E2E_OLD_SHA}")
+REPO_DIR="${e2e_repo}"
+REPO_URL_STATE_FILE="${repo_url_file}"
+
+if MODE=sync-scripts SHA="${E2E_NEW_SHA}" \
+  bash -c 'set -euo pipefail; cd '"${SCRIPT_DIR}"'/.. ; source ./sentinel-deploy.sh; REPO_DIR="'"${REPO_DIR}"'"; REPO_URL_STATE_FILE="'"${REPO_URL_STATE_FILE}"'"; main sync-scripts "'"${E2E_NEW_SHA}"'"' \
+  >/tmp/sync-scripts-e2e-test.out 2>&1; then
+  ok "sync-scripts on a healthy clone whose index predates a new file: verifies clean (the actual production bug)"
+else
+  bad "sync-scripts still fails on a healthy clone with a stale index (output: $(cat /tmp/sync-scripts-e2e-test.out))"
+fi
+if [ "$(cat "${e2e_repo}/scripts/newly-added.sh" 2>/dev/null)" = "new script" ]; then
+  ok "sync-scripts: the newly-added file is actually present and correct on disk"
+else
+  bad "sync-scripts: the newly-added file is missing or wrong on disk"
 fi
 
 echo

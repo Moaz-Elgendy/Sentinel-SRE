@@ -1250,11 +1250,27 @@ docs/aws-deployment.md, 'Deployment synchronization contract'".
 
 **The rule: "the SSM command returned 0" is never trusted as "the node is now at the commit CI
 asked for."** Every sync mode (`sync`, `sync-manifests`, `sync-scripts`) proves it afterward with
-`verify_synced_to()`, which runs `git diff --quiet <sha> -- <paths>` — a direct comparison of the
-*working tree* against the *requested commit*, not a check of any command's exit code. If that
-comparison fails, the script exits non-zero and CI's deploy step is expected to fail with it. This
-exists because of a real incident: `sync-scripts` used to be allowed to fail silently, which let a
-manifest change ship with a stale `render_and_apply()` that didn't know about it.
+`verify_synced_to()`, which reads the *target commit's tree* directly with `git ls-tree` and
+re-derives the same mode/content-hash triple from the *real filesystem* with `stat`/`git
+hash-object` for every regular file actually present, then compares the two — not a check of any
+command's exit code. If that comparison fails, the script exits non-zero and CI's deploy step is
+expected to fail with it. This exists because of a real incident: `sync-scripts` used to be allowed
+to fail silently, which let a manifest change ship with a stale `render_and_apply()` that didn't
+know about it.
+
+`verify_synced_to()` deliberately never consults the Git index (no `git diff`, no `git status`). An
+earlier version of this check did use `git diff --quiet <sha> -- <paths>`, and that caused its own
+incident: `sync-scripts` populates the working tree with `git archive <sha> -- scripts | tar -x`,
+which writes files straight to disk and never touches the index, so a path with no index entry (or
+a stale one left over from before the extraction) read as "deleted" to `git diff` regardless of
+what was actually sitting on disk — `sync-scripts` would extract every file correctly and then
+report all of them missing. Reading the tree and the filesystem directly, with no index in between,
+is not sensitive to that at all. By default `verify_synced_to()` stays silent about any on-disk file
+under the given path that the target tree doesn't track — the same contract the old `git diff`-based
+check had — which is what keeps it safe around `k8s/overlays/aws/secrets/*.env`. `sync-scripts` also
+passes `--exact`, which additionally fails on a file that exists on disk but isn't in the target
+tree; that's safe only for `scripts/`, which has no untracked subtree of its own and is always `rm
+-rf`'d immediately before `sync-scripts` re-extracts it.
 
 **Before any of that can run, the checkout itself has to be usable — and "usable" is proven, not
 assumed.** `/opt/sentinel-sre` keeps a Git checkout so CI/SSM commands never have to ship rendered
