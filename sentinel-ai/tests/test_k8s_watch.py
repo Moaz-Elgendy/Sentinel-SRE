@@ -25,6 +25,10 @@ class _FakeK8sList:
         self.available = available
         self._deployments = deployments or []
         self._full = {}
+        self._pods = {}
+
+    def set_pods(self, app, *pods):
+        self._pods[app] = list(pods)
 
     def set_deployment(self, name, desired, available_replicas, annotations=None):
         self._deployments = [
@@ -54,17 +58,43 @@ class _FakeK8sList:
     async def get_deployment(self, namespace, name):
         return self._full.get(name)
 
+    async def list_pods(self, namespace, label_selector=None):
+        app = None
+        if label_selector and label_selector.startswith("app="):
+            app = label_selector.split("=", 1)[1]
+        return list(self._pods.get(app, []))
+
+
+class _FakeStore:
+    def __init__(self, incidents=None):
+        self.incidents = list(incidents or [])
+        self.upserts = []
+
+    def list_by_statuses(self, statuses):
+        return [
+            i for i in self.incidents
+            if i.get("status") in statuses
+        ]
+
 
 class _FakeManager:
-    def __init__(self):
+    def __init__(self, incidents=None):
         self.alerts: list[dict] = []
         self.resolved: list[dict] = []
+        self.auto_resolved: list[dict] = []
+        self.store = _FakeStore(incidents)
 
     def handle_alert(self, normalised, environment=None):
         self.alerts.append(normalised)
 
     def handle_resolved(self, normalised, environment=None):
         self.resolved.append(normalised)
+
+    def auto_resolve_incident(self, incident_id, *, reason, source="sentinel"):
+        self.auto_resolved.append(
+            {"incident_id": incident_id, "reason": reason, "source": source}
+        )
+        return {"resolved": True, "incident_id": incident_id}
 
 
 class _FakeCtx:
@@ -217,6 +247,97 @@ def test_evaluate_never_flags_intentional_zero_end_to_end():
                 debounce_seconds=0, expected_zero_annotation="sentinel.sre/expected-scale-zero",
             )
         assert manager.alerts == []
+
+    asyncio.run(_run())
+
+
+def test_reconcile_resolves_stale_pod_incident_when_replacement_is_ready():
+    async def _run():
+        k8s = _FakeK8sList()
+        k8s.set_deployment("notification-service", desired=1, available_replicas=1)
+        k8s.set_pods(
+            "notification-service",
+            {"name": "notification-service-NEW", "ready": True, "container_states": []},
+        )
+        manager = _FakeManager(
+            incidents=[{
+                "id": "INC-OLD",
+                "status": "open",
+                "alertname": "PodCrashLooping",
+                "app": "notification-service",
+                "namespace": "some-namespace",
+                "pod": "notification-service-OLD",
+            }]
+        )
+        environment = _FakeEnvironment()
+        ctx = _FakeCtx(k8s)
+
+        await k8s_watch._reconcile_stale_pod_incidents(
+            ctx, manager, environment, k8s._deployments
+        )
+
+        assert [r["incident_id"] for r in manager.auto_resolved] == ["INC-OLD"]
+        assert "replacement Pod" in manager.auto_resolved[0]["reason"]
+
+    asyncio.run(_run())
+
+
+def test_reconcile_does_not_resolve_stale_pod_when_deployment_is_still_short():
+    async def _run():
+        k8s = _FakeK8sList()
+        k8s.set_deployment("notification-service", desired=2, available_replicas=1)
+        k8s.set_pods(
+            "notification-service",
+            {"name": "notification-service-NEW", "ready": True, "container_states": []},
+        )
+        manager = _FakeManager(
+            incidents=[{
+                "id": "INC-OLD",
+                "status": "open",
+                "alertname": "ServiceDown",
+                "app": "notification-service",
+                "namespace": "some-namespace",
+                "pod": "notification-service-OLD",
+            }]
+        )
+        environment = _FakeEnvironment()
+        ctx = _FakeCtx(k8s)
+
+        await k8s_watch._reconcile_stale_pod_incidents(
+            ctx, manager, environment, k8s._deployments
+        )
+
+        assert manager.auto_resolved == []
+
+    asyncio.run(_run())
+
+
+def test_reconcile_does_not_resolve_non_availability_pod_incident():
+    async def _run():
+        k8s = _FakeK8sList()
+        k8s.set_deployment("notification-service", desired=1, available_replicas=1)
+        k8s.set_pods(
+            "notification-service",
+            {"name": "notification-service-NEW", "ready": True, "container_states": []},
+        )
+        manager = _FakeManager(
+            incidents=[{
+                "id": "INC-MEM",
+                "status": "open",
+                "alertname": "MemoryLeakSuspected",
+                "app": "notification-service",
+                "namespace": "some-namespace",
+                "pod": "notification-service-OLD",
+            }]
+        )
+        environment = _FakeEnvironment()
+        ctx = _FakeCtx(k8s)
+
+        await k8s_watch._reconcile_stale_pod_incidents(
+            ctx, manager, environment, k8s._deployments
+        )
+
+        assert manager.auto_resolved == []
 
     asyncio.run(_run())
 
