@@ -166,7 +166,7 @@ see none of the first one's history.
 |---|---|---|
 | Metrics | Prometheus, in-cluster (Phase 9) | PromQL over HTTP to `http://prometheus:9090` |
 | Logs | Loki (Phase 9), structured JSON with `request_id`, `level`, `service` labels (Phase 6) | LogQL over HTTP to `http://loki:3100` |
-| Alerts (push, real-time) | Alertmanager webhook receiver | Alertmanager `POST`s to `http://sentinel-ai:8080/api/alerts/webhook` — this is the primary "wake up" signal, not polling |
+| Alerts (push, real-time) | Alertmanager webhook receiver | Alertmanager `POST`s to `SENTINEL_API_UPSTREAM/api/alerts/webhook` — this is the primary "wake up" signal, not polling. On AWS that upstream is the **external Sentinel EC2's private IP** (`http://<sentinel-private-ip>:8080`), substituted into the Alertmanager receiver at deploy time; the deploy scripts reject the Kubernetes-only `sentinel-ai` Service name |
 | Kubernetes state | The K3s API server | Namespaced `Role`: pods, services, endpoints, configmaps, events, deployments, replicasets, pod logs |
 | Deployment history | Deployment + ReplicaSet objects | The `deployment.kubernetes.io/revision` annotation *is* the rollout history, and each ReplicaSet holds the exact pod template — and so the exact image, and so the exact git SHA — of a past revision |
 | HTTP health | `/readyz` on each service | Parsed as **JSON**, not by status code: `/readyz` returns 200 with `status: "degraded"` when a downstream dependency is broken |
