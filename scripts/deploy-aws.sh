@@ -169,6 +169,37 @@ echo "--- applying ---"
 kubectl apply -f "${RENDERED}"
 
 # ---------------------------------------------------------------------------
+# Force Alertmanager + Prometheus + Loki to pick up their new config
+#
+# All three mount their main config file with `subPath` (see
+# k8s/monitoring/{alertmanager,prometheus,loki}/deployment.yaml), which
+# means the kubelet NEVER refreshes it inside a running container when the
+# backing ConfigMap changes — subPath mounts are a one-time copy at pod
+# creation, not a live-updated projection. On top of that, Alertmanager has
+# no `--web.enable-lifecycle` flag and no reload sidecar, so it cannot even
+# be asked to reload without a restart. Prometheus does have
+# `--web.enable-lifecycle`, but nothing here calls `/-/reload`. Loki config
+# doesn't currently change via this overlay, but it has the exact same
+# subPath property, so it is restarted here too rather than leaving a
+# second copy of this footgun for whoever edits loki-config.yaml next.
+#
+# Net effect without this: a change to patch-monitoring.yaml — most
+# importantly the Alertmanager -> Sentinel webhook receiver, and the AWS
+# overlay's extra alert rules — is silently ignored by already-running
+# pods. `kubectl apply` succeeds, `rollout status` below reports the
+# existing (already-ready) ReplicaSet as fine because the pod template
+# itself didn't change, and nothing looks broken. Alerts still fire and
+# show up in Alertmanager's own UI; they just never reach Sentinel, so no
+# incident is ever created. This is exactly the "chaos scenario runs, no
+# incident appears" symptom with no visible deploy failure — restart both
+# unconditionally, every apply, so the mounted config is always what is
+# actually running. Idempotent and cheap: a restart when nothing changed
+# just replaces the pod with itself.
+# ---------------------------------------------------------------------------
+echo "--- restarting alertmanager + prometheus + loki to pick up config changes ---"
+kubectl -n "${NAMESPACE}" rollout restart deployment/alertmanager deployment/prometheus deployment/loki
+
+# ---------------------------------------------------------------------------
 # Wait for rollout
 #
 # Postgres first: the app services' init containers run `alembic upgrade

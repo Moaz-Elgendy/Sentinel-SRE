@@ -89,6 +89,28 @@ else
   bad "manual AWS overlay deploy does not require the external Sentinel URL"
 fi
 
+echo "=== Alertmanager/Prometheus/Loki config actually reaches the running pod ==="
+# alertmanager.yml, prometheus.yml and loki-config.yaml are all mounted
+# with `subPath` (k8s/monitoring/{alertmanager,prometheus,loki}/deployment.yaml),
+# which the kubelet never live-updates on a ConfigMap change, and
+# Alertmanager has no reload mechanism at all. So every path that applies
+# the AWS overlay manifests must also restart all three deployments, or a
+# config-only change (most importantly the Alertmanager -> Sentinel webhook
+# receiver) is silently ignored by an already-running pod: alerts keep
+# firing and stay visible in Alertmanager's own UI, they just never reach
+# Sentinel, and no incident is ever created — with nothing about the
+# deploy looking wrong.
+if grep -q 'rollout restart deployment/alertmanager deployment/prometheus deployment/loki' "${SCRIPT_DIR}/../deploy-aws.sh"; then
+  ok "deploy-aws.sh restarts alertmanager+prometheus+loki after every apply"
+else
+  bad "deploy-aws.sh does not restart alertmanager+prometheus+loki; config changes (e.g. the Sentinel webhook receiver) can silently never take effect"
+fi
+if grep -q 'rollout restart deployment/alertmanager deployment/prometheus deployment/loki' "${SCRIPT_DIR}/../sentinel-deploy.sh"; then
+  ok "sentinel-deploy.sh's render_and_apply restarts alertmanager+prometheus+loki after every apply"
+else
+  bad "sentinel-deploy.sh's render_and_apply does not restart alertmanager+prometheus+loki; CI-driven manifest-only deploys can silently never take effect"
+fi
+
 echo "=== assert_no_placeholders ==="
 clean_file="$(mktemp)"
 dirty_file="$(mktemp)"

@@ -468,6 +468,28 @@ render_and_apply() {
     rc=$?
   fi
 
+  # Alertmanager, Prometheus and Loki all mount their main config file with
+  # `subPath` (k8s/monitoring/{alertmanager,prometheus,loki}/deployment.yaml),
+  # so an already-running pod NEVER sees a ConfigMap change — subPath is a
+  # one-time copy at pod creation, not a live-updated projection — and
+  # Alertmanager has no `--web.enable-lifecycle`/reload path at all. This
+  # function is exactly how a manifest-only change (apply-manifests, or
+  # apply) reaches the cluster, most importantly changes to
+  # patch-monitoring.yaml's Alertmanager -> Sentinel webhook receiver and
+  # the AWS-only alert rules. Without a restart here, `kubectl apply`
+  # succeeds silently and the running Alertmanager/Prometheus keep serving
+  # their OLD config: alerts still fire and are visible in Alertmanager's
+  # own UI, but never reach Sentinel, so no incident is ever created —
+  # exactly the "chaos scenario runs, nothing happens" symptom, with
+  # nothing about the deploy itself looking wrong. Loki config doesn't
+  # currently change via this overlay, but has the same subPath property,
+  # so it is restarted here too. Only do this on a successful apply; skip
+  # it if kubectl apply itself failed.
+  if [ "${rc}" -eq 0 ]; then
+    kubectl -n "${NS}" rollout restart deployment/alertmanager deployment/prometheus deployment/loki \
+      || echo "WARNING: failed to restart alertmanager/prometheus/loki after apply; their config may be stale" >&2
+  fi
+
   rm -f -- "${rendered}"
 
   return "${rc}"

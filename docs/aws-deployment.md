@@ -1997,6 +1997,26 @@ leave alerts active in Alertmanager without creating or remediating incidents. T
 group allows the Sentinel webhook port only from the K3s node security group, keeping this path on
 the private VPC.
 
+**If this comes back wrong (still `receiver: default`, or an old/placeholder URL) even though
+`kubectl -n citizen-portal get cm alertmanager-config -o yaml` shows the correct receiver:** you
+have hit the most common cause of "chaos scenario runs, but no incident ever appears." Alertmanager
+mounts `alertmanager.yml` with `subPath` (see `k8s/monitoring/alertmanager/deployment.yaml`), and
+`subPath` mounts are a one-time copy at pod creation — the kubelet never refreshes them when the
+ConfigMap changes, and Alertmanager has no `/-/reload` endpoint to ask for a manual refresh either.
+So a running Alertmanager pod can be serving a config that is stale by days, with the ConfigMap it
+was built from looking completely correct. `kubectl apply` reports success either way, because the
+Deployment's pod template never changed. `scripts/deploy-aws.sh` and `scripts/sentinel-deploy.sh`
+now force `kubectl rollout restart deployment/alertmanager deployment/prometheus deployment/loki`
+after every apply specifically to close this gap (same `subPath` property, same fix, on Prometheus'
+rules and Loki's config). If you are diagnosing an existing deployment rather than doing a fresh
+one, the immediate fix is simply:
+
+```bash
+sudo kubectl -n citizen-portal rollout restart deployment/alertmanager deployment/prometheus
+```
+
+then re-run the `config.original` check above until it shows the receiver you expect.
+
 You can exercise the path end to end without waiting for a real incident, by posting a synthetic
 alert into Alertmanager and watching it arrive at Sentinel:
 
