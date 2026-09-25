@@ -149,6 +149,214 @@ expect_success "passes once the working tree is brought forward" verify_synced_t
 echo "totally-untracked-secret" > "${tmp_repo}/k8s/secret.env"
 expect_success "ignores an untracked file (models secrets/*.env)" verify_synced_to "${NEW_SHA}" scripts k8s
 
+echo "=== ensure_repo_synced (git checkout repair) ==="
+# "Upstream" origin: a real repo any of these fixtures can clone/fetch from,
+# standing in for GitHub in the tests below. Two commits so there is
+# something to be "missing before fetch, available after".
+upstream="$(mktemp -d)"
+(
+  cd "${upstream}"
+  git init --quiet -b master
+  git config user.email test@example.com
+  git config user.name "Contract Test"
+  mkdir -p scripts k8s/overlays/aws/secrets
+  echo "old" > scripts/thing.sh
+  echo "old" > k8s/thing.yaml
+  git add -A
+  git commit --quiet -m "old commit"
+)
+UP_OLD_SHA="$(git -C "${upstream}" rev-parse HEAD)"
+# Snapshot a clone taken *at this point* — i.e. one that genuinely does not
+# have the commit created next below in its local object database. This is
+# what "valid-but-missing-commit" fixtures are copied from, since cloning
+# from upstream *after* the new commit exists would defeat the point (the
+# clone would already have it).
+old_clone_template="$(mktemp -d)"
+git clone --quiet "${upstream}" "${old_clone_template}"
+(
+  cd "${upstream}"
+  echo "new" > scripts/thing.sh
+  echo "new" > k8s/thing.yaml
+  git add -A
+  git commit --quiet -m "new commit"
+)
+UP_NEW_SHA="$(git -C "${upstream}" rev-parse HEAD)"
+
+# fixture_repo_dir <mode>: sets REPO_DIR to a fresh tmp dir prepared per
+# `mode` and returns it via the global FIXTURE var. Each mode reproduces one
+# way a real node's /opt/sentinel-sre has been observed or could plausibly
+# end up broken.
+FIXTURE=""
+fixture_repo_dir() {
+  local mode="$1"
+  local dir
+  dir="$(mktemp -d)"
+  FIXTURE="${dir}"
+  case "${mode}" in
+    valid-and-current)
+      git clone --quiet "${upstream}" "${dir}"
+      ;;
+    valid-but-missing-commit)
+      # A checkout genuinely cloned before the upstream's newest commit
+      # existed — models an ordinary "CI pushed a new commit, node hasn't
+      # fetched yet" gap, not corruption. rmdir first: cp -a into a
+      # mktemp -d target requires the target not already contain a
+      # conflicting tree.
+      rmdir "${dir}"
+      cp -a "${old_clone_template}" "${dir}"
+      ;;
+    missing-head)
+      # ".git exists, but nothing has ever been committed to it" —
+      # reproduces the exact symptom from the field: `git rev-parse HEAD`
+      # is ambiguous/unresolvable, yet the directory (and .git) exist.
+      mkdir -p "${dir}"
+      ( cd "${dir}" && git init --quiet )
+      ;;
+    missing-git)
+      # Directory exists (application/working-tree files present, as they
+      # would be on a real node) but .git never got created at all.
+      mkdir -p "${dir}/scripts" "${dir}/k8s"
+      ;;
+    corrupted-git)
+      # A .git directory that exists but is not a valid git repository at
+      # all (truncated/garbage HEAD, no object database) — distinct from
+      # "missing-head", which is a syntactically valid empty repo.
+      mkdir -p "${dir}/.git"
+      echo "not a real ref" > "${dir}/.git/HEAD"
+      ;;
+  esac
+  printf '%s' "${dir}"
+}
+
+# --- valid, current checkout: no repair, no network needed ---
+fixture_repo_dir valid-and-current >/dev/null
+REPO_DIR="${FIXTURE}"
+REPO_URL_STATE_FILE="/tmp/does-not-exist-sentinel-repo-url-$$"
+expect_success "already-valid checkout at the requested commit: no-op" \
+  ensure_repo_synced "${UP_NEW_SHA}"
+
+# --- every broken-checkout shape gets repaired, given a resolvable origin ---
+repo_url_file="$(mktemp)"
+printf '%s' "${upstream}" > "${repo_url_file}"
+REPO_URL_STATE_FILE="${repo_url_file}"
+
+for mode in valid-but-missing-commit missing-head missing-git corrupted-git; do
+  fixture_repo_dir "${mode}" >/dev/null
+  REPO_DIR="${FIXTURE}"
+  expect_success "repairs '${mode}' and reaches the requested commit" \
+    ensure_repo_synced "${UP_NEW_SHA}"
+  if git -C "${REPO_DIR}" cat-file -e "${UP_NEW_SHA}^{commit}" 2>/dev/null; then
+    ok "'${mode}': commit is actually present in the local object db afterward"
+  else
+    bad "'${mode}': commit still not present in the local object db afterward"
+  fi
+done
+
+# --- fails closed: no origin can be discovered, nothing to repair from ---
+fixture_repo_dir missing-git >/dev/null
+REPO_DIR="${FIXTURE}"
+REPO_URL_STATE_FILE="/tmp/does-not-exist-sentinel-repo-url-$$"
+expect_failure "fails closed when no repo URL is known and .git is unusable" \
+  ensure_repo_synced "${UP_NEW_SHA}"
+
+# --- fails closed: origin resolvable, but the requested commit genuinely
+#     does not exist there (never fetchable, no matter how many retries) ---
+fixture_repo_dir missing-git >/dev/null
+REPO_DIR="${FIXTURE}"
+REPO_URL_STATE_FILE="${repo_url_file}"
+expect_failure "fails closed when the requested commit does not exist upstream" \
+  ensure_repo_synced "0000000000000000000000000000000000dead"
+
+# --- preserves untracked content, most importantly the live AWS secrets,
+#     across a full repair (missing .git entirely) ---
+fixture_repo_dir missing-git >/dev/null
+REPO_DIR="${FIXTURE}"
+REPO_URL_STATE_FILE="${repo_url_file}"
+mkdir -p "${REPO_DIR}/k8s/overlays/aws/secrets"
+echo "super-secret-value" > "${REPO_DIR}/k8s/overlays/aws/secrets/citizen-postgres.env"
+before_secret="$(cat "${REPO_DIR}/k8s/overlays/aws/secrets/citizen-postgres.env")"
+expect_success "repairs a missing .git with live secrets already on disk" \
+  ensure_repo_synced "${UP_NEW_SHA}"
+after_secret="$(cat "${REPO_DIR}/k8s/overlays/aws/secrets/citizen-postgres.env" 2>/dev/null || echo "<gone>")"
+if [ "${before_secret}" = "${after_secret}" ]; then
+  ok "untracked k8s/overlays/aws/secrets/*.env survives a .git repair byte-for-byte"
+else
+  bad "untracked secret was altered or deleted by a .git repair (before='${before_secret}' after='${after_secret}')"
+fi
+
+echo "=== end-to-end: sync-scripts / sync-manifests / sync recover from a broken checkout ==="
+# These call main() itself (not just the helpers), the same entry point CI
+# and SSM use, against a REPO_DIR whose .git is unusable — reproducing the
+# exact field symptom (git rev-parse HEAD fails) and confirming the
+# documented contract still holds end-to-end: sync-scripts fully replaces
+# scripts/ (incl. deletions) and reinstalls the bin copy with correct
+# executable bits; sync-manifests touches only k8s/ and never the live
+# secrets; both fail closed if verification doesn't pass.
+
+# sync-scripts: upstream's "new commit" removed nothing, so exercise a real
+# deletion too, matching the original field failure (files disappearing).
+(
+  cd "${upstream}"
+  echo "old" > scripts/removed-in-latest.sh
+  git add -A
+  git commit --quiet -m "add a file that gets removed next"
+)
+(
+  cd "${upstream}"
+  git rm --quiet scripts/removed-in-latest.sh
+  git commit --quiet -m "remove it again"
+)
+UP_LATEST_SHA="$(git -C "${upstream}" rev-parse HEAD)"
+
+fixture_repo_dir missing-head >/dev/null
+REPO_DIR="${FIXTURE}"
+REPO_URL_STATE_FILE="${repo_url_file}"
+INSTALL_BIN_DIR="$(mktemp -d)"
+# sync-scripts installs to /usr/local/bin/sentinel-deploy.sh unconditionally;
+# these tests run unprivileged, so only assert on what sync-scripts leaves
+# inside REPO_DIR itself, which is what the field failure was actually about.
+if MODE=sync-scripts SHA="${UP_LATEST_SHA}" \
+  bash -c 'set -euo pipefail; cd '"${SCRIPT_DIR}"'/.. ; source ./sentinel-deploy.sh; REPO_DIR="'"${REPO_DIR}"'"; REPO_URL_STATE_FILE="'"${REPO_URL_STATE_FILE}"'"; main sync-scripts "'"${UP_LATEST_SHA}"'" 2>&1 | tee /tmp/sync-scripts-test.out; exit "${PIPESTATUS[0]}"' \
+  >/tmp/sync-scripts-test.out 2>&1; then
+  ok "sync-scripts recovers from a checkout with no resolvable HEAD"
+else
+  bad "sync-scripts still fails against a broken checkout (output: $(cat /tmp/sync-scripts-test.out))"
+fi
+if [ ! -e "${REPO_DIR}/scripts/removed-in-latest.sh" ]; then
+  ok "sync-scripts: a file deleted upstream is actually gone after recovery"
+else
+  bad "sync-scripts: a file deleted upstream is still present after recovery"
+fi
+if [ -x "${REPO_DIR}/scripts/thing.sh" ]; then
+  ok "sync-scripts: executable bit is set on synced scripts after recovery"
+else
+  bad "sync-scripts: executable bit missing on synced scripts after recovery"
+fi
+
+# sync-manifests: same broken-checkout starting point, but this time with a
+# live untracked secret sitting in k8s/ that must survive.
+fixture_repo_dir missing-git >/dev/null
+REPO_DIR="${FIXTURE}"
+REPO_URL_STATE_FILE="${repo_url_file}"
+mkdir -p "${REPO_DIR}/k8s/overlays/aws/secrets"
+echo "super-secret-value" > "${REPO_DIR}/k8s/overlays/aws/secrets/citizen-postgres.env"
+if bash -c 'set -euo pipefail; cd '"${SCRIPT_DIR}"'/.. ; source ./sentinel-deploy.sh; REPO_DIR="'"${REPO_DIR}"'"; REPO_URL_STATE_FILE="'"${REPO_URL_STATE_FILE}"'"; main sync-manifests "'"${UP_LATEST_SHA}"'"' \
+  >/tmp/sync-manifests-test.out 2>&1; then
+  ok "sync-manifests recovers from a missing .git and syncs k8s/"
+else
+  bad "sync-manifests still fails against a missing .git (output: $(cat /tmp/sync-manifests-test.out))"
+fi
+if [ "$(cat "${REPO_DIR}/k8s/overlays/aws/secrets/citizen-postgres.env" 2>/dev/null)" = "super-secret-value" ]; then
+  ok "sync-manifests: live untracked secret survives a full checkout recovery"
+else
+  bad "sync-manifests: live untracked secret was lost during checkout recovery"
+fi
+if [ "$(cat "${REPO_DIR}/k8s/thing.yaml" 2>/dev/null)" = "new" ]; then
+  ok "sync-manifests: k8s/ content matches the requested commit after recovery"
+else
+  bad "sync-manifests: k8s/ content does not match the requested commit after recovery"
+fi
+
 echo
 echo "============================================================"
 echo " ${PASS} passed, ${FAIL} failed"

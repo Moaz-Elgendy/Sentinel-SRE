@@ -1243,6 +1243,81 @@ For manifest changes rather than image changes, use the same script; for image-o
 uses the narrower path, `/usr/local/bin/sentinel-deploy.sh images <sha>`, which is all the SSM
 policy permits it to invoke.
 
+## Deployment synchronization contract
+
+This section is what `scripts/sentinel-deploy.sh`'s own comments point to when they say "see
+docs/aws-deployment.md, 'Deployment synchronization contract'".
+
+**The rule: "the SSM command returned 0" is never trusted as "the node is now at the commit CI
+asked for."** Every sync mode (`sync`, `sync-manifests`, `sync-scripts`) proves it afterward with
+`verify_synced_to()`, which runs `git diff --quiet <sha> -- <paths>` — a direct comparison of the
+*working tree* against the *requested commit*, not a check of any command's exit code. If that
+comparison fails, the script exits non-zero and CI's deploy step is expected to fail with it. This
+exists because of a real incident: `sync-scripts` used to be allowed to fail silently, which let a
+manifest change ship with a stale `render_and_apply()` that didn't know about it.
+
+**Before any of that can run, the checkout itself has to be usable — and "usable" is proven, not
+assumed.** `/opt/sentinel-sre` keeps a Git checkout so CI/SSM commands never have to ship rendered
+manifests over SSM's payload-size limit. A directory named `.git` existing is not proof that
+checkout is usable: an interrupted clone (a reboot mid-`git clone`, a transient network error) can
+leave a `.git` directory with no resolvable `HEAD` — `git rev-parse HEAD` fails as "ambiguous
+argument" — while still looking, from `[ -d .git ]` alone, like a normal repository. Every sync
+mode calls `ensure_repo_synced()` first, which:
+
+1. Checks whether the checkout is actually usable (`git rev-parse --is-inside-work-tree` **and** a
+   resolvable `HEAD`), not just whether `.git` exists.
+2. If it isn't, repairs **only** `.git` — reinitializing Git metadata and re-pointing it at
+   `origin` (read from `/etc/sentinel-sre/repo-url`, written once by Terraform's bootstrap, or
+   from an existing `origin` remote if the state file predates it) — then fetches. `/opt/sentinel-sre`
+   itself is never removed or recreated, and nothing else already on disk there is touched, which is
+   what keeps the live, gitignored `k8s/overlays/aws/secrets/*.env` files intact through a repair.
+3. Checks whether the requested commit is present locally (`git cat-file -e <sha>^{commit}`); if
+   not, fetches (`git fetch --all --tags`, then a direct `git fetch origin <sha>` for a commit that
+   isn't the tip of any branch `--all` picked up — GitHub allows fetching a reachable commit
+   directly on a public repo).
+4. **Fails closed.** If the requested commit still cannot be proven present locally after every
+   repair/fetch attempt, `ensure_repo_synced()` returns non-zero and the calling sync mode exits
+   without touching anything further. It never falls back to "best effort" or proceeds on an
+   unproven checkout.
+
+The same repair logic exists, independently, in `infra/terraform/user_data.sh.tftpl`'s first-boot
+bootstrap — it cannot simply call `ensure_repo_synced()`, because that function lives *inside* the
+file the bootstrap is trying to obtain a copy of in the first place. Both places share the same
+shape (check usability, not just presence; repair only `.git`; never touch anything else already on
+disk) deliberately, so they cannot silently drift into disagreeing about what "usable" means.
+
+### Recovering an already-running node
+
+You do not need to SSH or SCP anything onto the box by hand. Any sync mode now repairs a broken
+checkout as a normal side effect of running, so the same SSM commands used for an ordinary deploy
+also recover a node stuck in this state:
+
+```bash
+aws ssm send-command \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --parameters commands="/usr/local/bin/sentinel-deploy.sh sync-scripts $GITHUB_SHA" \
+  --region "$AWS_REGION"
+```
+
+then re-run the CI job (or the equivalent `sync-manifests`/`apply-manifests`/`images` SSM commands)
+that originally failed. If `/usr/local/bin/sentinel-deploy.sh` itself predates this fix (so it
+doesn't know `ensure_repo_synced` at all), refresh it first the same way `sync` always has:
+
+```bash
+aws ssm send-command \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --parameters commands="/usr/local/bin/sentinel-deploy.sh sync $GITHUB_SHA" \
+  --region "$AWS_REGION"
+```
+
+`sync` refreshes `scripts/sentinel-deploy.sh` and reinstalls `/usr/local/bin/sentinel-deploy.sh`;
+now that `sync` itself also calls `ensure_repo_synced()` first, this succeeds even from a checkout
+with no resolvable `HEAD` — it repairs `.git` as a side effect of the same command. Nothing here
+ever runs `rm -rf /opt/sentinel-sre`, and nothing here can touch
+`k8s/overlays/aws/secrets/*.env`.
+
 ## Step 19. Verify pods
 
 ```bash
