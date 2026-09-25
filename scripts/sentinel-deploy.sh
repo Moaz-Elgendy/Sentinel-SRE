@@ -397,52 +397,69 @@ assert_no_placeholders() {
 # out itself. Must be run from ${REPO_DIR}.
 render_and_apply() {
   local sha="$1"
-  local token aws_region aws_account_id public_ip ecr_registry sentinel_api_upstream rendered
+  local token aws_region aws_account_id public_ip ecr_registry sentinel_api_upstream rendered rc
 
   token="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' \
     -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')"
+
   aws_region="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
     http://169.254.169.254/latest/meta-data/placement/region)"
-  aws_account_id="$(aws sts get-caller-identity --query Account --output text --region "${aws_region}")"
+
+  aws_account_id="$(aws sts get-caller-identity \
+    --query Account \
+    --output text \
+    --region "${aws_region}")"
+
   public_ip="$(curl -sS -H "X-aws-ec2-metadata-token: ${token}" \
     http://169.254.169.254/latest/meta-data/public-ipv4)"
+
   ecr_registry="${aws_account_id}.dkr.ecr.${aws_region}.amazonaws.com"
-  # The AWS/K3s overlay runs Sentinel on a separate EC2 instance, so the
-  # in-cluster `sentinel-ai` Service is intentionally not available there.
-  # CI resolves the external Sentinel private IP and exports
-  # SENTINEL_API_UPSTREAM before calling this mode. Keep the in-cluster DNS
-  # default for local/manual deployments where an in-cluster Sentinel really
-  # exists, but never allow the AWS CI path to silently fall back to it.
+
+  # Same default as deploy-aws.sh: the in-cluster topology's Service DNS
+  # name. Set SENTINEL_API_UPSTREAM for the external-control-plane topology.
   sentinel_api_upstream="${SENTINEL_API_UPSTREAM:-http://sentinel-ai:8080}"
+
   validate_upstream_url "${sentinel_api_upstream}" || return 1
 
   rendered="$(mktemp)"
-  trap 'rm -f "${rendered}"' RETURN
-  kubectl kustomize k8s/overlays/aws \
-    | sed -e "s|ACCOUNT_ID\.dkr\.ecr\.REGION\.amazonaws\.com|${ecr_registry}|g" \
-          -e "s|:PLACEHOLDER|:${sha}|g" \
-          -e "s|PUBLIC_IP_PLACEHOLDER|${public_ip}|g" \
-          -e "s|SENTINEL_API_UPSTREAM_PLACEHOLDER|${sentinel_api_upstream}|g" \
-    > "${rendered}"
 
-  # Fail-loud guard: a survived placeholder must stop the deploy, not
-  # silently reach the cluster.
-  assert_no_placeholders "${rendered}" || return 1
-
-  # Positive assertion, not just an absence-of-placeholder one: prove the
-  # value we actually meant to ship is present verbatim. This is what would
-  # have caught the historical incident even if some future edit renamed
-  # the placeholder token without updating this sed list to match — a
-  # mismatch there leaves no "PLACEHOLDER" string behind for the check
-  # above to catch, since the raw base manifest's own literal is gone too,
-  # replaced by nothing.
-  if ! grep -qF "value: ${sentinel_api_upstream}" "${rendered}"; then
-    echo "ERROR: rendered manifests do not contain the expected Sentinel endpoint" >&2
-    echo "       (value: ${sentinel_api_upstream}) — refusing to apply." >&2
+  # Render the AWS overlay and substitute all deploy-time values.
+  if ! kubectl kustomize k8s/overlays/aws \
+      | sed -e "s|ACCOUNT_ID\\.dkr\\.ecr\\.REGION\\.amazonaws\\.com|${ecr_registry}|g" \
+            -e "s|:PLACEHOLDER|:${sha}|g" \
+            -e "s|PUBLIC_IP_PLACEHOLDER|${public_ip}|g" \
+            -e "s|SENTINEL_API_UPSTREAM_PLACEHOLDER|${sentinel_api_upstream}|g" \
+      > "${rendered}"; then
+    rm -f -- "${rendered}"
     return 1
   fi
 
-  kubectl apply -f "${rendered}"
+  # Fail-loud guard: a survived placeholder must stop the deploy.
+  if ! assert_no_placeholders "${rendered}"; then
+    rm -f -- "${rendered}"
+    return 1
+  fi
+
+  # Positive assertion: prove the intended Sentinel endpoint was actually
+  # rendered into the manifests.
+  if ! grep -qF "value: ${sentinel_api_upstream}" "${rendered}"; then
+    echo "ERROR: rendered manifests do not contain the expected Sentinel endpoint" >&2
+    echo "       (value: ${sentinel_api_upstream}) — refusing to apply." >&2
+    rm -f -- "${rendered}"
+    return 1
+  fi
+
+  # Apply while capturing the exit status so the temporary file is always
+  # removed before this function returns, including when kubectl fails.
+  if kubectl apply -f "${rendered}"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  rm -f -- "${rendered}"
+
+  return "${rc}"
 }
 
 # Dispatch is wrapped in main() — invoked only when this file is executed
