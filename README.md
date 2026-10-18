@@ -2,7 +2,14 @@
 
 ### From alert to evidence, policy-checked action, and verified recovery.
 
-An autonomous SRE prototype with an external control plane, a live operator console, and a real AWS demonstration deployment. Sentinel investigates Kubernetes incidents, correlates telemetry with deployment history, proposes a response, and executes only what its deterministic policy permits.
+Sentinel addresses the slow, manual work between a Kubernetes alert and a verified recovery. It gathers telemetry and cluster evidence, evaluates bounded remediation options, and records what happened.
+
+| Reviewer question | Answer from this repository |
+|---|---|
+| **What problem does it solve?** | Turns incident response into an evidence-backed, policy-gated lifecycle with recovery validation. |
+| **What has run?** | The supplied AWS demo recording shows Sentinel handling an HTTP chaos incident through reset and validated recovery; the owner reports the AWS demo was deployed and working. |
+| **How can I verify it?** | [Watch the demo](docs/media/sentinel-demo.mp4), inspect its [evidence frames](docs/README-EVIDENCE.md), then trace behavior in the [workflow](.github/workflows/ci-cd.yml), [policy](sentinel-ai/app/lifecycle/policy.py), and [validator](sentinel-ai/app/lifecycle/validation.py). |
+| **What engineering choices matter?** | Optional LLM reasoning; deterministic allow-lists and thresholds; typed Kubernetes writes; deep proposals require human authorization; Sentinel runs outside the workload cluster. |
 
 **The model advises. Policy authorizes. Typed executors act. Recovery checks decide whether it worked.**
 
