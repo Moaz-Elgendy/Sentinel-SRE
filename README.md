@@ -1,1162 +1,385 @@
 # Sentinel SRE
 
-An autonomous SRE agent, and a realistic workload for it to watch.
+### From alert to evidence, policy-checked action, and verified recovery.
 
-This repository contains two things that only make sense together:
+An autonomous SRE prototype with an external control plane, a live operator console, and a real AWS demonstration deployment. Sentinel investigates Kubernetes incidents, correlates telemetry with deployment history, proposes a response, and executes only what its deterministic policy permits.
 
-1. **The Digital Citizen Services Portal** — a small but genuinely multi-service application
-   (React frontend, two FastAPI services, two PostgreSQL databases) built to behave like a real
-   production system: structured logs with request correlation, Prometheus metrics, health probes
-   that distinguish "up" from "healthy", alerting rules, and an authenticated API for injecting
-   controlled failures.
-2. **Sentinel AI** (`sentinel-ai/`) — an autonomous SRE agent that watches that application,
-   investigates incidents, decides on remediation, and **executes it without asking a human**,
-   including rolling back a bad deployment. **`sentinel-gui/`** is its companion admin console — a
-   separate React app, with its own login, for watching that lifecycle incident-by-incident and
-   intervening when Sentinel escalates.
+**The model advises. Policy authorizes. Typed executors act. Recovery checks decide whether it worked.**
 
-The application exists so Sentinel has something real to fail. Most demonstrations of "AI for
-operations" are built on a fabricated metric and a fabricated failure; this one is built on an
-application that can actually break, in several distinguishable ways, on demand.
+[Architecture](#architecture) · [Safety gates](#safety-gates) · [Run locally](#run-locally) · [AWS & delivery](#aws-deployment-and-cicd) · [Demo](#see-it-work) · [Scope & roadmap](#implemented-scope-and-roadmap)
 
-> **The AWS environment in this repository is a demonstration and development environment. It is
-> not a production government deployment architecture.** It is a single EC2 instance with no
-> redundancy, no TLS, no database backups, and one availability zone. It is deliberately shaped
-> to be cheap enough to leave running while Sentinel is developed against it. Nothing about it
-> should be copied into a system with real users or real citizen data. The portal itself is a
-> simulation — it does not represent any real government service, and every national ID or
-> document in it is generated.
->
-> **Additionally: the AWS environment has not yet been deployed.** The Terraform is written and
-> validated but has never been applied. See [Limitations](#limitations).
+![Sentinel command center showing service health, incident history, live activity, and watch-only databases](docs/media/command-center.png)
 
----
+*Actual project GUI. Dashboard counts and rates describe this demo's recorded history; they are not reliability benchmarks.*
 
-## Contents
+## Why this project exists
 
-- [Problem statement](#problem-statement)
-- [Solution](#solution)
-- [Architecture](#architecture)
-- [Technology stack](#technology-stack)
-- [Microservices](#microservices)
-- [AWS architecture](#aws-architecture)
-- [K3s architecture](#k3s-architecture)
-- [Observability architecture](#observability-architecture)
-- [Sentinel architecture](#sentinel-architecture)
-- [Autonomous remediation](#autonomous-remediation)
-- [Deep investigation & novel remediation](#deep-investigation--novel-remediation)
-- [Rollback capability](#rollback-capability)
-- [The incident lifecycle](#the-incident-lifecycle)
-- [A worked example incident](#a-worked-example-incident)
-- [Operational learning & incident replay](#operational-learning--incident-replay)
-- [Chaos engineering scenarios](#chaos-engineering-scenarios)
-- [CI/CD](#cicd)
-- [Security model](#security-model)
-- [Deployment](#deployment) — [local](#local-development) and [AWS](#aws-deployment)
-- [Cost-conscious AWS architecture](#cost-conscious-aws-architecture)
-- [Limitations](#limitations)
-- [Future roadmap](#future-roadmap)
-- [Documentation map](#documentation-map)
+An alert tells an operator something is wrong. It does not establish the cause, identify a safe response, or prove recovery. Sentinel connects those steps into one auditable incident lifecycle.
 
----
+The monitored workload is a Citizen Portal: a React frontend, two FastAPI services, and a separate PostgreSQL database for each service. Deliberate failures make the system observable under stress, while Sentinel runs on a separate EC2 instance so its control plane remains independent of the application cluster.
 
-## Problem statement
+- **Evidence first:** Prometheus metrics, Loki logs, Kubernetes state/events, health probes, and optional GitHub deployment correlation.
+- **Bounded autonomy:** restart, rollback, scale, or reset an injected chaos fault, subject to allow-lists, confidence thresholds, cooldowns, and action-specific checks.
+- **A second path for unfamiliar failures:** bounded, read-only deep investigation produces a typed proposal that always requires explicit human authorization.
+- **A visible audit trail:** incident evidence, causal views, policy decisions, actions, validation, replay, feedback, and persisted activity in the operator GUI.
 
-When a production system breaks, the work is rarely the fix. The work is everything around it:
-reading the alert, pulling the metric that the alert summarised into a boolean, finding the log
-lines for the affected requests, checking whether anything was deployed recently, forming a
-hypothesis, deciding whether the safest action is a restart or a rollback or nothing at all,
-executing it, confirming the system actually recovered rather than merely stopped alerting, and
-then writing it all down.
+## See it work
 
-Most of that is mechanical. It is also slow, and it is slowest exactly when it matters most —
-at 3am, under pressure, by whoever happened to be on call. Monitoring platforms have got very good
-at the first step and have deliberately stopped there: they tell a human that something is wrong
-and leave every decision to that human.
+[**Watch the supplied 66-second demonstration →**](docs/media/sentinel-demo.mp4)
 
-The gap is not detection. The gap is the twenty minutes between detection and the correct action.
+The recording shows an HTTP chaos incident on `citizen-service`, a `reset_chaos_fault` response, and a subsequent resolved incident. These frames come directly from that recording:
 
-## Solution
+| Policy-approved remediation in progress (~00:30) | Incident resolved (~00:55) |
+|---|---|
+| ![Incident undergoing remediation](docs/media/incident-remediation.jpg) | ![Incident after recovery validation](docs/media/incident-resolved.jpg) |
 
-Sentinel closes that gap for a bounded set of failures, by doing the mechanical parts
-deterministically and using a language model only for the part that genuinely benefits from one:
-reading heterogeneous evidence and proposing an explanation.
-
-The design commitment that makes this defensible is that **the language model never touches the
-cluster**. It receives evidence and returns a structured recommendation — an action name from a
-fixed enum, a target, a confidence number, and its reasoning. Everything after that is ordinary
-code: a Decision Engine that orders candidate actions, a Policy Engine that checks each against
-allow-lists, confidence thresholds and preconditions, a Remediation Engine that is the only
-component permitted to call the Kubernetes API, and a Kubernetes RBAC Role that would refuse
-anything else even if both of those had bugs.
-
-Within that boundary, Sentinel is genuinely autonomous. It restarts deployments, scales them
-within bounds, clears chaos faults, and rolls back bad deployments, with no approval step. Outside
-that boundary — a database incident, an unfamiliar failure mode, an action whose preconditions do
-not hold — it escalates to a human and says exactly why.
+The project owner reports that the application was deployed and working on AWS. The supplied recording shows the remote GUI and AWS browser tabs; the repository contains the corresponding Terraform, K3s configuration, and delivery workflow. This README does not assert that a historical demo address is still online, or that every scenario succeeded. See the [evidence guide](docs/README-EVIDENCE.md) for provenance and presentation caveats.
 
 ## Architecture
 
-```text
-  Developer push
-        │
-        ▼
-  GitHub Actions ──── OIDC ────▶ AWS
-   tests → build → push to ECR → aws ssm send-command
-                                        │
-                                        ▼  (CI never touches the Kubernetes API)
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ K3s node — citizen portal + observability (t3a.large, Ubuntu 24.04)     │
-  │ K3s v1.31.4+k3s1 — single node, control-plane + worker                  │
-  │                                                                         │
-  │   Traefik (K3s's bundled ingress controller)                            │
-  │     │                                                                   │
-  │     ├── / ────▶ frontend (nginx + React)                                │
-  │     └── /api ─▶ citizen-service ──▶ notification-service                │
-  │                       │                      │                          │
-  │                 citizen-postgres    notification-postgres               │
-  │                                                                         │
-  │   Prometheus ── Alertmanager                Grafana Alloy               │
-  │        │             │  webhook (to the Sentinel node)  │               │
-  │        │             └───────────────┐                 ▼               │
-  │        │ NodePort :30090             │               Loki               │
-  │        │                             │           NodePort :30100        │
-  │   Grafana ── reads ──▶ Prometheus + Loki                                │
-  └────────│─────────────────────────────│─────────────────│───────────────┘
-           │ PromQL                      │                 │ LogQL
-           ▼                             ▼                 ▼
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ Sentinel node — its own EC2 instance, optional                          │
-  │ (infra/terraform/sentinel_remote.tf, `enable_remote_sentinel`)          │
-  │                                                                         │
-  │   nginx — the only public port on this instance                        │
-  │     ├── / ────▶ sentinel-gui (React SPA, the SRE Control Center)       │
-  │     └── /api ─▶ sentinel-ai (FastAPI :8080)                            │
-  │                       │                                                │
-  │            namespaced RBAC Role, reached over the K3s API              │
-  │            (:6443, security-group-scoped — not public)                 │
-  └─────────────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-  GitHub issues / incident reports / postmortems · Slack (both optional)
+```mermaid
+flowchart TB
+    users[Citizen browser] --> ingress
+    operator[SRE operator] --> gui
+    subgraph aws["AWS · one VPC / public subnet"]
+        subgraph workload["EC2 #1 · K3s workload plane"]
+            ingress[Traefik · HTTP :80]
+            ingress -->|/| web[React Citizen Portal]
+            ingress -->|/api| citizen[FastAPI · citizen-service]
+            citizen --> cdb[(Citizen PostgreSQL)]
+            citizen -->|asynchronous notification| notification[FastAPI · notification-service]
+            notification --> ndb[(Notification PostgreSQL)]
+            citizen -. metrics .-> prom[Prometheus]
+            notification -. metrics .-> prom
+            alloy[Grafana Alloy] -->|pod logs| loki[Loki]
+            prom -->|alert rules| am[Alertmanager]
+            grafana[Grafana] --> prom
+            grafana --> loki
+            api[Kubernetes API]
+        end
+        subgraph control["EC2 #2 · external Sentinel control plane"]
+            gui[React GUI / nginx · :80] -->|same-origin API proxy| sentinel[FastAPI · sentinel-ai · :8080]
+            sentinel --> store[(SQLite incident memory)]
+        end
+        am -->|private webhook| sentinel
+        sentinel -->|read telemetry| prom
+        sentinel -->|read logs| loki
+        sentinel -->|read / scoped writes| api
+        sentinel -->|health / authorized chaos reset| citizen
+        sentinel -->|health / authorized chaos reset| notification
+    end
+    sentinel -. optional reasoning .-> llm[OpenAI / Gemini / Groq]
+    sentinel -. optional reports .-> github[GitHub Issues]
+    sentinel -. optional notifications .-> slack[Slack]
+    classDef controlStyle fill:#123b34,stroke:#35b990,color:#fff
+    classDef dataStyle fill:#202b48,stroke:#7b9eff,color:#fff
+    class sentinel,gui controlStyle
+    class cdb,ndb,store dataStyle
 ```
 
-Both EC2 instances are administered through AWS Systems Manager Session Manager only — there is no
-SSH port and no key pair. On the K3s node, Grafana, Prometheus and Alertmanager are not exposed
-publicly; they are reached by port-forwarding through Session Manager, and Prometheus and Loki are
-additionally reachable from the Sentinel node through two restricted NodePorts. On the Sentinel
-node, `sentinel-gui`'s nginx is the only public entrypoint, reverse-proxying `/api/` to `sentinel-ai`
-over a private Docker network. Each instance's security group allows exactly one inbound port from
-the internet (`:80`).
+This diagram follows the active AWS overlay and external-instance bootstrap, rather than older comments describing an in-cluster Sentinel. The GUI and agent run as Docker containers managed by systemd on the Sentinel instance. PostgreSQL and monitoring remain inside K3s; this is **K3s on EC2, not EKS**.
 
-## Technology stack
-
-| Layer | Choice | Note |
+| Component | Responsibility | Source |
 |---|---|---|
-| Frontend | React + Vite, served by nginx | Built with `VITE_API_BASE_URL=""` so the browser calls relative `/api/...` paths and there is no CORS to configure for the browser↔API path |
-| Backend | Python, FastAPI, SQLAlchemy, Alembic | Two services, one database each |
-| Database | PostgreSQL | In-cluster, one instance per service, not RDS |
-| Containers | Docker | Multi-stage builds, non-root users |
-| Orchestration | Kubernetes — K3s on AWS, kind / minikube / Docker Desktop locally | Kustomize base + two overlays |
-| Ingress | Traefik on AWS (K3s's bundled controller), ingress-nginx locally | See [K3s architecture](#k3s-architecture) for why they differ |
-| Metrics | Prometheus | Annotation-based pod discovery, no Operator/CRDs |
-| Logs | Loki + Grafana Alloy | Alloy, not Promtail — Promtail is deprecated |
-| Dashboards | Grafana | Datasources and one dashboard provisioned from ConfigMaps |
-| Alerting | Alertmanager | Webhook receiver pointing at Sentinel |
-| Agent | Python, FastAPI, `httpx`, SQLite | Optional OpenAI API for root-cause narrative |
-| Infrastructure | Terraform (AWS provider 5.x) | Local state |
-| CI/CD | GitHub Actions, ECR, OIDC, SSM | No long-lived AWS keys |
+| Citizen Portal | Registration/login, service catalog, requests, profile, uploads | [`frontend/`](frontend/), [`citizen-service/`](citizen-service/) |
+| Notification service | Independent API and database; downstream notification processing | [`notification-service/`](notification-service/) |
+| Observability | Metrics, alert routing, log collection, dashboards | [`k8s/base/monitoring/`](k8s/base/monitoring/) |
+| Sentinel engine | Evidence → correlation → diagnosis → decision → policy → execution → validation | [`sentinel-ai/app/lifecycle/`](sentinel-ai/app/lifecycle/) |
+| Operator console | Incidents, action ledger, live logs, environment, performance, guardrails, chaos controls | [`sentinel-gui/`](sentinel-gui/) |
+| Infrastructure | VPC, EC2/EBS, IAM, ECR, SSM, external control plane | [`infra/terraform/`](infra/terraform/) |
 
-## Microservices
+<details>
+<summary>Presentation architecture and workload diagrams</summary>
 
-- **`frontend/`** — React SPA: registration, login, service catalogue, request submission, request
-  status. Never calls `notification-service`; it only reflects state `citizen-service` exposes.
-- **`citizen-service/`** (`:8000`) — the public API. Citizen registration and JWT auth, the service
-  catalogue, request submission, document upload, request status. Owns the `citizen_portal`
-  database. Hosts the chaos control API.
-- **`notification-service/`** (`:8000` in-cluster) — notification dispatch with a simulated
-  email/SMS provider. Called server-to-server by `citizen-service` with an ID-only payload
-  (`citizen_id`, `request_id`) and never a database reference. Owns the `notification_service`
-  database. It has no ingress rule at all; it is `ClusterIP`-only.
-- **`sentinel-ai/`** (`:8080`) — the SRE agent. Receives Alertmanager webhooks at
-  `/api/alerts/webhook`, reads Prometheus and Loki, reads and patches Deployments through the
-  Kubernetes API.
-- **`sentinel-gui/`** — the Sentinel SRE Control Center. A separate React SPA with its own admin
-  login (unrelated to citizen-service's citizen auth or to the chaos control API's
-  `X-Chaos-Token`), giving an operator a live view of the incident lifecycle and a narrow, audited
-  way to intervene when Sentinel escalates. It runs on its own EC2 instance, not in K3s — see
-  [Architecture](#architecture) — and every route it calls other than the Alertmanager webhook and
-  the chaos-scenario endpoint requires that admin JWT. Full detail is in
-  [`docs/sentinel-integration.md`](docs/sentinel-integration.md#sentinel-sre-control-center-gui).
+![Original full architecture presentation slide](docs/media/architecture.jpg)
 
-Each backend owns its own database and its own migrations. There are no cross-service joins and no
-shared schema — which is what makes "notification delivery is degraded but the portal is fine" a
-state the system can actually be in, and therefore a state Sentinel has to distinguish.
+![Original workload plane presentation slide](docs/media/workload-plane.jpg)
 
-## AWS architecture
+These are original presentation assets. The source-based diagram and scope notes in this README take precedence where a slide simplifies implementation details.
 
-The citizen portal and its observability stack run on one K3s instance. Sentinel — both
-`sentinel-ai` and `sentinel-gui` — optionally runs on a second, standalone instance instead of
-inside that cluster (`enable_remote_sentinel`, off by default; see
-[`infra/terraform/sentinel_remote.tf`](infra/terraform/sentinel_remote.tf) and
-[`docs/sentinel-remote-validation-runbook.md`](docs/sentinel-remote-validation-runbook.md)). The
-full list of AWS services used:
+</details>
 
-**VPC, Internet Gateway, one public subnet, one route table, security groups, EC2 (one or two
-instances), EBS, IAM, ECR, Systems Manager.**
+## Incident lifecycle
 
-Deliberately not used: **EKS, RDS, ALB, NAT Gateway**, and (on AWS) **ingress-nginx**. The
-reasoning for each is in [Cost-conscious AWS architecture](#cost-conscious-aws-architecture) and
-in full in [`docs/aws-deployment.md`](docs/aws-deployment.md).
-
-The K3s instance is a **`t3a.large`** (2 vCPU / 8 GiB) on Canonical's official **Ubuntu 24.04**
-AMI, with a **40 GiB encrypted gp3** root volume. Each instance has an IAM instance profile for SSM
-and ECR pulls, and no other AWS permissions.
-
-Five **ECR** repositories hold the images: `sentinel-sre-demo/citizen-service`,
-`.../notification-service`, `.../frontend`, `.../sentinel-ai`, `.../sentinel-gui`. Deployments
-reference images **by git commit SHA, never `latest`** — the running ReplicaSet has to be
-traceable back to a commit, because "was something deployed just before this broke" is a question
-Sentinel answers
-mechanically rather than by asking someone.
-
-Infrastructure is Terraform in [`infra/terraform/`](infra/terraform/). State is local; there is no
-S3 backend.
-
-## K3s architecture
-
-**K3s `v1.31.4+k3s1`, single node, control-plane and worker on the same instance.** K3s is a
-conformant Kubernetes distribution in a single binary, and the API it exposes is the API the
-manifests, `kubectl`, and Sentinel's Kubernetes client all target — so nothing in this repo is
-K3s-specific except which ingress controller is installed.
-
-The ingress controller **is** K3s-specific, in a useful way: K3s bundles **Traefik** and installs
-it by default. The AWS overlay therefore uses Traefik, which also finally resolves a problem this
-project has carried since Phase 8 — local development uses **ingress-nginx**, which
-[was retired by the Kubernetes project](https://www.kubernetes.io/blog/2026/01/29/ingress-nginx-statement/)
-and receives no further security patches. That is acceptable on a laptop cluster and is not
-acceptable on anything reachable from the internet, so the two environments differ here on purpose.
-
-Storage is K3s's **`local-path` provisioner** on the root EBS volume: a PVC becomes a directory on
-the node's disk. This survives pod recreation and instance reboot. It does **not** survive instance
-replacement — a `terraform destroy`/`apply` cycle starts from an empty database. The honest
-description is "durable across the failures Sentinel is meant to handle, not the ones it is not".
-
-Manifests live in a Kustomize base with two overlays:
-
-```text
-k8s/base/            shared manifests, configured for local development
-k8s/overlays/local/  base + the committed demo Secrets  (kind / minikube / Docker Desktop)
-k8s/overlays/aws/    base + Traefik, ECR images by SHA, real Secrets, Sentinel
+```mermaid
+flowchart LR
+    A[Alertmanager webhook] --> B[Normalize and correlate incident]
+    B --> C[Gather evidence]
+    C --> D[Rule-based RCA / optional LLM enrichment]
+    D --> E[Rank candidate actions]
+    E --> F{Deterministic policy}
+    F -->|allowed| G[Typed remediation]
+    G --> H{Recovery validation}
+    H -->|passes| I[Resolved / record outcome]
+    H -->|needs another attempt within bounds| C
+    F -->|no permitted known action| J[Bounded read-only deep investigation]
+    J --> K{Valid typed proposal?}
+    K -->|yes| L[Deep policy check + human authorization]
+    L --> G
+    K -->|no safe fix| M[Escalate with evidence]
+    H -->|budget exhausted| M
 ```
 
-`kubectl apply -k k8s/` still works exactly as it always did for local development. Details, and
-why the manifests had to move into `base/`, are in [`k8s/README.md`](k8s/README.md).
+Repeated alerts are correlated by environment, application, namespace, service, and failure class. They update an existing live incident rather than starting duplicate remediation. A per-deployment lock serializes writes; stale evidence is re-investigated after another incident acts. Terminal incidents, recurrence gaps, and material-evidence checks bound reopening. See the [incident engine notes](docs/incident-engine.md).
 
-## Observability architecture
+Recovery validation checks deployment availability, pod readiness/crash loops, parsed health status, error rate, p95 latency, CPU/memory, and relevant per-pod chaos gauges. A successful patch or HTTP response alone is insufficient. The validator can recognize a substantially recovering error rate while a five-minute metric window still contains pre-fix errors; its report records that distinction.
 
-Sentinel is only as good as what it can see, so the observability stack is a dependency of the
-agent rather than a dashboard for humans:
+## Safety gates
 
-- **Prometheus** scrapes both services via pod annotations (`prometheus.io/scrape`,
-  `prometheus.io/port`, `prometheus.io/path`) — the classic annotation-based pattern, no Prometheus
-  Operator and no `ServiceMonitor` CRDs for two scrape targets.
-- **Grafana Alloy** tails pod logs through the Kubernetes API and ships them to **Loki**. Alloy
-  rather than Promtail because Promtail is deprecated; reading through the API rather than host log
-  files also avoids `hostPath` mounts and the privileges a classic Promtail DaemonSet needs.
-- **Loki** stores structured JSON logs. Every log line carries a `request_id`, which is generated
-  in `citizen-service`'s middleware and propagated to `notification-service`. That is the thread
-  that turns "the 5xx rate is up" into "these specific requests failed, for this reason".
-- **Alertmanager** receives Prometheus alerts and `POST`s them to Sentinel's webhook. This is a
-  push signal: Sentinel does not poll for trouble, it is told.
-- **Grafana** provisions its datasources and one starter dashboard from ConfigMaps, so there is no
-  manual setup step.
-- **Health probes distinguish liveness from readiness meaningfully.** `/readyz` returns HTTP 200
-  with `status: "degraded"` when a downstream dependency is broken but the process is fine. This
-  matters more than it sounds: it is why Sentinel's recovery validation parses the JSON body rather
-  than trusting the status code.
+### Known actions: autonomous only when policy permits
 
-## Sentinel architecture
+| Action | Default confidence requirement | Additional boundary |
+|---|---:|---|
+| Roll back deployment | 0.95 | Requires deployment history, a previous revision, correlation with recent deployment, reversibility, and available recovery validation |
+| Restart deployment | 0.90 | Must pass target, statefulness, rate-limit, and action-specific checks |
+| Scale deployment | 0.90 | Default permitted replica range is 1–3; zero replicas is refused |
+| Reset chaos fault | 0.90 | Requires the configured chaos surface and token |
 
-```text
-  Alertmanager webhook
-        │
-        ▼
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  Evidence gathering (read-only)                                  │
-  │    Prometheus (PromQL) · Loki (LogQL) · Kubernetes pods/events   │
-  │    /readyz JSON · chaos_* gauges · Deployment + ReplicaSet history│
-  └──────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-   ┌─────────┐   structured    ┌──────────┐   ordered    ┌────────┐
-   │   LLM   │ ─ recommendation▶│ Decision │ ─candidates─▶│ Policy │
-   │(optional)│   only          │  Engine  │              │ Engine │
-   └─────────┘                 └──────────┘              └────────┘
-                                                              │ permitted?
-                                                              ▼
-                                                      ┌─────────────┐
-                                                      │ Remediation │
-                                                      │   Engine    │
-                                                      └─────────────┘
-                                                              │ structured params
-                                                              ▼
-                                                    Kubernetes API (RBAC Role)
+The [policy engine](sentinel-ai/app/lifecycle/policy.py) denies by default. The [executor](sentinel-ai/app/lifecycle/remediation.py) requires an allowed verdict and independently rechecks its target.
+
+- Default allowed namespace: `citizen-portal`; deployments: `citizen-service`, `notification-service`, `frontend`.
+- Frozen deny-lists protect `citizen-postgres`, `notification-postgres`, and Kubernetes system namespaces. Stateful targets are also excluded.
+- Defaults: at most **3 actions per incident**, **120 seconds** between actions, **5 lifecycle cycles**, **4 concurrent lifecycles**, and a **1,800-second** run budget checked between cycles.
+- `DRY_RUN` defaults to **`false`** in source. Set **`DRY_RUN=true`** when first connecting a new environment and inspect decisions before enabling writes.
+- Temporary human authorization for a known action may substitute for its confidence requirement; it does **not** bypass target restrictions, cooldowns, caps, or action preconditions.
+
+Confidence scores are internal decision signals, not calibrated probabilities of success. Defaults are configurable; the live guardrail configuration is authoritative.
+
+### Deep investigation: read-only reasoning, human-authorized execution
+
+When the known playbook is exhausted, or an operator selects **Suggest Fix**, Sentinel can perform an iterative evidence investigation. Default limits are **6 turns**, **8 tool calls**, and **90 seconds**, with bounded responses and error limits.
+
+The result must be one of six typed operations:
+
+`SET_ENV_VAR` · `UNSET_ENV_VAR` · `UPDATE_CONTAINER_IMAGE` · `UPDATE_REPLICAS` · `UPDATE_CONTAINER_COMMAND` · `UPDATE_CONTAINER_ARGS`
+
+The target is pinned to the incident. Credential-shaped environment keys are blocked, proposed images must be grounded in deployment evidence/history, and replicas are constrained. Proposals must clear the default **0.97** threshold and deep policy checks, then receive explicit, one-time human authorization. Risk is computed by code rather than accepted from the model.
+
+There is no generic manifest-patch or free-form shell execution interface. Displayed `kubectl` commands are explanatory; execution uses typed client methods. Command/argument changes can still alter application behavior and deserve careful operator review.
+
+<details>
+<summary>Original deep-investigation presentation slide</summary>
+
+![Deep investigation and novel remediation presentation](docs/media/deep-investigation.jpg)
+
+</details>
+
+### Memory and replay
+
+SQLite persists incidents, evidence, policy decisions, authorizations, and action outcomes. Outcome learning applies a bounded success-ratio bias: it can reduce confidence or reorder candidates, but cannot raise confidence above its original value or invent new actions. This is **not model training**.
+
+Replay evaluates stored evidence through the decision/policy pipeline without live investigation or remediation. It supports reviewing “what would Sentinel decide?” without changing the cluster.
+
+## Run locally
+
+Commands below are checked against the uploaded source and are run from the repository root unless stated otherwise. They were not executed against Docker, Kubernetes, or AWS during this documentation rewrite. Bash examples require Bash; on Windows use WSL or Git Bash as appropriate.
+
+### 1. Citizen Portal with Docker Compose
+
+Prerequisites: Docker with Compose support and available ports 3000, 8000, 8001, 5432, and 5433.
+
+```bash
+cp .env.example .env
+# Edit .env: replace database passwords, JWT_SECRET, and CHAOS_ADMIN_TOKEN.
+docker compose up --build
 ```
 
-The layering is the whole security argument, so it is worth being precise about what each layer
-does and does not do.
+| Local address | Purpose |
+|---|---|
+| `http://localhost:3000` | Citizen Portal |
+| `http://localhost:8000/docs` | Citizen API documentation |
+| `http://localhost:8001/docs` | Notification API documentation |
 
-**The LLM analyses evidence and returns a structured recommendation.** An action name, a target, a
-confidence score, and reasoning. It never receives shell access. It never receives `kubectl`. It
-cannot name a target outside the allow-list, because the action name is parsed against a fixed enum
-and the target is checked against a configured list before anything downstream runs — a returned
-string like `restart_deployment; rm -rf /` does not parse to a valid action and is rejected. The
-LLM is also **optional**: with no API key, Sentinel runs fully rule-based, and records
-`llm_used=false` on the incident so that reading the record later is honest about what produced the
-narrative.
+Compose starts the portal, two APIs, and two databases. API startup runs migrations; the citizen service also seeds the catalog. **It does not start Sentinel or the monitoring stack.** Keep `CHAOS_MODE=false` for normal portal use. Browser-facing API URLs are baked in at frontend build time; rebuild after changing `FRONTEND_API_BASE_URL`.
 
-**The Decision Engine turns a hypothesis into an ordered list of candidate actions.** It decides
-what to try and in what order; it does not decide what is permitted. Having the ordering computed
-here is what makes "the next safe action after a failed remediation" a well-defined thing rather
-than an improvisation.
+### 2. Local Kubernetes workload and observability
 
-**The Policy Engine is the gate.** Allow-listed namespace, allow-listed deployment, action-specific
-confidence threshold, per-incident action cap, per-target cooldown, replica bounds, and — for
-rollback — a set of preconditions described below. It also enforces a **frozen deny-list**:
-`citizen-postgres` and `notification-postgres` can never be remediated, and no environment
-variable can change that.
+For a local demo, choose the script matching your installed cluster tooling:
 
-**The Remediation Engine is the only component that calls the Kubernetes API**, and it accepts
-structured parameters (namespace, deployment, target revision) — never a command string.
+```bash
+bash scripts/deploy-kind.sh
+# Alternatives: bash scripts/deploy-minikube.sh
+#               bash scripts/deploy-docker-desktop.sh
+```
 
-**The RBAC Role is the last line, and it matters precisely because the three layers above it are
-ordinary application code that could contain a mistake.** See [Security model](#security-model).
+The scripts build/load application images, apply the local Kustomize overlay, wait for workloads, and print access instructions. The local overlay contains committed demo credentials; keep it confined to local experimentation. These scripts deploy the application and monitoring, **not an external Sentinel control plane**. Follow [`k8s/README.md`](k8s/README.md) for access details and [`docs/sentinel-remote-validation-runbook.md`](docs/sentinel-remote-validation-runbook.md) for connecting Sentinel.
 
-Incident history is kept in SQLite on a node-local volume, which feeds the LEARNING phase and is
-also why Sentinel runs as a single replica (see [Limitations](#limitations)). That same history is
-also what the [Operational learning & incident replay](#operational-learning--incident-replay)
-feedback loop reads from, and what a diagram this size cannot show: when the Policy Engine rejects
-every candidate the Decision Engine offers (or the four actions above are exhausted without a
-validated recovery), Sentinel reaches for one more, narrower tool before it gives up and escalates
-— see [Deep investigation & novel remediation](#deep-investigation--novel-remediation).
+### 3. Configure and run the Sentinel API
 
-## Autonomous remediation
+Use a separate Python 3.12 environment for `sentinel-ai/` and install its pinned dependencies:
 
-Four actions exist. There is no fifth, and adding one means adding an enum member, a Policy Engine
-branch, and possibly an RBAC verb — deliberately not a configuration change.
+```bash
+cd sentinel-ai
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-| Action | Confidence threshold | What it does |
+Create `sentinel-ai/.env` with values appropriate to your environment. [Settings](sentinel-ai/app/core/config.py) and the [AWS environment example](k8s/overlays/aws/secrets/sentinel.env.example) document the supported names. Configure at least:
+
+| Setting | Purpose |
+|---|---|
+| `DRY_RUN=true` | Inspect proposed operations before enabling mutations |
+| `SENTINEL_DB_PATH` | Writable SQLite path; use `./sentinel.db` for a local run |
+| `SENTINEL_ADMIN_USERNAME`, `SENTINEL_ADMIN_PASSWORD`, `SENTINEL_JWT_SECRET` | Operator login and persistent session signing |
+| `KUBERNETES_MODE` | `in_cluster`, `kubeconfig`, or `remote` |
+| `KUBERNETES_KUBECONFIG_B64` | Base64 kubeconfig for `kubeconfig` mode |
+| `KUBERNETES_API_SERVER`, `KUBERNETES_TOKEN`, `KUBERNETES_CA_CERT_B64` | Remote-mode connection and trust configuration |
+| `PROMETHEUS_URL`, `LOKI_URL`, `ALERTMANAGER_URL` | Addresses reachable from the Sentinel process |
+| `CITIZEN_SERVICE_URL`, `NOTIFICATION_SERVICE_URL`, `FRONTEND_URL` | Reachable application addresses for health/evidence checks |
+| `CHAOS_ADMIN_TOKEN` | Must match the services when using chaos reset |
+
+Local cluster DNS names such as `http://prometheus:9090` do not resolve automatically from an external process. Configure reachable endpoints and namespace-scoped Kubernetes credentials using the remote runbook.
+
+Optional integrations: `LLM_PROVIDER=openai|gemini|groq` with the corresponding API key/model settings; `GITHUB_TOKEN` + `GITHUB_REPOSITORY`; `SLACK_WEBHOOK_URL`. Without a reasoning-provider key, the standard incident path uses rule-based RCA. Deep LLM investigation requires a configured reasoner.
+
+```bash
+# Still inside sentinel-ai/, with the environment configured:
+uvicorn app.main:app --host 127.0.0.1 --port 8080
+```
+
+`GET /healthz` checks process liveness. `GET /readyz` checks the store and Kubernetes connection and reports the live execution mode. A running API alone does not prove connector readiness.
+
+### 4. Start the operator GUI
+
+In another terminal, use the repository's frontend toolchain (CI specifies Node 20; installed packages must also satisfy their own engine requirements):
+
+```bash
+cd sentinel-gui
+cp .env.example .env
+npm ci
+npm run dev
+```
+
+The example points the browser at `http://localhost:8080`; Vite serves the GUI on `http://localhost:5173`. Sign in with the Sentinel admin credentials configured above. The deployed nginx build instead uses same-origin API calls. Citizen Portal and Sentinel operator logins are separate identity systems.
+
+Configure Alertmanager to deliver to **`POST /api/alerts/webhook`** on a Sentinel address reachable from the cluster. Starting the GUI does not configure alert delivery. See the remote validation runbook for end-to-end wiring.
+
+## AWS deployment and CI/CD
+
+The implementation provisions a single-node K3s workload instance and, with `enable_remote_sentinel=true` (the current variable default), a separate Sentinel instance. Current Terraform defaults include region `eu-central-1`, workload type `m7i-flex.large`, Sentinel type `t3.small`, and a 40 GiB workload root volume. Override these for your account; older examples contain different defaults.
+
+Kubernetes API, telemetry NodePorts, and application chaos NodePorts are restricted to the Sentinel security group. Alertmanager reaches Sentinel's port 8080 from the workload security group. The portal and GUI expose HTTP port 80 according to `allowed_http_cidrs`. SSM provides administration without opening SSH.
+
+Deployment references:
+
+1. [`infra/terraform/terraform.tfvars.example`](infra/terraform/terraform.tfvars.example) — account/repository-specific configuration.
+2. [`docs/aws-deployment.md`](docs/aws-deployment.md) — infrastructure and initial workload deployment.
+3. [`docs/sentinel-remote-validation-runbook.md`](docs/sentinel-remote-validation-runbook.md) — remote API access, RBAC, token/CA parameters, and validation.
+4. [`scripts/generate-aws-secrets.sh`](scripts/generate-aws-secrets.sh) and [`scripts/deploy-aws.sh`](scripts/deploy-aws.sh) — first workload deployment on the EC2 node.
+
+**Read the [source review notes](docs/README-SOURCE-REVIEW.md) before following historical runbooks.** Their old “never deployed” status text, in-cluster topology descriptions, and some defaults no longer agree with the supplied demonstration or current executable configuration. Do not apply the AWS overlay directly with unresolved image, public-IP, or Sentinel-upstream placeholders.
+
+```mermaid
+flowchart LR
+    PR[PR to main / push to main] --> tests[Three Python test suites]
+    PR --> ui[Both frontends: lint + build]
+    PR --> manifests[YAML / references / schemas / secret-file checks]
+    tests --> gate{Checks pass + push to main?}
+    ui --> gate
+    manifests --> gate
+    gate -->|yes| oidc[GitHub OIDC: assume AWS role]
+    oidc --> ecr[Build five images / push to ECR]
+    ecr --> workload[SSM: sync scripts and apply workload manifests]
+    ecr --> external[SSM: pull latest Sentinel images / restart services]
+    workload --> k3s[K3s: SHA-tagged workload images]
+    external --> ec2[External Sentinel EC2]
+```
+
+The executable [GitHub Actions workflow](.github/workflows/ci-cd.yml) is authoritative:
+
+- PRs to `main` and pushes to `main` run backend tests, both frontend checks, and Kubernetes manifest validation. PRs do not deploy.
+- Successful pushes build **five images**: `citizen-service`, `notification-service`, `frontend`, `sentinel-ai`, and `sentinel-gui`, tagged with the commit SHA and `latest`.
+- AWS authentication uses GitHub OIDC rather than stored AWS access keys. Deployment runs through SSM; GitHub runners do not need a kubeconfig or direct Kubernetes API access.
+- The K3s job refreshes deployment scripts, syncs changed manifests, discovers the external Sentinel private IP, and applies rendered manifests even for code-only deployments. Workload image tags use the commit SHA.
+- The external Sentinel job currently pulls **`latest`** from the hardcoded `sentinel-sre-demo` ECR prefix, restarts both systemd services, and checks that they are active. This does not establish application readiness or SHA-pinned deployment.
+- Workload deployment deliberately does **not** wait for healthy rollout: bad releases are part of the remediation demonstration.
+- Manual `workflow_dispatch` offers `connectivity-only` (OIDC/ECR/SSM check) or `full-dry-run` (also builds/pushes `manual-test-<run_id>` images). Neither manual mode deploys.
+
+Configure the `aws-demo` GitHub Environment and the workflow's required values: variables `AWS_REGION`, `ECR_REPOSITORY_PREFIX`; secrets `AWS_ROLE_TO_ASSUME`, `EC2_INSTANCE_ID`, `SENTINEL_EC2_INSTANCE_ID`. Repository/branch/environment trust must match the Terraform OIDC policy. Environment protection rules depend on repository settings; their presence is not proven by the YAML alone.
+
+<details>
+<summary>Original CI/CD presentation slide</summary>
+
+![CI/CD presentation](docs/media/cicd.jpg)
+
+The slide summarizes delivery intent. In the current workflow, the K3s job always applies rendered manifests, and the external Sentinel job uses `latest` and systemd active-state checks.
+
+</details>
+
+## Exercise the system
+
+The [smoke test](scripts/smoke-test.sh) registers a test citizen, logs in, browses services, submits a request, and checks downstream notification behavior:
+
+```bash
+bash scripts/smoke-test.sh http://localhost:8000
+```
+
+For a configured Kubernetes **demo environment**, the incident harness supports:
+
+| Application faults | Platform / release faults |
+|---|---|
+| `db-outage`, `http-errors`, `latency`, `notification-degradation`, `high-cpu`, `memory-leak` | `full-outage`, `crashloop`, `bad-deployment` |
+
+It requires a valid `kubectl` context, monitoring, chaos-enabled services, and the matching token in `CHAOS_ADMIN_TOKEN`.
+
+```bash
+# Injects an actual fault into the selected demo cluster:
+bash scripts/incident-scenarios.sh http-errors citizen-portal
+```
+
+Watch the GUI for evidence collection, candidate selection, the policy verdict, execution, and recovery validation. A correct result can be escalation: database deployments remain watch-only. The `bad-deployment` scenario intentionally leaves a broken release for Sentinel to handle; inspect that scenario's recovery options before running it. A “scenario exists” claim is not a claim that every scenario has been demonstrated successfully.
+
+### Verification commands
+
+Run each Python suite from its service directory after installing that service's `requirements.txt` in a separate environment:
+
+```bash
+python -m pytest -v
+```
+
+Citizen tests require `DATABASE_PASSWORD`, `JWT_SECRET`, and `CHAOS_ADMIN_TOKEN`; notification tests require `DATABASE_PASSWORD` and `CHAOS_ADMIN_TOKEN`. CI uses nonempty test values and SQLite-backed fixtures. Sentinel tests inject fake connectors for the critical decision, policy, authorization, remediation, and recovery paths.
+
+For each frontend, from `frontend/` or `sentinel-gui/`:
+
+```bash
+npm ci
+npm run lint
+npm run build
+```
+
+No current test-pass count, CI badge, coverage percentage, or fresh AWS validation is asserted here.
+
+## Implemented scope and roadmap
+
+| Area | Implemented in this source | Remaining work / boundary |
 |---|---|---|
-| `restart_deployment` | ≥ 0.90 | Patches the pod template annotation — what `kubectl rollout restart` does. No pod deletion, so no `delete` verb is needed anywhere. |
-| `rollback_deployment` | ≥ 0.95 | Patches the pod template back to a previous ReplicaSet's template. |
-| `scale_deployment` | ≥ 0.90 | Patches replicas, within `MIN_REPLICAS=1` and `MAX_REPLICAS=3`. Never 0 — scaling to zero is an outage, not a fix. |
-| `reset_chaos_fault` | ≥ 0.90 | `POST /api/chaos/reset` against the affected service, when the diagnosis is that the "incident" is a deliberately injected fault. |
+| Kubernetes response | Scoped restart/rollback/scale, chaos reset, typed deep proposals | Broader autonomous actions require new explicit policies and executors |
+| Environment support | Persisted environment records, connection testing, namespace discovery | **One active environment per process**; registration replaces the active context, with no multi-environment alert routing |
+| Investigation | Rules, optional provider enrichment, bounded read-only deep investigation | No standalone trained Sentinel model |
+| Learning | Recorded outcomes and conservative candidate bias | No fine-tuning or self-expanding permissions |
+| AWS | Terraform deployment, ECR/SSM/OIDC delivery; EC2/CloudWatch client exists | AWS client is not wired into incident evidence collection |
+| Concurrency | Async incident tasks and per-deployment locking | In-process leases and SQLite assume one Sentinel replica; distributed coordination is not implemented |
+| Deployment | AWS demo with external control plane | Pin external Sentinel deploys to SHA and verify API readiness; reconcile hardcoded ECR prefix and older runbooks |
+| Production operations | Demo persistence, scoped networking, operator authentication | Multi-AZ/HA, managed database backups and restore tests, TLS, remote Terraform state, credential rotation, and hardened ingress remain work |
 
-Rollback carries the highest bar because it is the action with the largest effect: it changes what
-code is running. The others are cheap and self-correcting by comparison.
+The demonstration uses a single workload node, local-disk PostgreSQL, and HTTP entrypoints. It establishes a working prototype, not production availability, security certification, or suitability for real citizen data.
 
-A confidence number produced partly by a language model is a heuristic, and treating it as a
-safety mechanism on its own would be a mistake. The parts that actually make an action safe are
-the allow-list, the bounds, and the preconditions — the threshold just stops Sentinel acting on a
-weak hypothesis.
-
-Recovery validation runs after **every** action, and an incident is only marked RESOLVED once it
-passes. It checks deployment availability, pod readiness, HTTP health (parsing the JSON `status`
-field, because `/readyz` returns 200 with `status: "degraded"` when a dependency is broken — a
-validator reading only the status code would declare a still-broken service recovered), the 5xx
-error rate, p95 latency, CPU, memory, and the `chaos_*` gauges.
-
-If validation fails, Sentinel re-investigates, takes the next candidate off the list, executes it,
-and re-validates. When the candidates are exhausted or the per-incident action cap is reached, it
-escalates. An agent that keeps inventing new things to try against a service that is not
-recovering is strictly worse than one that stops and pages a human.
-
-## Deep investigation & novel remediation
-
-The four actions above are Sentinel's entire *autonomous* vocabulary — bounded, rule-vetted, and
-executed with no human in the loop. Deep Investigation
-([`lifecycle/deep_investigation.py`](sentinel-ai/app/lifecycle/deep_investigation.py)) is a
-separate, narrower capability for the situation where the known playbook isn't enough: either
-Sentinel already tried and exhausted it (no candidate action existed, every candidate was denied by
-policy, the per-incident action cap was reached, or the lifecycle exhausted its retry cycles
-without a validated recovery) and is about to escalate to a human anyway, **or** an SRE looking at
-an already-escalated incident asks Sentinel to take a closer look before doing anything themselves.
-Either way, Sentinel's configured LLM investigates and returns one bounded, typed,
-**human-authorizable** proposal — never something it just goes and does. Both entry points run the
-exact same investigation and the exact same policy gate; they only differ in how the run started
-and whether it can also happen automatically the moment known remediation runs out.
-
-**Two ways in, one investigation.** `DeepInvestigationTrigger.AUTO` is the automatic path described
-above, fired from the lifecycle itself. `DeepInvestigationTrigger.SUGGEST_FIX` is a manual one: any
-authenticated admin can call `POST /api/incidents/{id}/suggest-fix` on an incident that already has
-evidence and a hypothesis, whether or not it has escalated — this is the explicit,
-user-invokable "Suggest Fix" the GUI's Deep Investigation panel exposes as its own button, for an
-SRE who wants a second opinion without waiting for the known ladder to fail first. Both triggers
-call the same `investigate_deep(...)`, are gated by the same shared
-`deep_investigation_max_per_incident` budget and the same single-writer incident lease no other
-lifecycle action can run alongside, and produce proposals that go through the identical
-`evaluate_deep_proposal` policy gate below — `trigger` is recorded purely for audit and the GUI, and
-never changes what is allowed.
-
-**The investigation itself is now iterative, not a single guess.** Rather than asking the model for
-one shot in the dark, `investigate_deep` runs a bounded read-only tool-use loop: on each turn the
-model returns exactly one JSON object — `call_tool` (inspect something and get real data back),
-`propose` (submit a typed remediation), or `no_safe_fix` (say plainly that nothing safe occurred to
-it) — over the narrow `Reasoner.complete_json` interface. Available tools
-(`lifecycle/deep_investigation_tools.py`) are all read-only: `inspect_pods`, `inspect_deployment`,
-`inspect_replicasets`, `inspect_previous_revision` (backed by the *same*
-`find_previous_revision` logic the Rollback executor itself uses — not a re-derived
-approximation), `inspect_events`, `inspect_service_health`, `get_container_logs`, `query_metric`,
-`query_logs`. There is no write-capable tool in this list; the loop can look, never touch. The loop
-is bounded on every axis that matters — `deep_investigation_max_iterations` (6),
-`deep_investigation_max_tool_calls` (8), `deep_investigation_max_seconds` (90), and
-`deep_investigation_max_consecutive_malformed_turns` (2) — so a confused or malfunctioning model
-runs out of turns and produces `no_safe_fix` rather than looping indefinitely or being coaxed into
-eventually proposing something unsafe. Every turn — the model's stated hypothesis, which tool it
-called, whether that tool call succeeded, and a truncated summary of what it returned — is recorded
-into an append-only `DeepInvestigationTrace` (`iterations`, `tool_call_count`, `outcome`,
-`reason`), attached to the incident and rendered in the GUI, so "why did it propose this" or "why
-did it give up" is always answerable from the incident itself, not from application logs.
-
-**What the model can propose is a closed, typed DSL of six operations**
-(`NovelActionType`): `SET_ENV_VAR` / `UNSET_ENV_VAR` (the original two), plus
-`UPDATE_CONTAINER_IMAGE`, `UPDATE_REPLICAS`, `UPDATE_CONTAINER_COMMAND`, and
-`UPDATE_CONTAINER_ARGS`. Each maps to exactly one narrowly-scoped `KubernetesClient` write method —
-never a generic "patch this manifest" escape hatch. Deliberately excluded, on the same boundary
-rather than for lack of time: a generic `PATCH_DEPLOYMENT_FIELD` (the arbitrary-patch hatch this
-codebase refuses to build), anything touching a Service's selectors or ports (traffic routing is
-out of scope for an AI-originated change), and anything that could point an env var at a
-ConfigMap/Secret key (one hop from "read secrets," and visually indistinguishable from a secret
-mount to most reviewers). Every member goes through the same three independent gates the original
-two did — construction-time validation in `deep_investigation.py`, a Policy Engine precondition in
-`policy.py`, and an execution-time re-check in `remediation.py` — and `RemediationEngine.execute_deep`
-dispatches over the closed enum with an explicit `if/elif` chain ending in an unconditional refusal;
-there is no default branch, no `getattr`-based dispatch, and no way to reach a `KubernetesClient`
-write the enum doesn't name:
-
-- The target namespace and deployment are **never taken from the model** — they are hard-pinned to
-  the incident's own target, exactly as recorded before the LLM was ever called.
-- The named container must actually exist in the evidence already gathered for this incident.
-- The environment variable **key** is checked against the same
-  `SENSITIVE_ENV_KEY_MARKERS` list (`password`, `secret`, `token`, `key`, `credential`, `private`,
-  `auth`, matched case-insensitively as a substring) that
-  [`kubernetes_client.py`](sentinel-ai/app/clients/kubernetes_client.py) already redacts by when
-  reading a Deployment's env — a proposal naming a credential-shaped key is refused at
-  construction time, before it is ever stored or shown to anyone.
-- **A proposed container image must be evidence-grounded, never trusted from the model's say-so.**
-  `UPDATE_CONTAINER_IMAGE` is only accepted when the exact image string appears somewhere the model
-  actually observed for *this* Deployment — its current image, its `replicaset_history` evidence, or
-  the result of a tool call this same investigation made (e.g. `inspect_previous_revision`
-  surfacing the last known-good tag). An image that merely looks plausible, well-formed, and
-  confidently argued for — but was never seen anywhere in this incident's own evidence or tool
-  output — is refused outright, regardless of confidence. This is the direct generalisation of
-  Rollback's own logic (see below) into the novel-remediation path, and is covered by a dedicated
-  regression test (`tests/test_deep_investigation_loop.py`) built on this repo's own
-  `citizen-service`/`Init:InvalidImageName` incident shape: a placeholder image one revision ahead
-  of a real one.
-- **A proposed replica count is re-clamped, never taken as given.** `UPDATE_REPLICAS` is refused
-  outright with no replica count, refused if it asks to scale to zero (an outage, not a fix), and
-  otherwise clamped into the same `[min_replicas, max_replicas]` band (`1`–`3`) the Scale action
-  already respects — both in the Policy Engine's precondition and again, independently, as a
-  defense-in-depth re-clamp in the executor itself.
-- `command`/`args` overrides go through Kubernetes' own merge semantics for those fields (a whole-
-  array replace, not a per-item merge) via the same `_assert_valid_argv` bounds
-  (`MAX_ARGV_ITEMS`, `MAX_ARGV_ITEM_LEN`) already enforced elsewhere in `kubernetes_client.py`.
-- Confidence is clamped to `[0, 1]`, and risk is computed independently by Sentinel
-  (`_assess_deep_risk`) — never "low", and never taken from the model — because a proposal that
-  reached this path was, by definition, never vetted by the Policy Engine's rules the way the four
-  known actions are.
-- Anything that fails any check — malformed JSON, an unparseable action name, an out-of-range
-  field, a missing required prose field, a sensitive-looking key, an ungrounded image, an
-  out-of-band replica count — is rejected outright, and a run that never finds anything safe to
-  propose returns `no_safe_fix` rather than inventing something. `apply_llm_response` never patches
-  a bad response into something usable; it returns nothing, and Sentinel escalates exactly as if the
-  LLM had not answered at all.
-
-**A confidence-clearing proposal is still not an authorization to act.** The Policy Engine's
-`evaluate_deep_proposal` re-derives eligibility from scratch — the proposal's target must match the
-incident's own target exactly (`DenialReason.BLAST_RADIUS_EXCEEDS_INCIDENT` otherwise), the
-deployment must not be on the frozen deny-list, the per-incident action cap is shared with the four
-known actions, and confidence must clear **0.97** — deliberately higher than every known-action
-threshold, including rollback's 0.95, because this path was never rule-vetted. The environment-key
-check and the replicas-band check are both re-run here too, independently of their
-construction-time checks, under their own `DenialReason`s. Crucially, clearing every one of these
-checks still only produces `allowed=True`, meaning *eligible for a human to authorize* — unlike the
-four known actions, there is no confidence-override path here, at any confidence.
-
-**Execution requires an explicit, one-time SRE authorization — and a proposal can also be
-dismissed.** An eligible proposal is surfaced on the incident (`GET /api/incidents/{id}/deep-proposals`,
-and in `sentinel-gui`'s Deep Investigation panel) and sits in `status: suggested` until an
-authenticated admin either calls `POST /api/incidents/{id}/deep-proposals/{id}/authorize` — which
-reuses the same short-lived temporary-authorization mechanism and single-writer incident lease the
-four known actions' manual authorization already uses, no separate, less-audited path — or calls
-`POST /api/incidents/{id}/deep-proposals/{id}/reject`, a synchronous, cluster-inert status change
-(`status: rejected`, no lease, no background task, nothing touches the cluster) for an SRE who's
-looked at the proposal and doesn't want it. Authorizing runs `RemediationEngine.execute_deep()`,
-which re-checks the allow-list, the deny-list, the sensitive-key rule, the image-evidence grounding,
-and the replicas band **a third time**, independently of both `apply_llm_response` and the Policy
-Engine, as the last gate before the one narrowly-scoped Kubernetes write the proposed action names —
-there remains no generic write method anywhere in `KubernetesClient`. After execution, the incident
-re-enters RECOVERY VALIDATION exactly like any other action; a failure is recorded on the proposal
-and the incident continues to escalate, it does not retry the same proposal automatically. Note
-that authorizing a Suggest-Fix-originated proposal does not require the incident to be currently
-escalated — only automatic Deep Investigation implies an incident is already headed for escalation;
-a Suggest Fix proposal can legitimately sit on an incident that's still open.
-
-**The proposal's `rendered_command`** (a display-only `kubectl ...` string an SRE reads before
-deciding — generalised across all six action types) is never executed by Sentinel — it exists only
-so a human can see, in familiar terms, what authorizing this proposal would do. Every field in it is
-`shlex.quote()`-d, so a model-proposed value containing shell metacharacters (`x; rm -rf /`,
-`` `curl evil` ``) renders as an inert quoted literal rather than something a shell would act on if
-copy-pasted into a real terminal.
-
-**This is off by default in the sense that matters:** with no LLM configured (no API key), or with
-its provider's circuit breaker open from recent failures, `investigate_deep` returns nothing and
-Sentinel escalates exactly as it did before this feature existed —
-`deep_investigation_enabled=true` is the default, but the feature is inert without a reasoner.
-Deep Investigation is bounded to `deep_investigation_max_per_incident` (1 by default) *investigation
-runs* per incident, shared across both triggers and independent of the lifecycle's own retry
-cycles, so a pathological incident — or an SRE repeatedly mashing "Suggest fix" — cannot keep
-spending new LLM calls indefinitely.
-
-## Rollback capability
-
-**Rollback requires no human approval.** Sentinel decides that a deployment caused an incident and
-rolls it back, unattended. This is the intended behaviour and the reason the project exists; it is
-not a mode that has to be enabled.
-
-What makes that bounded rather than reckless is a set of conditions that all have to hold, none of
-which the language model can influence:
-
-- The target deployment is on the allow-list (`citizen-service`, `notification-service`,
-  `frontend`) and not on the frozen deny-list.
-- The namespace is on the allow-list (`citizen-portal`).
-- Confidence is at least 0.95.
-- A **previous revision actually exists** to roll back to.
-- **Deployment history exists** — the ReplicaSets carrying the revision annotations are present.
-  This is why the AWS overlay sets `revisionHistoryLimit` explicitly and why CI deploys by
-  `kubectl set image`, which produces a clean new ReplicaSet.
-- **A recent deployment correlates with the incident onset**, within a configured window
-  (30 minutes by default). Without this, every incident gets blamed on the last deploy.
-- **The rollback is reversible** — rolling forward again is possible.
-- **Recovery validation is available for the target.** If Sentinel cannot verify that the rollback
-  worked, it does not perform it. A target with no HTTP surface to probe is treated as
-  "validation unavailable", and rollback is refused.
-
-If any of these fails, the Policy Engine rejects the action and the Decision Engine's next
-candidate is tried — or, if none remains, the incident escalates. The RBAC Role independently
-bounds the damage: even a bug in all of the above cannot let Sentinel roll back something outside
-its namespace, delete anything, or exec into a container.
-
-**Audited: rollback target selection does not blindly trust "the previous revision."**
-`find_previous_revision` (`kubernetes_client.py`) — the same function both the autonomous Rollback
-plan (via `correlation._find_valid_rollback_candidate`) and Deep Investigation's
-`inspect_previous_revision` tool call into — does not return `numbered[1]` (plain "one revision
-back," equivalent to `kubectl rollout undo` with no `--to-revision`). It returns the newest revision
-*strictly older than the current one whose images are not known-invalid*, walking back further if
-it has to. This is a deliberate guard against exactly the production bug this engagement started
-from: a placeholder-image ReplicaSet sitting one revision back from the one that broke is "the
-previous revision" in name only, and rolling back to it would re-trigger the same
-`Init:InvalidImageName` failure rather than fix it. A candidate with no `images_valid` key at all
-(older evidence, a hand-built fixture) is treated as valid, so this rule can only ever make Sentinel
-*skip* a target it previously would have used, never reject one it used to accept — and when
-nothing further back is safe either, it returns `None`, which the Policy Engine turns into a hard
-denial rather than letting the Remediation Engine improvise. This exact scenario — a placeholder
-revision one step behind a real one — is exercised end-to-end by
-`tests/test_deep_investigation_loop.py`.
-
-`DRY_RUN=true` runs the entire lifecycle — detect, investigate, correlate, decide, policy-check,
-validate — and logs the action it *would* have taken without touching the cluster. That is the
-honest way to demonstrate Sentinel to someone not yet comfortable with it acting unattended, and
-it is not the default.
-
-## The incident lifecycle
+## Repository map
 
 ```text
-DETECTION  →  INVESTIGATION  →  CORRELATION  →  ROOT CAUSE ANALYSIS
-           →  REMEDIATION DECISION  →  POLICY CHECK  →  AUTONOMOUS EXECUTION
-           →  RECOVERY VALIDATION  →  DOCUMENTATION  →  NOTIFICATION  →  LEARNING
+citizen-service/       Citizen API, migrations, seed data, tests
+notification-service/ Notification API, independent migrations and tests
+frontend/             Citizen Portal React application
+sentinel-ai/          Incident engine, connectors, policy, persistence, tests
+sentinel-gui/         Operator console and nginx API proxy
+k8s/base/             Shared application and monitoring manifests
+k8s/overlays/         Local and AWS configurations
+infra/terraform/      AWS infrastructure and bootstrap templates
+scripts/              Deploy helpers, smoke test, incident harness
+docs/                 Runbooks, engine documentation, visual evidence
+.github/workflows/    CI, image publishing, and SSM deployments
 ```
 
-1. **DETECTION** — an Alertmanager webhook opens an incident. A repeat firing within the dedup
-   window joins the existing incident rather than opening a second one, so Alertmanager's
-   `repeat_interval` does not produce a storm.
-2. **INVESTIGATION** — PromQL for the actual shape of the metric (not just the alert's boolean),
-   LogQL for `request_id`-correlated log lines in the same window, Kubernetes pod status and
-   Events for the things metrics never show: `CrashLoopBackOff`, `OOMKilled`, `FailedScheduling`,
-   image pull errors.
-3. **CORRELATION** — tie the signals to each other and to recent Deployment revisions. This is
-   where "a deploy landed four minutes before the error rate moved" becomes a fact rather than a
-   hunch.
-4. **ROOT CAUSE ANALYSIS** — a hypothesis with a confidence score. Rule-based, optionally enriched
-   by the LLM.
-5. **REMEDIATION DECISION** — an ordered list of candidate actions derived from the root cause.
-6. **POLICY CHECK** — allow-lists, thresholds, bounds, caps, cooldowns, preconditions.
-7. **AUTONOMOUS EXECUTION** — the Remediation Engine performs the action and emits a Kubernetes
-   Event, so the action is visible in `kubectl get events` alongside everything else that happened.
-8. **RECOVERY VALIDATION** — settle, then poll the full check set until it passes or times out.
-9. **DOCUMENTATION** — a structured incident record: timeline, evidence, hypothesis, actions taken,
-   validation result. Optionally a GitHub issue and a postmortem.
-10. **NOTIFICATION** — Slack and/or GitHub, both optional and both no-ops when unconfigured.
-11. **LEARNING** — the incident is written to the store so patterns across incidents are visible,
-    not just the most recent one.
+Explore the [visual evidence guide](docs/README-EVIDENCE.md), [source review notes](docs/README-SOURCE-REVIEW.md), [integration notes](docs/sentinel-integration.md), and [development history](Phases.md) for detail. Historical reports describe earlier checkpoints; current executable source and the scope table above define this README's claims.
 
-On a failed remediation the loop re-enters at INVESTIGATION. On exhaustion — no candidate action,
-every candidate denied, the action cap reached, or the retry cycles exhausted without a validated
-recovery — it escalates, and immediately before that escalation Sentinel also runs [Deep
-investigation](#deep-investigation--novel-remediation) once, to see whether a bounded, typed,
-human-authorizable proposal can be attached to it.
-
-**Surviving a restart mid-lifecycle.** Sentinel runs as a single replica (see
-[Limitations](#limitations)), so a process restart while an incident is `OPEN` or `INVESTIGATING`
-is a real failure mode, not a hypothetical one — every prior phase of this project simply left such
-an incident stuck in that status forever, with no lifecycle task left to move it. On startup,
-`IncidentManager.recover_interrupted()` reconciles every incident still in an active status against
-what the previous process actually managed to do: one with **no remediation action yet executed**
-is resumed from where it left off, **exactly once** — the resumption is recorded on the incident's
-own timeline, so a Sentinel that keeps crash-looping cannot resume the same incident forever. Any
-other in-flight incident — one where an action had already been executed, or one already resumed
-once before — is closed as `ESCALATED` with `escalation_reason: interrupted_by_restart`, explicitly
-because Sentinel will not blindly re-attempt or re-validate an action a human has not confirmed the
-current state of. A `POST`/`PUT` correlating with an already-`ESCALATED` incident is similarly rate
-limited: automatic re-investigation only happens for a reason in `AUTO_RECONSIDERABLE_REASONS`, at
-most `max_incident_reopens` times (3 by default) per incident, and only after
-`escalated_reconsider_min_interval_seconds` has passed since the last one — past that, only a human
-re-opening it manually tries again.
-
-## A worked example incident
-
-The `bad-deployment` scenario, end to end. This is the case the rollback path exists for.
-
-**t+0 — a healthy baseline.** `citizen-service` v1 is running. Error rate is near zero, p95 latency
-is well inside its threshold, `/readyz` reports `status: "ok"`.
-
-**t+1m — v2 is deployed.** CI pushes a new image by commit SHA and `sentinel-deploy.sh` sets it on
-the Deployment. Kubernetes creates a new ReplicaSet; the old one stays, holding v1's exact pod
-template — and therefore v1's exact image and git SHA.
-
-**t+3m — errors rise.** The new revision returns 5xx on a significant fraction of requests. The
-`http_requests_total{status=~"5.."}` rate climbs. `/readyz` still returns 200, because the process
-is alive and its database is reachable — nothing here is a liveness failure, which is exactly why
-Kubernetes will not fix this on its own.
-
-**t+5m — DETECTION.** `HighHTTPErrorRate` reaches `firing` after its `for:` window and Alertmanager
-`POST`s to Sentinel's webhook. Sentinel opens an incident.
-
-**INVESTIGATION.** Sentinel pulls the 5xx rate and latency series over the alert window, pulls
-`ERROR`-level log lines for `citizen-service` from Loki for the same window, reads pod status and
-recent Events, and reads the `chaos_*` gauges.
-
-**CORRELATION.** Two things line up. First, the `chaos_*` gauges are all at their resting values —
-this is not a deliberately injected fault, so `reset_chaos_fault` is not the answer. Second, the
-Deployment's ReplicaSet history shows a new revision created roughly two minutes before the error
-rate moved, inside the 30-minute correlation window. The onset follows the deploy.
-
-**ROOT CAUSE ANALYSIS.** Hypothesis: the current revision is faulty. Not a resource problem — CPU
-and memory are normal. Not a dependency problem — the database is reachable and
-`notification-service` is healthy. Confidence is high, because the correlation is a
-strong signal and the alternatives have been actively ruled out rather than merely not considered.
-
-**REMEDIATION DECISION.** The Decision Engine's ordered candidates put `rollback_deployment` first.
-A restart would not help: the new code would simply start again and fail again. Scaling would not
-help either — more replicas of broken code is more broken.
-
-**POLICY CHECK.** `citizen-service` is allow-listed and not on the frozen deny-list.
-`citizen-portal` is allow-listed. Confidence clears 0.95. A previous revision exists. Deployment
-history exists. A recent deploy correlates. The rollback is reversible. Recovery validation is
-available, because `citizen-service` has an HTTP surface to probe. Every precondition holds, so the
-action is permitted.
-
-**AUTONOMOUS EXECUTION.** Sentinel patches the Deployment's pod template back to the previous
-ReplicaSet's template. No human is asked. A Kubernetes Event is emitted recording what it did and
-why.
-
-**RECOVERY VALIDATION.** Sentinel waits for the rollout to settle, then polls: the Deployment
-reports its full replica count available, pods are ready, `/readyz` returns `status: "ok"` (parsed
-from the body, not inferred from the 200), the 5xx rate is back under threshold, p95 latency is
-under threshold, CPU and memory are normal, and the `chaos_*` gauges are still at rest. Validation
-passes. The incident moves to RESOLVED.
-
-**DOCUMENTATION and NOTIFICATION.** A structured incident record is written with the timeline, the
-evidence, the hypothesis, the action, and the validation result — and, if configured, a GitHub
-issue and a Slack message. Sentinel may *propose* a fix in the issue. It does not modify
-application code and does not merge anything.
-
-**LEARNING.** The incident is persisted, so a second bad deployment on the same service is a
-recognised pattern rather than a fresh mystery.
-
-**And the counterexample worth stating.** Had this been a `db-outage` instead, correlation would
-have pointed at `citizen-postgres` — which is on the frozen deny-list. Sentinel would have
-escalated to a human with its full diagnosis attached and taken no action at all. That is the
-correct answer, not a gap in coverage.
-
-## Operational learning & incident replay
-
-Every incident has always been persisted to SQLite once it closes (the LEARNING phase in [The
-incident lifecycle](#the-incident-lifecycle)). On its own, that is auditing, not learning — a
-record that nothing later reads back changes nothing about what Sentinel decides next time. Two
-mechanisms now close that loop, both bounded and both dampening-only: neither can ever make
-Sentinel *more* confident than its evidence and rules already say, only less.
-
-**Aggregated learning, by root cause**
-([`lifecycle/learning.py`](sentinel-ai/app/lifecycle/learning.py)). For the current incident's
-root cause, Sentinel looks at how often each candidate action actually resolved *past* incidents
-with that same root cause. With at least `MIN_SAMPLES_FOR_BIAS` (3) prior attempts of an action,
-its historical success rate maps to a multiplier between `MAX_PENALTY_MULTIPLIER` (0.85) and `1.0`
-— a perfect track record leaves confidence untouched, a poor one pulls it down, and an action with
-too little history is left neutral (multiplier `1.0`) rather than guessed at.
-
-**Operational Memory, by incident similarity**
-([`lifecycle/memory.py`](sentinel-ai/app/lifecycle/memory.py)). Separately, Sentinel finds past
-incidents whose *evidence signature* resembles this one (not just the same root cause label) and
-weights each by how similar it actually was. With at least `MIN_SIMILAR_SAMPLES_FOR_BIAS` (2)
-weighted samples for a candidate action, the same shape of calculation produces a second
-multiplier, floored at `MEMORY_MAX_PENALTY_MULTIPLIER` (0.92) — deliberately a gentler ceiling than
-aggregated learning's, because a handful of similar-but-not-identical incidents is a noisier signal
-than a root cause's whole history and should be trusted proportionally less.
-
-**The two are combined multiplicatively** (`learning.merge_bias`), a missing action in either
-source treated as neutral (`1.0`), and the *combined* bias — never either alone — is what the
-Decision Engine actually applies to candidate ordering and confidence. The product of two
-multipliers each already bounded to ≤1.0 is itself always ≤1.0: this can only ever make Sentinel
-more cautious about a candidate with a poor track record, never more willing to try one that
-weak evidence alone would not already support. Every incident's timeline records all three values —
-the aggregated bias, the memory bias, and the combined result — so which of the two, if either,
-affected a given decision is always auditable after the fact, not just asserted.
-
-`tests/test_learning_integration.py` proves this is real, not just a unit-tested formula: it runs
-three training incidents through the *full* engine (real IncidentManager, Orchestrator, RCA,
-Decision Engine, Policy Engine, and RemediationEngine, against a real SQLite file — no mocked
-learning internals), each retrying and failing to validate every action a shared root cause's
-ladder has, then sends a fourth incident with the same root cause on a fourth, previously-unseen app
-through the same trained store. A control run with no prior history executes both ladder candidates
-in sequence on the identical scenario; the trained run denies both outright for
-`confidence_too_low` and escalates having executed nothing — same evidence, same RCA confidence,
-a different decision, and the only input that differs between the two runs is what the
-`action_outcomes` table already held.
-
-**Incident Replay** ([`lifecycle/replay.py`](sentinel-ai/app/lifecycle/replay.py)) answers "what
-would Sentinel decide about this incident right now, given everything it has learned since" by
-recomputing findings and candidates without touching the incident's own persisted decision — and it
-deliberately runs the identical bias computation the live orchestrator does (same lookups, same
-`merge_bias` call), so replaying an incident can never silently disagree with what a live run would
-actually do. If Operational Memory's lookup fails during a replay, that failure is recorded as a
-note on the result and replay degrades to aggregated-learning-only, rather than raising.
-
-**The Causal Incident Graph**
-([`lifecycle/causal_graph.py`](sentinel-ai/app/lifecycle/causal_graph.py)) — the structured
-timeline-to-graph view used for incident visualisation — includes a Deep Investigation proposal as
-the same kind of `action`/`outcome` node the four known actions already get, distinguished only by
-`detail.source` (`"known_action"` vs `"deep_investigation"`), rather than as a separate parallel
-view Sentinel would have to keep in sync by hand. The graph's final resolution edge is based on
-whichever of a known attempt or a deep proposal actually has the latest outcome timestamp, not on
-one or the other exclusively.
-
-**Sentinel Agent Evaluation** ([`lifecycle/evaluation.py`](sentinel-ai/app/lifecycle/evaluation.py))
-— which scores root-cause and action correctness against a scenario's known ground truth, where one
-exists (see [Chaos engineering scenarios](#chaos-engineering-scenarios)) — only ever scores the
-*first* executed action on an incident. A Deep Investigation proposal can never be first by
-construction (it is only ever produced immediately before an escalation that known remediation has
-already failed to prevent), so its presence never distorts that score.
-
-## Chaos engineering scenarios
-
-Failure is injected through an authenticated control API on the backend services, and driven by
-[`scripts/incident-scenarios.sh`](scripts/incident-scenarios.sh):
-
-```text
-GET  /api/chaos/status    inspect current fault state
-POST /api/chaos/fault     configure faults
-POST /api/chaos/reset     clear all faults
-```
-
-Chaos is off unless `CHAOS_MODE=true`, every request needs an `X-Chaos-Token` header, and an
-unauthenticated caller gets **404, not 401** — the existence of the control surface is not
-advertised. Health, metrics, OpenAPI and the control endpoints themselves are excluded from fault
-injection, so an injected fault does not accidentally make Kubernetes believe the pod is dead.
-
-Fault fields on both backend services: `latency_ms`, `error_rate`, `db_failure`, `cpu_burn` (bool)
-and `memory_leak_mb` (int, 0–2048), plus `notification_failure_rate` on `notification-service`.
-All of them are exported as Prometheus gauges (`chaos_latency_ms`, `chaos_error_rate`,
-`chaos_db_failure`, `chaos_cpu_burn`, `chaos_memory_leak_mb`, `chaos_notification_failure_rate`,
-and `chaos_injections_total`), which is what lets Sentinel tell a deliberate fault from a real one.
-
-Nine named scenarios:
-
-| Scenario | What it exercises |
-|---|---|
-| `db-outage` | Database failure — and Sentinel's escalation path, since Postgres is not remediable |
-| `http-errors` | Forced 5xx, the classic error-rate incident |
-| `latency` | Injected latency with generated traffic (a histogram with no requests produces silence, not an alert) |
-| `notification-degradation` | Partial degradation: the portal works, delivery does not |
-| `full-outage` | `kubectl scale --replicas=0` — a real outage, not an injected one |
-| `high-cpu` | CPU exhaustion, where a restart is genuinely the right first move |
-| `memory-leak` | Growing memory, the slow-burn case |
-| `crashloop` | `CrashLoopBackOff`, where a restart is *not* the answer |
-| `bad-deployment` | A faulty revision — the rollback case, walked through above |
-
-Each scenario pins the target to one replica first (chaos state is per-pod and in-memory),
-generates real traffic where the alert needs it, and always resets the fault it injected — even if
-interrupted.
-
-## CI/CD
-
-One workflow, [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml):
-
-```text
-test-citizen-service ┐
-test-notification-service ├─▶ build-and-push-images ─▶ deploy-to-k3s
-test-sentinel-ai      │        (ECR, tagged by SHA)      (aws ssm send-command)
-lint-and-build-frontend │
-validate-k8s-manifests ┘
-```
-
-- **Tests** — the pytest suites for both application services and for Sentinel, plus frontend lint
-  and build.
-- **Manifest validation** — structural consistency checks *and* a real `kubeconform` schema check
-  of `kubectl kustomize` output against genuine Kubernetes API schemas. **Both overlays** are
-  validated, not just the local one.
-- **Build and push** — only on `main`, only after everything above passes. Images go to ECR tagged
-  with the git commit SHA.
-- **Deploy** — `aws ssm send-command` invoking `/usr/local/bin/sentinel-deploy.sh images <sha>`,
-  a fixed script installed on the node at provisioning time.
-
-Two things about that deploy step are the point of it:
-
-**Authentication is GitHub OIDC federation.** There are no long-lived AWS access keys anywhere.
-The trust policy in [`infra/terraform/github_oidc.tf`](infra/terraform/github_oidc.tf) is scoped to
-this repository and branch, and the role can reach the ECR repositories and send commands to one
-instance — nothing else.
-
-**CI never connects to the Kubernetes API.** It cannot: the API server is not reachable from the
-internet. CI can only ask SSM to run one specific script with an image tag. There is no kubeconfig
-in CI, no cluster credential to leak, and no way for a compromised workflow to run an arbitrary
-command on the node.
-
-## Security model
-
-**Network.** Port 80 is the only inbound rule (443 exists behind a Terraform variable that defaults
-to off, since nothing terminates TLS yet). There is **no port 22 rule and no EC2 key pair** —
-administration is Systems Manager Session Manager, which works through the SSM agent's outbound
-connection rather than an inbound listener. The Kubernetes API on `:6443` is not exposed publicly.
-Prometheus, Grafana, Loki, Alertmanager and Sentinel are all `ClusterIP`-only and reached by
-port-forwarding through Session Manager.
-
-**Secrets.** The committed demo Secrets (with literal passwords like `sentinal`) live in
-`k8s/overlays/local/secrets/` and are **not inherited by the AWS overlay** — that overlay generates
-its Secrets from gitignored `.env` files instead. This is structural rather than procedural: the
-AWS overlay cannot ship a published password by someone forgetting an override, because the
-manifest is not in its resource list. A fresh checkout fails `kubectl apply -k` with a
-missing-file error until the env files exist. Failing closed beats defaulting to a known credential
-on a public host.
-
-**Sentinel's Kubernetes RBAC** ([`k8s/overlays/aws/sentinel/namespace-rbac.yaml`](k8s/overlays/aws/sentinel/namespace-rbac.yaml))
-is a dedicated ServiceAccount with a **namespaced `Role`, not `cluster-admin` and not a
-`ClusterRole`**:
-
-*Reads*: pods, services, endpoints, configmaps, events, deployments, replicasets, pod logs.
-*Writes*: `patch`/`update` on `deployments` and `deployments/scale`, and `create` on Events.
-
-What it explicitly **cannot** do, each omission deliberate:
-
-- **No `pods/exec`, `pods/attach`, `pods/portforward`** — no arbitrary command execution inside a
-  container. This is what makes "the LLM never gets shell access" a structural fact rather than a
-  coding convention.
-- **No `delete` on anything.** Restarts patch the pod template, so no delete verb is needed at all
-   — which means Sentinel cannot delete a pod, a PVC, a Secret, or a namespace even by accident.
-- **No access to Secrets, any verb.** Sentinel has no reason to read application credentials, and
-  not being able to means a confused or compromised agent cannot leak them into an incident report,
-  a GitHub issue, or an LLM prompt. That last one is the real risk.
-- **No PVCs or PersistentVolumes** — it cannot touch storage, so it cannot destroy database data.
-- **No nodes and nothing cluster-scoped** — it cannot drain or cordon the node, cannot see
-  `kube-system`, and cannot reach any other namespace, including one created later.
-- **No RBAC resources** — it cannot grant itself more permission, which is what makes every other
-  restriction here durable rather than advisory.
-- **No AWS permissions of any kind.** Sentinel runs as a pod with no IAM role; it cannot touch ECR,
-  EC2, or anything else in the account.
-
-**Application-level.** `citizen-postgres` and `notification-postgres` are not on the remediation
-allow-list, and are additionally on a frozen deny-list that no environment variable can override.
-Database incidents escalate to a human by design: restarting a Postgres pod under load is a
-plausible-looking action that risks data loss and fixes almost nothing, and rolling one back is
-meaningless.
-
-**Chaos.** Autonomous remediation still only resets faults; it does not create them as part of
-incident handling. The separate GUI-driven scenario runner is an operator action guarded by
-`CHAOS_ADMIN_TOKEN` and an allow-list of known `scripts/incident-scenarios.sh` scenario names — a
-wrong or missing token is a **404**, not a 401/403, so an unauthenticated caller cannot even confirm
-the endpoint exists. `namespace`, the one field of that request an operator controls, is
-`shlex.quote()`-d before it reaches the shell script SSM runs on the node, so it cannot break out
-of its own argument no matter what is in it.
-
-**Deep Investigation is additive, not a second execution path with weaker rules.** The LLM's output
-there is checked against the same closed action enum, the same frozen deny-list, the same
-per-incident action cap, and the same "no target the model chose, only the incident's own target"
-rule as everything else in this section — see [Deep investigation & novel
-remediation](#deep-investigation--novel-remediation) for the specifics, including the
-sensitive-environment-variable-key gate that is checked independently three times (proposal
-construction, policy eligibility, and immediately before the cluster write) rather than once, and
-the confidence bar it must clear (0.97) being higher than any of the four known actions', with no
-override path at any confidence. It never executes without an explicit human authorization, and a
-prompt-injection attempt riding in on log or evidence content that the model repeats back in a
-prose field (`reason`, `problem`, and so on) is still just prose — it has no path to skip
-validation, policy, or authorization, because none of those layers trust anything the model says
-about itself.
-
-**`sentinel-gui` admin access.** Sign-in uses a separate admin-account system (unrelated to
-citizen-service's citizen auth), and every GUI-facing route requires that admin JWT except the
-Alertmanager webhook and the chaos-scenario endpoint, which keep their own existing gates.
-`sentinel-gui`'s nginx denies both of those at the reverse proxy, since Alertmanager and the chaos
-runner already reach `sentinel-ai` directly and never need the public path. Full detail is in
-[`docs/sentinel-integration.md`](docs/sentinel-integration.md#sentinel-sre-control-center-gui).
-
----
-
-## Deployment
-
-### Local development
-
-Unchanged from earlier phases, and the fastest way to see the application working. Pick the script
-matching your cluster:
-
-```bash
-./scripts/deploy-docker-desktop.sh   # Docker Desktop's built-in Kubernetes
-./scripts/deploy-kind.sh             # a local kind cluster
-./scripts/deploy-minikube.sh         # a local minikube cluster
-```
-
-All three are idempotent. Then verify end to end, and drive an incident:
-
-```bash
-./scripts/smoke-test.sh
-export CHAOS_ADMIN_TOKEN=<the token set in both services' Secrets>
-./scripts/incident-scenarios.sh http-errors
-./scripts/incident-scenarios.sh all
-```
-
-On AWS, the same scenarios can be started from **Sentinel's Control Center** (`sentinel-gui`)'s
-**Chaos** page instead of opening an SSM shell yourself — this is the *only* chaos control surface
-in the UI; there is no equivalent page in the citizen-facing `frontend/`, deliberately, so an
-operator has exactly one place to look. In the external-control-plane topology, deploy the K3s
-stack with the frontend
-proxy pointed at the standalone Sentinel EC2 private IP:
-
-```bash
-terraform -chdir=infra/terraform output -raw sentinel_private_ip
-sudo SENTINEL_API_UPSTREAM=http://<sentinel-private-ip>:8080 \
-  /opt/sentinel-sre/scripts/deploy-aws.sh <image-tag>
-```
-
-The upstream is required for every AWS overlay apply. Deployment fails closed if it is absent or
-points to Kubernetes-only Sentinel Service DNS; never use `http://sentinel-ai:8080` in the
-standalone two-EC2 topology. CI discovers this private IP and reapplies the overlay on every deploy.
-
-Then enter the chaos admin token, connect to Sentinel, and click a scenario. Sentinel uses SSM Run
-Command to execute `/opt/sentinel-sre/scripts/incident-scenarios.sh` on the K3s node and shows the
-returned command status/output in the page.
-
-Applying the manifests by hand instead:
-
-```bash
-kubectl apply -k k8s/
-kubectl get pods -n citizen-portal -w
-```
-
-That command is **unchanged** despite the manifests having moved into `k8s/base/` — see
-[`k8s/README.md`](k8s/README.md), which also covers image naming, the hosts-file entry for
-`citizen-portal.local`, port-forwarding the observability stack, and troubleshooting.
-
-Neither `sentinel-ai` nor `sentinel-gui` has a local-development equivalent yet — both exist only
-on the optional standalone Sentinel EC2 instance (`enable_remote_sentinel`), not in `k8s/`. To
-exercise `sentinel-gui` against a local cluster anyway, run its own `npm run dev` with
-`VITE_API_BASE_URL` pointed at a `kubectl port-forward`'d `sentinel-ai` — see
-[`k8s/README.md`](k8s/README.md) and `sentinel-gui/.env.example`. See also
-[Future roadmap](#future-roadmap).
-
-Docker Compose still works too, for the application without Kubernetes — see
-[`Phases.md`](Phases.md).
-
-### AWS deployment
-
-**This has not been done yet.** The steps below are what the code implements, not a record of a
-successful run. Read [`docs/aws-deployment.md`](docs/aws-deployment.md) in full first, and expect
-the first real `terraform plan` to surface something.
-
-```bash
-# 1. Provision. Terraform state is local — no S3 backend.
-cd infra/terraform
-terraform init
-terraform plan
-terraform apply
-
-# 2. Configure GitHub: the OIDC role ARN and instance id as repository secrets,
-#    and the aws-demo Environment. See infra/terraform/github_oidc.tf and the
-#    OIDC setup steps in docs/aws-deployment.md.
-
-# 3. On the node, over Session Manager — there is no SSH.
-aws ssm start-session --target <instance-id> --region <region>
-sudo /opt/sentinel-sre/scripts/generate-aws-secrets.sh
-sudo /opt/sentinel-sre/scripts/deploy-aws.sh <git-sha>
-
-# 4. Thereafter, a push to main deploys itself: tests → build → ECR → SSM.
-```
-
-Reaching the internal tools, once it is running, is a port-forward through Session Manager rather
-than an exposed endpoint — the commands are in [`docs/aws-deployment.md`](docs/aws-deployment.md).
-
-## Cost-conscious AWS architecture
-
-The architecture is shaped by one constraint: this is a demonstration environment that needs to be
-cheap enough to leave running while Sentinel is developed against it. Every declined AWS service
-was declined for a stated reason, and each has a real tradeoff.
-
-**EKS → K3s on EC2.** This is the big one, and it is purely about cost: EKS's managed control plane
-is a standing charge that accrues before a single workload node exists, whereas K3s gives a
-conformant Kubernetes API on an instance that has to exist anyway. What is given up is real — no
-managed control plane, no control plane HA, no managed upgrade path, and the node is a single point
-of failure. For a cluster whose purpose is to have something Sentinel can act on, that is the right
-trade. For anything with users, it is not.
-
-**RDS → PostgreSQL in Kubernetes.** This one is only partly about cost. **Database failure is one
-of Sentinel's incident scenarios.** Moving Postgres to a managed service would put it outside the
-cluster Sentinel observes and outside the RBAC boundary that makes Sentinel's behaviour analysable,
-and would delete the most interesting case in the project: the one where the correct autonomous
-action is *no action*. The cost is that there are no managed backups, no automated failover, and no
-point-in-time recovery — see [Limitations](#limitations).
-
-**ALB → Traefik on the node.** K3s installs Traefik anyway, and the instance's public IP is
-directly reachable. An ALB would add a standing charge to route traffic to exactly one target.
-What is given up: no managed TLS termination, no WAF integration, no health-check-based failover.
-
-**NAT Gateway → a public subnet.** A NAT Gateway exists to give private-subnet workloads egress.
-With one node that has to be reachable from the internet anyway, it buys nothing and bills
-continuously. The node reaches ECR, SSM and `get.k3s.io` through the Internet Gateway using its own
-public IP. The tradeoff is that the instance has a public IP at all — mitigated by there being
-exactly one open port and no SSH.
-
-**One instance, one AZ, no autoscaling.** Replica counts are sized by hand to fit 2 vCPU;
-`MAX_REPLICAS=3` is what the node can absorb rather than a policy preference.
-
-No dollar figures are quoted here on purpose. AWS pricing varies by region and changes over time,
-and a number written into a README ages badly and gets quoted as authoritative. Price the shape of
-this architecture — one burstable instance, one EBS volume, ECR storage, and data transfer —
-against the AWS pricing pages for the region you actually deploy in.
-
-## Limitations
-
-Read this section before drawing any conclusion from anything above it.
-
-**The AWS environment has not been deployed or verified end to end.** The Terraform is written and
-`terraform validate` passes; **`terraform plan` has never been run**, because a plan needs real
-credentials against a real account. No instance has been created. No pod has ever started on AWS.
-Sentinel has never run against a real cluster. The autonomous remediation and rollback path is
-implemented and unit-tested with the Kubernetes and Prometheus clients stubbed, and is **not
-verified end-to-end**. Every claim in this README about Sentinel's behaviour is a claim about code,
-not about observed behaviour.
-
-**Single node, no redundancy.** One EC2 instance, one availability zone, one control plane. If the
-instance goes, everything goes — the application, the observability stack, and Sentinel with it.
-
-**Sentinel is a single replica and is not safely horizontally scalable.** Incident deduplication is
-in-process and the incident store is node-local SQLite, so two replicas would each open their own
-incident for the same alert and neither would see the other's history. Sentinel is therefore itself
-a single point of failure in a system meant to be watching for single points of failure.
-
-**No TLS and no DNS.** The portal is served over plain HTTP on an IP address. `:443` is wired
-behind a Terraform variable that defaults to off because nothing terminates TLS yet. Doing this
-properly needs a hostname first; a self-signed certificate on an IP address would be worse than
-plain HTTP, because it trains whoever demos it to click through browser warnings.
-
-**No database backups.** Postgres runs in-cluster on a local-path PVC with no `pg_dump` schedule,
-no snapshot policy, and nothing that survives instance replacement. This is the sharpest edge of
-the "not production" caveat.
-
-**Terraform state is local.** No S3 backend and no lock table. Fine for one operator on one
-laptop; a genuine problem the moment a second person or a CI job needs to apply.
-
-**`local-path` storage does not survive instance replacement.** PVCs are directories on the node's
-root volume. They survive pod recreation and reboot; a `terraform destroy`/`apply` starts from an
-empty database.
-
-**The LLM is optional, and Sentinel is rule-based without it.** With no `OPENAI_API_KEY` — the
-default — Sentinel still detects, investigates, correlates, decides, remediates and validates, but
-the root-cause narrative is rule-generated. Nothing degrades silently; the incident records
-`llm_used=false`. But "AI-powered" is doing less work in that configuration than the phrase
-suggests, and the honest framing is that the LLM enriches an analysis the rules already produce.
-**Deep Investigation depends on that same optional LLM even more directly: with none configured, or
-with its provider's circuit breaker open, it silently produces no proposal at all** and every
-incident escalates exactly as it did before the feature existed — there is no rule-based fallback
-for this one, because there is nothing rule-based to fall back to for a failure mode the four known
-actions do not already cover.
-
-**Deep Investigation and the learning/memory feedback loop are exercised end-to-end against the
-real engine (real Orchestrator, Decision/Policy/Remediation Engines, a real SQLite store) with the
-LLM and Kubernetes client swapped for deterministic test doubles — not against a real cluster or a
-real model provider.** `tests/test_deep_investigation_loop.py` and
-`tests/test_learning_integration.py` both prove their respective mechanisms hold up through the
-full stack, not just in isolated unit tests, but neither replaces a live run: a genuine attempt to
-verify this against a real Groq endpoint and a reachable K3s cluster was made from this project's
-own development sandbox and honestly could not be completed there — that environment has no
-outbound network path to `api.groq.com` (blocked by egress policy) and no `kubectl`/cluster
-reachable from it, so no `GROQ_API_KEY` or live cluster round-trip was ever exercised from it. The
-same "claims about code and about the real engine's stubbed-boundary behaviour, not about a live
-model or a live cluster" caveat above applies to every number and threshold quoted in [Deep
-investigation & novel remediation](#deep-investigation--novel-remediation) and [Operational
-learning & incident replay](#operational-learning--incident-replay). Verifying against this
-project's actual configured Groq key and its actual K3s environment is a step only achievable from
-somewhere with genuine network reach to both — this repository as checked out and run here is not
-that place.
-
-**Local development has no Sentinel.** `sentinel-ai` and `sentinel-gui` exist only on the optional
-standalone Sentinel EC2 instance, so the fastest environment to bring up is also the one where the
-agent and its console cannot be exercised without extra manual steps.
-
-**The in-cluster Sentinel manifests
-([`k8s/overlays/aws/sentinel/`](k8s/overlays/aws/sentinel/)) are present but unused.** The AWS
-overlay's `kustomization.yaml` no longer lists that directory as a resource — its own comment
-says Sentinel now runs as an external control plane, and K3s hosts only the citizen workloads and
-observability stack. `infra/terraform/variables.tf`'s description of `enable_remote_sentinel`
-still calls the in-cluster deployment "the default," which this contradicts. This README describes
-the standalone-EC2 topology as current because that is what the manifests and Terraform actually
-wire up; the stale comment in `variables.tf` is worth a maintainer's look.
-
-**ingress-nginx locally is unmaintained.** Fine for a laptop, and the reason AWS uses Traefik
-instead. Not something to put in front of real traffic.
-
-**No image vulnerability scanning**, for the supply-chain reasons documented in
-[`Phases.md`](Phases.md)'s Phase 11 — which have not been revisited since.
-
-## Future roadmap
-
-Roughly in the order that would actually help:
-
-1. **Apply the infrastructure and run one real incident end to end.** `terraform plan`, `apply`,
-   deploy, then `./scripts/incident-scenarios.sh bad-deployment`, and watch Sentinel roll it back.
-   Nothing else on this list matters until this happens.
-2. **A hostname and real TLS**, which also unblocks exposing Grafana with real authentication
-   instead of a port-forward.
-3. **Remote Terraform state** (S3 + locking) before a second person touches the infrastructure.
-4. **Scheduled `pg_dump` to S3** — the cheapest backup that is better than none.
-5. **A local Sentinel setup**, so the agent can be exercised on kind/minikube without AWS.
-6. **Make Sentinel horizontally scalable** by moving the incident store and dedup window out of the
-   pod — worth doing only once there is more than one node for a second replica to land on.
-7. **Synthetic incidents in CI** — run the chaos scenarios on a schedule and assert on Sentinel's
-   incident records, not just on alerts firing.
-8. **More remediation actions**, each one requiring an enum member, a Policy Engine branch, and
-   possibly an RBAC verb. Deliberately not a configuration change.
-9. **Multi-node, then multi-cluster.** Everything about the current design assumes one node, and
-   several limitations above dissolve only when that stops being true.
-10. **Predictive detection** — acting on a trend before an alert fires. Interesting, and much
-    harder to bound safely than reacting to a fired alert, which is why it is last.
-
-## Documentation map
-
-| Document | What is in it |
-|---|---|
-| [`Phases.md`](Phases.md) | The build history through Phase 13, phase by phase, with what was deferred and why at each step. Written before the standalone Sentinel EC2 and `sentinel-gui` existed, so it does not cover them — see `docs/sentinel-integration.md` for that work instead. |
-| [`docs/aws-deployment.md`](docs/aws-deployment.md) | The AWS architecture in detail, the OIDC/repository-secrets setup, and the deployment runbook. |
-| [`docs/sentinel-integration.md`](docs/sentinel-integration.md) | What Sentinel reads, what it may act on, `request_id` correlation, chaos-awareness, and the `sentinel-gui` Control Center's design. |
-| [`docs/sentinel-remote-validation-runbook.md`](docs/sentinel-remote-validation-runbook.md) | Standing up and validating the standalone Sentinel EC2 instance (`enable_remote_sentinel`). |
-| [`k8s/README.md`](k8s/README.md) | Manifest layout, the base/overlay split, both deployment paths, reaching `sentinel-gui` locally, troubleshooting. |
-| [`scripts/`](scripts/) | `deploy-*.sh`, `deploy-aws.sh`, `generate-aws-secrets.sh`, `smoke-test.sh`, `incident-scenarios.sh`, `teardown.sh`. |

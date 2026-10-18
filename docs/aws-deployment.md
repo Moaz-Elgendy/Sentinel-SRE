@@ -8,6 +8,7 @@ real command and what its output should look like. Nothing here is a summary of 
 the thing you actually type.
 
 ---
+added
 
 ## Status: what has and has not been executed
 
