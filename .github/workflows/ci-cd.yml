@@ -82,8 +82,12 @@
 name: CI/CD
 
 on:
-  push:
-    branches: [main]
+  # Automatic runs on push to main are disabled: the AWS demo instances are
+  # shut down to save cost, so the deploy jobs would fail. Re-add the block
+  # below when the environment is brought back up.
+  #
+  # push:
+  #   branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:

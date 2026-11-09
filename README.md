@@ -2,12 +2,22 @@
 
 ### From alert to evidence, policy-checked action, and verified recovery.
 
+[![Live showcase](https://img.shields.io/badge/showcase-live-3ecf9a?style=flat-square)](https://moaz-elgendy.github.io/Sentinel-SRE/)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-K3s-326ce5?style=flat-square)
+![AWS](https://img.shields.io/badge/AWS-EC2%20%C2%B7%20ECR%20%C2%B7%20SSM-ff9900?style=flat-square)
+![Terraform](https://img.shields.io/badge/IaC-Terraform-7b42bc?style=flat-square)
+![Python](https://img.shields.io/badge/Python-3.12-3776ab?style=flat-square)
+
+**[Open the project showcase &rarr;](https://moaz-elgendy.github.io/Sentinel-SRE/)**
+
+> **Project status:** Sentinel was fully deployed on AWS and worked end to end: alerts, evidence gathering, policy-gated remediation, and validated recovery. The EC2 instances are now **stopped to save cost**, so there is no live environment to visit. The [recorded demo](docs/media/sentinel-demo.mp4) shows the system running, and everything needed to redeploy it is in this repository.
+
 Sentinel addresses the slow, manual work between a Kubernetes alert and a verified recovery. It gathers telemetry and cluster evidence, evaluates bounded remediation options, and records what happened.
 
 | Reviewer question | Answer from this repository |
 |---|---|
 | **What problem does it solve?** | Turns incident response into an evidence-backed, policy-gated lifecycle with recovery validation. |
-| **What has run?** | The supplied AWS demo recording shows Sentinel handling an HTTP chaos incident through reset and validated recovery; the owner reports the AWS demo was deployed and working. |
+| **What has run?** | The full system was deployed on AWS (two EC2 instances, K3s workload plane, external Sentinel control plane) and worked end to end. The [demo recording](docs/media/sentinel-demo.mp4) shows Sentinel handling an HTTP chaos incident through reset and validated recovery. The instances have since been shut down to save cost. |
 | **How can I verify it?** | [Watch the demo](docs/media/sentinel-demo.mp4), inspect its [evidence frames](docs/README-EVIDENCE.md), then trace behavior in the [workflow](.github/workflows/ci-cd.yml), [policy](sentinel-ai/app/lifecycle/policy.py), and [validator](sentinel-ai/app/lifecycle/validation.py). |
 | **What engineering choices matter?** | Optional LLM reasoning; deterministic allow-lists and thresholds; typed Kubernetes writes; deep proposals require human authorization; Sentinel runs outside the workload cluster. |
 
@@ -40,7 +50,7 @@ The recording shows an HTTP chaos incident on `citizen-service`, a `reset_chaos_
 |---|---|
 | ![Incident undergoing remediation](docs/media/incident-remediation.jpg) | ![Incident after recovery validation](docs/media/incident-resolved.jpg) |
 
-The project owner reports that the application was deployed and working on AWS. The supplied recording shows the remote GUI and AWS browser tabs; the repository contains the corresponding Terraform, K3s configuration, and delivery workflow. This README does not assert that a historical demo address is still online, or that every scenario succeeded. See the [evidence guide](docs/README-EVIDENCE.md) for provenance and presentation caveats.
+The application was deployed on AWS and worked as shown. The recording captures the remote GUI and AWS console tabs, and the repository contains the Terraform, K3s configuration, and delivery workflow that produced that environment. **The EC2 instances are now stopped to save cost, so the demo address is offline.** Not every fault scenario was recorded; see the [evidence guide](docs/README-EVIDENCE.md) for provenance and presentation caveats.
 
 ## Architecture
 
@@ -295,8 +305,8 @@ flowchart LR
 
 The executable [GitHub Actions workflow](.github/workflows/ci-cd.yml) is authoritative:
 
-- PRs to `main` and pushes to `main` run backend tests, both frontend checks, and Kubernetes manifest validation. PRs do not deploy.
-- Successful pushes build **five images**: `citizen-service`, `notification-service`, `frontend`, `sentinel-ai`, and `sentinel-gui`, tagged with the commit SHA and `latest`.
+- **Automatic runs on push to `main` are currently disabled**, because the AWS instances are stopped and the deploy jobs would fail. Pull requests to `main` still run backend tests, both frontend checks, and Kubernetes manifest validation, and never deploy. To restore push-triggered delivery, uncomment the `push` trigger at the top of the [workflow](.github/workflows/ci-cd.yml) once the environment is running again.
+- When enabled, successful pushes build **five images**: `citizen-service`, `notification-service`, `frontend`, `sentinel-ai`, and `sentinel-gui`, tagged with the commit SHA and `latest`.
 - AWS authentication uses GitHub OIDC rather than stored AWS access keys. Deployment runs through SSM; GitHub runners do not need a kubeconfig or direct Kubernetes API access.
 - The K3s job refreshes deployment scripts, syncs changed manifests, discovers the external Sentinel private IP, and applies rendered manifests even for code-only deployments. Workload image tags use the commit SHA.
 - The external Sentinel job currently pulls **`latest`** from the hardcoded `sentinel-sre-demo` ECR prefix, restarts both systemd services, and checks that they are active. This does not establish application readiness or SHA-pinned deployment.
